@@ -1,0 +1,44 @@
+name: Deploy Worker
+
+on:
+  push:
+    branches: [ "main" ]      # despliega al hacer push a main
+  workflow_dispatch:           # permite "Run workflow" manual
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+      # Obtiene el código de tu repo
+        uses: actions/checkout@v4
+
+      - name: Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Si NO tienes package.json, puedes comentar/ quitar estos dos pasos
+      - name: Instalar dependencias
+        if: hashFiles('package-lock.json') != ''
+        run: npm ci
+
+      # (Opcional) Verificar que el token ve tu cuenta
+      - name: Whoami (opcional)
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          command: whoami
+
+      - name: Deploy con Wrangler
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          # si usas entornos en wrangler.toml, ajusta --env
+          command: deploy --minify
