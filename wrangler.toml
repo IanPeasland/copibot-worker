@@ -1,15 +1,13 @@
-name = "copibot-stg"
+name = "copibot-webhook"     # <-- ¡único worker!
 main = "worker.js"
-compatibility_date = "2024-08-01"
+compatibility_date = "2024-06-20"
 
+# Si usas recordatorios por cron (los del bot)
+[triggers]
+crons = ["*/15 * * * *"]
+
+# Variables no sensibles aquí (las sensibles van como Secrets en Cloudflare)
 [vars]
 TZ = "America/Mexico_City"
 STRICT_FAMILY_MATCH = "true"
 DEBUG_LOG = "0"
-
-[triggers]
-crons = ["*/15 * * * *"]
-
-[env.production]
-name = "copibot"
-main = "worker.js"
