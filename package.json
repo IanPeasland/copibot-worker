@@ -1,0 +1,12 @@
+{
+  "name": "copibot-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy:stg": "wrangler deploy",
+    "deploy:prod": "wrangler deploy --env production",
+    "test": "node tests/smoke.cjs"
+  },
+  "devDependencies": {}
+}
