@@ -6,6 +6,7 @@
  * - Filtro por familia (Versant/VersaLink/AltaLink/DocuColor/Cxx) y color (magenta/amarillo/cyan/negro)
  * - STRICT_FAMILY_MATCH env var
  * - Logger opcional DEBUG_LOG → wa_debug
+ * - NUEVO: estado await_resume para reanudar flujos sin “responde sí/no”
  */
 
 export default {
@@ -74,16 +75,35 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
+        // === Saludo estando en flujo activo: preguntamos SIN instrucciones y pausamos ===
         const isGreet = RX_GREET.test(lowered);
         if (isGreet && session.stage !== 'idle') {
-          // saludo sin continuar automático; pedimos confirmación amable
           const friendly = await aiSmallTalk(env, session, 'general', text);
-          await sendWhatsAppText(
-            env,
-            fromE164,
-            `${friendly}\n¿Deseas continuar con tu trámite? Responde *sí* para seguir o *no* para dejarlo en pausa. 😊`
-          );
+          await sendWhatsAppText(env, fromE164, `${friendly}\n¿Deseas continuar con tu trámite?`);
+          // Pausa suave: guarda el stage anterior y entra a await_resume
+          session.data.last_stage = session.stage;
+          session.stage = 'await_resume';
           await saveSession(env, session, now);
+          return ok('EVENT_RECEIVED');
+        }
+
+        // === Reanudación explícita (await_resume) ===
+        if (session.stage === 'await_resume') {
+          if (RX_YES.test(lowered)) {
+            session.stage = session?.data?.last_stage || 'idle';
+            await saveSession(env, session, now);
+            const prompt = buildResumePrompt(session);
+            await sendWhatsAppText(env, fromE164, prompt);
+            return ok('EVENT_RECEIVED');
+          }
+          if (RX_NO.test(lowered)) {
+            session.stage = 'idle';
+            if (session?.data) delete session.data.last_stage;
+            await saveSession(env, session, now);
+            await sendWhatsAppText(env, fromE164, 'De acuerdo. ¿En qué te ayudo hoy?');
+            return ok('EVENT_RECEIVED');
+          }
+          await sendWhatsAppText(env, fromE164, '¿Deseas continuar con tu trámite?');
           return ok('EVENT_RECEIVED');
         }
 
@@ -196,6 +216,10 @@ const RX_ADD_ITEM = /\b(agrega(?:me)?|añade|mete|pon|suma|incluye)\b/i;
 const RX_DONE = /\b(es(ta)? (todo|suficiente)|ser[ií]a todo|nada m[aá]s|con eso|as[ií] est[aá] bien|ya qued[oó]|listo|est[aá] listo)\b/i;
 const RX_NEG_NO = /\bno\b/i;
 const RX_WANT_QTY = /\b(quiero|ocupo|me llevo|pon|agrega|añade|mete|dame|manda|env[ií]ame|p[oó]n)\s+(\d+)\b/i;
+
+// NUEVOS para reanudar/abandonar
+const RX_YES = /\b(s[ií]|sí|si|claro|va|dale|correcto|ok|seguim(?:os)?|contin[uú]a(?:r)?|adelante)\b/i;
+const RX_NO  = /\b(no|luego|despu[eé]s|pausa|ahorita no|cancelar|det[eé]n)\b/i;
 
 /* ============================ Ayudas ============================ */
 const firstWord = (s='') => (s||'').trim().split(/\s+/)[0] || '';
@@ -570,7 +594,7 @@ function extractColor(text='') {
 }
 function productHasColor(p, color){
   if (!color) return true;
-  const s = normalize([p?.nombre, p?.sku].join(' '));
+  const s = normalize([p?.nombre, p?.sku].join(' ''));
   const map = {
     amarillo: ['amarillo','yellow','ylw','y'],
     magenta: ['magenta','m '], // espacio para evitar “modelo m” falso
@@ -811,7 +835,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     ciudad: sv.ciudad || null,
     cp: sv.cp || null,
     created_at: new Date().toISOString()
-  }];
+  }]];
   const os = await sbUpsert(env, 'orden_servicio', osBody, { returning: 'representation' });
   const osId = os?.data?.[0]?.id;
 
@@ -1222,4 +1246,29 @@ function parseCustomerText(text) {
 
   return out;
 }
-function displayField(k){ const map={ nombre:'Nombre / Razón Social', rfc:'RFC', email:'Email', calle:'Calle', numero:'Número', colonia:'Colonia', ciudad:'Ciudad', cp:'CP' }; return map[k]||k; }
+function displayField(k){ const map={ nombre:'Nombre / Razón Social', rfc:'RFC', email:'Email', calle:'Calle', numero:'Número', colonia:'Colonia', ciudad:'Ciudad', cp:'CP' }; return map[k]||k; } 
+
+// ======== NUEVO: prompt para reanudar según stage ========
+function buildResumePrompt(session){
+  const st = session?.stage || 'idle';
+  if (st === 'await_invoice') return '¿La cotizamos con factura o sin factura?';
+  if (st === 'cart_open') return '¿Lo agrego al carrito o prefieres otra opción?';
+  if (st && st.startsWith('collect_')) {
+    const k = st.replace('collect_','');
+    return `¿${displayField(k)}?`;
+  }
+  if (st === 'sv_collect') {
+    const need = session?.data?.sv_need_next || 'modelo';
+    const q = {
+      modelo: '¿Qué marca y modelo es tu impresora (p.ej., Xerox Versant 180)?',
+      falla: 'Cuéntame brevemente la falla (p.ej., “atasco en fusor”, “no imprime”).',
+      calle: '¿Cuál es la *calle* donde estará el equipo?',
+      numero: '¿Qué *número* es?',
+      colonia: '¿*Colonia*?',
+      cp: '¿*Código Postal* (5 dígitos)?',
+      horario: '¿Qué día y hora te viene bien entre *10:00 y 15:00*? (puedes decir “mañana 12:30”)'
+    };
+    return q[need] || '¿Podrías compartirme el dato pendiente para continuar?';
+  }
+  return '¿En qué te ayudo hoy?';
+}
