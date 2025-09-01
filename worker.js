@@ -75,19 +75,18 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // === Saludo estando en flujo activo: preguntamos SIN instrucciones y pausamos ===
+        // Saludo estando en flujo activo → preguntar y pausar
         const isGreet = RX_GREET.test(lowered);
         if (isGreet && session.stage !== 'idle') {
           const friendly = await aiSmallTalk(env, session, 'general', text);
           await sendWhatsAppText(env, fromE164, `${friendly}\n¿Deseas continuar con tu trámite?`);
-          // Pausa suave: guarda el stage anterior y entra a await_resume
           session.data.last_stage = session.stage;
           session.stage = 'await_resume';
           await saveSession(env, session, now);
           return ok('EVENT_RECEIVED');
         }
 
-        // === Reanudación explícita (await_resume) ===
+        // Reanudación de flujo
         if (session.stage === 'await_resume') {
           if (RX_YES.test(lowered)) {
             session.stage = session?.data?.last_stage || 'idle';
@@ -217,7 +216,7 @@ const RX_DONE = /\b(es(ta)? (todo|suficiente)|ser[ií]a todo|nada m[aá]s|con es
 const RX_NEG_NO = /\bno\b/i;
 const RX_WANT_QTY = /\b(quiero|ocupo|me llevo|pon|agrega|añade|mete|dame|manda|env[ií]ame|p[oó]n)\s+(\d+)\b/i;
 
-// NUEVOS para reanudar/abandonar
+// Reanudar / abandonar
 const RX_YES = /\b(s[ií]|sí|si|claro|va|dale|correcto|ok|seguim(?:os)?|contin[uú]a(?:r)?|adelante)\b/i;
 const RX_NO  = /\b(no|luego|despu[eé]s|pausa|ahorita no|cancelar|det[eé]n)\b/i;
 
@@ -365,7 +364,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     return ok('EVENT_RECEIVED');
   }
 
-  // ✅ PARCHE: detecta “sí, agrégalo” en cualquier parte + sinónimos
+  // “sí, agrégalo” o cantidad explícita
   const RX_YES_CONFIRM = /\b(s[ií]|sí|si|claro|va|dale|correcto|ok|afirmativo|hazlo|agr[eé]ga(lo)?|añade|m[eé]te|pon(lo)?)\b/i;
   if (RX_YES_CONFIRM.test(lowered) || RX_WANT_QTY.test(lowered)) {
     const qty = parseQty(lowered, 1);
@@ -435,7 +434,6 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
 }
 
 async function handleAwaitInvoice(env, session, toE164, lowered, now, originalText='') {
-  // ✅ PARCHE: “con/sin” factura con respuestas cortas
   const yes = /\b(s[ií]|sí|si|con(\s+factura)?|factura|con)\b/i.test(lowered);
   const no  = /\b(sin(\s+factura)?|sin|no)\b/i.test(lowered);
 
@@ -475,7 +473,7 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now, originalTe
   return ok('EVENT_RECEIVED');
 }
 
-/* Captura UNO A UNO (igual que tu versión) */
+/* Captura UNO A UNO */
 const FLOW_FACT = ['nombre','rfc','email','calle','numero','colonia','cp'];
 const FLOW_SHIP = ['nombre','email','calle','numero','colonia','cp'];
 const LABEL = {
@@ -571,8 +569,6 @@ function splitCart(cart = []){
 }
 
 /* =============== Inventario & Pedido =============== */
-
-// ==== NUEVOS helpers de familia/color ====
 function extractModelHints(text='') {
   const t = normalize(text);
   const out = {};
@@ -594,10 +590,10 @@ function extractColor(text='') {
 }
 function productHasColor(p, color){
   if (!color) return true;
-  const s = normalize([p?.nombre, p?.sku].join(' ''));
+  const s = normalize([p?.nombre, p?.sku].join(' ')); // ← FIX comilla extra
   const map = {
     amarillo: ['amarillo','yellow','ylw','y'],
-    magenta: ['magenta','m '], // espacio para evitar “modelo m” falso
+    magenta: ['magenta','m '],
     cyan: ['cyan','cian',' c '],
     negro: ['negro','black','bk',' k ']
   };
@@ -715,7 +711,7 @@ async function createOrderFromSession(env, session, toE164) {
   }
 }
 
-/* ============================ SOPORTE (igual a tu versión con empatía) ============================ */
+/* ============================ SOPORTE ============================ */
 function extractSvInfo(text) {
   const out = {};
   if (/xerox/i.test(text)) out.marca = 'Xerox';
@@ -835,7 +831,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     ciudad: sv.ciudad || null,
     cp: sv.cp || null,
     created_at: new Date().toISOString()
-  }]];
+  }];
   const os = await sbUpsert(env, 'orden_servicio', osBody, { returning: 'representation' });
   const osId = os?.data?.[0]?.id;
 
@@ -1248,7 +1244,6 @@ function parseCustomerText(text) {
 }
 function displayField(k){ const map={ nombre:'Nombre / Razón Social', rfc:'RFC', email:'Email', calle:'Calle', numero:'Número', colonia:'Colonia', ciudad:'Ciudad', cp:'CP' }; return map[k]||k; } 
 
-// ======== NUEVO: prompt para reanudar según stage ========
 function buildResumePrompt(session){
   const st = session?.stage || 'idle';
   if (st === 'await_invoice') return '¿La cotizamos con factura o sin factura?';
