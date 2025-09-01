@@ -1,6 +1,6 @@
-name = "copibot-webhook"     # <-- ¡único worker!
+name = "copibot-webhook"
 main = "worker.js"
-compatibility_date = "2024-06-20"
+compatibility_date = "2025-08-01"
 
 # Si usas recordatorios por cron (los del bot)
 [triggers]
@@ -11,3 +11,4 @@ crons = ["*/15 * * * *"]
 TZ = "America/Mexico_City"
 STRICT_FAMILY_MATCH = "true"
 DEBUG_LOG = "0"
+
