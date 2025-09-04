@@ -1,4 +1,5 @@
 name: Deploy Worker
+
 on:
   push:
     branches: [ main ]
@@ -6,50 +7,73 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Setup Node (optional)
+      - name: Setup Node (for wrangler)
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
+      # 1) Construimos /tmp/secrets.json con TODOS los keys desde los Repo Secrets
+      - name: Build secrets.json
+        run: |
+          jq -n \
+            --arg VERIFY_TOKEN        "${{ secrets.VERIFY_TOKEN }}" \
+            --arg WA_TOKEN            "${{ secrets.WA_TOKEN }}" \
+            --arg PHONE_ID            "${{ secrets.PHONE_ID }}" \
+            --arg SUPABASE_URL        "${{ secrets.SUPABASE_URL }}" \
+            --arg SUPABASE_SERVICE_ROLE "${{ secrets.SUPABASE_SERVICE_ROLE }}" \
+            --arg OPENAI_API_KEY      "${{ secrets.OPENAI_API_KEY }}" \
+            --arg LLM_MODEL           "${{ secrets.LLM_MODEL }}" \
+            --arg OPENAI_NLU_MODEL    "${{ secrets.OPENAI_NLU_MODEL }}" \
+            --arg OPENAI_FALLBACK_MODEL "${{ secrets.OPENAI_FALLBACK_MODEL }}" \
+            --arg GCAL_CLIENT_ID      "${{ secrets.GCAL_CLIENT_ID }}" \
+            --arg GCAL_CLIENT_SECRET  "${{ secrets.GCAL_CLIENT_SECRET }}" \
+            --arg GCAL_REFRESH_TOKEN  "${{ secrets.GCAL_REFRESH_TOKEN }}" \
+            --arg SUPPORT_PHONE_E164  "${{ secrets.SUPPORT_PHONE_E164 }}" \
+            --arg SUPPORT_WHATSAPP    "${{ secrets.SUPPORT_WHATSAPP }}" \
+            --arg TZ                  "${{ secrets.TZ }}" \
+            --arg STRICT_FAMILY_MATCH "${{ secrets.STRICT_FAMILY_MATCH }}" \
+            --arg CRON_SECRET         "${{ secrets.CRON_SECRET }}" \
+            '{
+              VERIFY_TOKEN:        $VERIFY_TOKEN,
+              WA_TOKEN:            $WA_TOKEN,
+              PHONE_ID:            $PHONE_ID,
+              SUPABASE_URL:        $SUPABASE_URL,
+              SUPABASE_SERVICE_ROLE: $SUPABASE_SERVICE_ROLE,
+              OPENAI_API_KEY:      $OPENAI_API_KEY,
+              LLM_MODEL:           $LLM_MODEL,
+              OPENAI_NLU_MODEL:    $OPENAI_NLU_MODEL,
+              OPENAI_FALLBACK_MODEL: $OPENAI_FALLBACK_MODEL,
+              GCAL_CLIENT_ID:      $GCAL_CLIENT_ID,
+              GCAL_CLIENT_SECRET:  $GCAL_CLIENT_SECRET,
+              GCAL_REFRESH_TOKEN:  $GCAL_REFRESH_TOKEN,
+              SUPPORT_PHONE_E164:  $SUPPORT_PHONE_E164,
+              SUPPORT_WHATSAPP:    $SUPPORT_WHATSAPP,
+              TZ:                  $TZ,
+              STRICT_FAMILY_MATCH: $STRICT_FAMILY_MATCH,
+              CRON_SECRET:         $CRON_SECRET
+            }' > /tmp/secrets.json
+          echo "Generated /tmp/secrets.json"
+          jq 'keys' /tmp/secrets.json
+
+      # 2) Subimos los secrets en bulk (forzamos --name para no depender del wrangler.toml)
+      - name: Upload Cloudflare secrets (bulk)
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          wranglerVersion: '3.33.2'
+          command: secret bulk /tmp/secrets.json --name copibot-webhook
+
+      # 3) Publicamos el worker
       - name: Publish to Cloudflare Workers
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
-          # wrangler usa wrangler.toml + worker.js
-          command: deploy
+          wranglerVersion: '3.33.2'
+          command: deploy --name copibot-webhook
 
-          # Lista de NOMBRES de secrets que el action subirá al Worker
-          # (tomará el valor desde las variables de entorno de este paso)
-          secrets: |
-            WA_TOKEN
-            PHONE_ID
-            VERIFY_TOKEN
-            CRON_SECRET
-            SUPPORT_WHATSAPP
-            SUPPORT_PHONE_E164
-            SUPABASE_URL
-            SUPABASE_SERVICE_ROLE
-            OPENAI_API_KEY
-            GCAL_CLIENT_ID
-            GCAL_CLIENT_SECRET
-            GCAL_REFRESH_TOKEN
-
-        # Aquí mapeamos cada GitHub Secret -> env var del paso
-        env:
-          WA_TOKEN:               ${{ secrets.WA_TOKEN }}
-          PHONE_ID:               ${{ secrets.PHONE_ID }}
-          VERIFY_TOKEN:           ${{ secrets.VERIFY_TOKEN }}
-          CRON_SECRET:            ${{ secrets.CRON_SECRET }}
-          SUPPORT_WHATSAPP:       ${{ secrets.SUPPORT_WHATSAPP }}
-          SUPPORT_PHONE_E164:     ${{ secrets.SUPPORT_PHONE_E164 }}
-          SUPABASE_URL:           ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE:  ${{ secrets.SUPABASE_SERVICE_ROLE }}
-          OPENAI_API_KEY:         ${{ secrets.OPENAI_API_KEY }}
-          GCAL_CLIENT_ID:         ${{ secrets.GCAL_CLIENT_ID }}
-          GCAL_CLIENT_SECRET:     ${{ secrets.GCAL_CLIENT_SECRET }}
-          GCAL_REFRESH_TOKEN:     ${{ secrets.GCAL_REFRESH_TOKEN }}
