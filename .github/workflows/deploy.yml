@@ -1,8 +1,7 @@
 name: Deploy Worker
 on:
   push:
-    branches: [ "main" ]
-  workflow_dispatch:
+    branches: [ main ]
 
 jobs:
   deploy:
@@ -10,25 +9,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Node (opcional)
+      - name: Setup Node (optional)
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      - name: Install deps (if lockfile exists)
-        run: |
-          if [ -f package-lock.json ]; then
-            npm ci
-          elif [ -f package.json ]; then
-            npm i
-          else
-            echo "No package.json — skipping install"
-          fi
-
+      # Publicar con Wrangler
       - name: Publish to Cloudflare Workers
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
-          command: deploy --minify
+          # Usa wrangler.toml y worker.js
+          command: deploy
+          # Estos secrets SE CARGAN al Worker en cada deploy
+          secrets: |
+            WA_TOKEN=${{ secrets.WA_TOKEN }}
+            PHONE_ID=${{ secrets.PHONE_ID }}
+            VERIFY_TOKEN=${{ secrets.VERIFY_TOKEN }}
+            CRON_SECRET=${{ secrets.CRON_SECRET }}
+            SUPPORT_WHATSAPP=${{ secrets.SUPPORT_WHATSAPP }}
+            SUPPORT_PHONE_E164=${{ secrets.SUPPORT_PHONE_E164 }}
+            SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+            SUPABASE_SERVICE_ROLE=${{ secrets.SUPABASE_SERVICE_ROLE }}
+            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+            GCAL_CLIENT_ID=${{ secrets.GCAL_CLIENT_ID }}
+            GCAL_CLIENT_SECRET=${{ secrets.GCAL_CLIENT_SECRET }}
+            GCAL_REFRESH_TOKEN=${{ secrets.GCAL_REFRESH_TOKEN }}
+
 
