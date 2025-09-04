@@ -1,4 +1,10 @@
-name: Deploy Worker
+name = "copibot-webhook"
+main = "worker.js"
+compatibility_date = "2024-09-01"
+
+# Si usas cron desde el UI, puedes dejar esto; si quieres que quede versionado, descomenta:
+[triggers]
+crons = ["*/15 * * * *"]
 
 on:
   push:
@@ -79,3 +85,4 @@ jobs:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
           command: deploy
+
