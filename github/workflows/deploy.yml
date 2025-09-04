@@ -20,13 +20,14 @@ jobs:
         with:
           node-version: "20"
 
-      # Usamos v3 explícita para evitar diferencias con v4
       - name: Install Wrangler v3
         run: npm i -g wrangler@3
 
-      # Sube secretos uno por uno por stdin (compatible v3/v4, sin --text)
       - name: Upload secrets (stdin, version-safe)
         env:
+          CI: "1"
+          WRANGLER_TELEMETRY: "0"
+
           CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
 
@@ -58,7 +59,7 @@ jobs:
             key="$1"
             val="$2"
             if [ -n "$val" ]; then
-              printf '%s' "$val" | wrangler secret put "$key" --name "$NAME" --yes
+              printf '%s' "$val" | wrangler secret put "$key" --name "$NAME"
             else
               echo "⚠️  $key vacío: omitido"
             fi
