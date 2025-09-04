@@ -5,11 +5,12 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
 
     steps:
       - name: Checkout
@@ -20,9 +21,16 @@ jobs:
         with:
           node-version: "20"
 
+      # Aseguramos Wrangler CLI v3 (el action también lo usa, pero lo
+      # instalamos para ejecutar `wrangler secret ...` en modo shell)
       - name: Install Wrangler v3
         run: npm i -g wrangler@3
 
+      # ---- SUBIDA DE SECRETS (IDEMPOTENTE) ----
+      # Si un secret ya existe o hay un binding homónimo, lo borramos y volvemos a crearlo.
+      # NOTA: si en el dashboard creaste una *variable* (no "secret") con el mismo
+      # nombre, bórrala en Cloudflare -> Workers -> Settings -> Variables & Secrets
+      # o cámbiale el nombre. Las variables y los secrets comparten el mismo "binding".
       - name: Upload secrets (stdin, version-safe)
         env:
           CI: "1"
@@ -56,10 +64,13 @@ jobs:
           NAME="copibot-webhook"
 
           put_secret () {
-            key="$1"
-            val="$2"
+            key="$1"; val="$2"
             if [ -n "$val" ]; then
+              # Borramos si existiera (ignora error si no existe)
+              yes | wrangler secret delete "$key" --name "$NAME" >/dev/null 2>&1 || true
+              # Creamos de nuevo desde stdin
               printf '%s' "$val" | wrangler secret put "$key" --name "$NAME"
+              echo "✓ $key actualizado"
             else
               echo "⚠️  $key vacío: omitido"
             fi
@@ -83,9 +94,11 @@ jobs:
           put_secret STRICT_FAMILY_MATCH   "$STRICT_FAMILY_MATCH"
           put_secret CRON_SECRET           "$CRON_SECRET"
 
+      # ---- DEPLOY ----
       - name: Publish to Cloudflare Workers
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
-        run: |
-          wrangler deploy worker.js --name copibot-webhook --minify
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          # `wrangler.toml` en el root define nombre y entrypoint
+          command: deploy
