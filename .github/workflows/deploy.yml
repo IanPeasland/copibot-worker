@@ -6,6 +6,7 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -14,27 +15,41 @@ jobs:
         with:
           node-version: 20
 
-      # Publicar con Wrangler
       - name: Publish to Cloudflare Workers
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
-          # Usa wrangler.toml y worker.js
+          # wrangler usa wrangler.toml + worker.js
           command: deploy
-          # Estos secrets SE CARGAN al Worker en cada deploy
+
+          # Lista de NOMBRES de secrets que el action subirá al Worker
+          # (tomará el valor desde las variables de entorno de este paso)
           secrets: |
-            WA_TOKEN=${{ secrets.WA_TOKEN }}
-            PHONE_ID=${{ secrets.PHONE_ID }}
-            VERIFY_TOKEN=${{ secrets.VERIFY_TOKEN }}
-            CRON_SECRET=${{ secrets.CRON_SECRET }}
-            SUPPORT_WHATSAPP=${{ secrets.SUPPORT_WHATSAPP }}
-            SUPPORT_PHONE_E164=${{ secrets.SUPPORT_PHONE_E164 }}
-            SUPABASE_URL=${{ secrets.SUPABASE_URL }}
-            SUPABASE_SERVICE_ROLE=${{ secrets.SUPABASE_SERVICE_ROLE }}
-            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
-            GCAL_CLIENT_ID=${{ secrets.GCAL_CLIENT_ID }}
-            GCAL_CLIENT_SECRET=${{ secrets.GCAL_CLIENT_SECRET }}
-            GCAL_REFRESH_TOKEN=${{ secrets.GCAL_REFRESH_TOKEN }}
+            WA_TOKEN
+            PHONE_ID
+            VERIFY_TOKEN
+            CRON_SECRET
+            SUPPORT_WHATSAPP
+            SUPPORT_PHONE_E164
+            SUPABASE_URL
+            SUPABASE_SERVICE_ROLE
+            OPENAI_API_KEY
+            GCAL_CLIENT_ID
+            GCAL_CLIENT_SECRET
+            GCAL_REFRESH_TOKEN
 
-
+        # Aquí mapeamos cada GitHub Secret -> env var del paso
+        env:
+          WA_TOKEN:               ${{ secrets.WA_TOKEN }}
+          PHONE_ID:               ${{ secrets.PHONE_ID }}
+          VERIFY_TOKEN:           ${{ secrets.VERIFY_TOKEN }}
+          CRON_SECRET:            ${{ secrets.CRON_SECRET }}
+          SUPPORT_WHATSAPP:       ${{ secrets.SUPPORT_WHATSAPP }}
+          SUPPORT_PHONE_E164:     ${{ secrets.SUPPORT_PHONE_E164 }}
+          SUPABASE_URL:           ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE:  ${{ secrets.SUPABASE_SERVICE_ROLE }}
+          OPENAI_API_KEY:         ${{ secrets.OPENAI_API_KEY }}
+          GCAL_CLIENT_ID:         ${{ secrets.GCAL_CLIENT_ID }}
+          GCAL_CLIENT_SECRET:     ${{ secrets.GCAL_CLIENT_SECRET }}
+          GCAL_REFRESH_TOKEN:     ${{ secrets.GCAL_REFRESH_TOKEN }}
