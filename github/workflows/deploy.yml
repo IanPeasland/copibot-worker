@@ -13,12 +13,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node (optional)
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      # 1) Construimos /tmp/secrets.json con TODAS las keys que usa el worker
+      # ---------- 1) Construimos secrets.json y quitamos vacíos ----------
       - name: Build secrets.json
         run: |
           jq -n \
@@ -61,25 +61,47 @@ jobs:
               CRON_SECRET:            $CRON_SECRET,
               DEBUG_LOG:              $DEBUG_LOG,
               SESSION_TTL_DAYS:       $SESSION_TTL_DAYS
-            }' > /tmp/secrets.json
+            } | with_entries(select(.value != null and .value != ""))' \
+            > /tmp/secrets.json
 
-          echo "Generated /tmp/secrets.json"
-          jq 'keys' /tmp/secrets.json
+          echo "Claves que se cargarán:"
+          jq -r 'keys|join(", ")' /tmp/secrets.json
 
-      # 2) Subimos los secrets al Worker (bulk) apuntando al nombre del Worker
+      # ---------- 2) Intento bulk ----------
       - name: Upload Cloudflare secrets (bulk)
+        id: bulk
         uses: cloudflare/wrangler-action@v3
+        continue-on-error: true
         with:
           apiToken:  ${{ secrets.CF_API_TOKEN }}
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
-          # wranglerVersion: '3.90.0'   # (opcional) puedes dejarlo comentado
           command: secret bulk /tmp/secrets.json --name copibot-webhook
 
-      # 3) Desplegamos el worker
+      # ---------- 3) Fallback si el bulk falla: subir 1x1 ----------
+      - name: Install Wrangler CLI (for fallback)
+        if: steps.bulk.outcome != 'success'
+        run: npm i -g wrangler@3
+
+      - name: Upload secrets individually (fallback)
+        if: steps.bulk.outcome != 'success'
+        env:
+          CF_API_TOKEN:  ${{ secrets.CF_API_TOKEN }}
+          CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          set -e
+          uploaded=0
+          jq -r 'to_entries[] | @base64' /tmp/secrets.json | while read -r row; do
+            k=$(echo "$row" | base64 -d | jq -r '.key')
+            v=$(echo "$row" | base64 -d | jq -r '.value')
+            wrangler secret put "$k" --name copibot-webhook --text "$v"
+            uploaded=$((uploaded+1))
+          done
+          echo "Subidas $uploaded secrets."
+
+      # ---------- 4) Deploy ----------
       - name: Publish to Cloudflare Workers
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken:  ${{ secrets.CF_API_TOKEN }}
           accountId: ${{ secrets.CF_ACCOUNT_ID }}
-          # wranglerVersion: '3.90.0'   # (opcional) puedes dejarlo comentado
           command: deploy --name copibot-webhook
