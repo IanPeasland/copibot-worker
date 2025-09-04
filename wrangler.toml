@@ -3,18 +3,14 @@ main = "worker.js"
 compatibility_date = "2024-09-01"
 workers_dev = true
 
-# Cron (si lo manejas por código y no desde el panel)
 [triggers]
 crons = ["*/15 * * * *"]
 
-# Variables NO sensibles (quedan en el repo)
 [vars]
 TZ = "America/Mexico_City"
 DEBUG_LOG = "0"
 STRICT_FAMILY_MATCH = "true"
 SESSION_TTL_DAYS = "90"
-
-# Si quieres fijar el modelo por defecto:
 LLM_MODEL = "gpt-4o-mini"
 OPENAI_NLU_MODEL = "gpt-4o"
 OPENAI_FALLBACK_MODEL = "gpt-4o-mini"
