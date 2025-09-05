@@ -1,6 +1,6 @@
 /**
  * CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
- * FUSIÓN
+ * HÍBRIDO CON ESTADOS MÍNIMOS
  * - Reanudar flujo con await_resume
  * - Filtro por familia/color y STRICT_FAMILY_MATCH
  * - Fase await_compatibles para buscar ignorando familia
@@ -204,8 +204,11 @@ export default {
             session.stage = 'await_compatibles';
             session.data.pending_query = ntext || text;
             await saveSession(env, session, now);
-            await sendWhatsAppText(env, fromE164,
-              `No encontré disponibilidad *${hints.family}* ahora mismo 😕. ¿Te muestro opciones *compatibles*?`);
+            await sendWhatsAppText(
+              env,
+              fromE164,
+              `No encontré disponibilidad *${hints.family}* ahora mismo 😕. ¿Te muestro opciones *compatibles*?`
+            );
             return ok('EVENT_RECEIVED');
           }
           if (best) {
@@ -344,6 +347,7 @@ Responde sólo JSON.`;
 
 /* ============================ WhatsApp ============================ */
 async function sendWhatsAppText(env, toE164, body) {
+  if (!env.WA_TOKEN || !env.PHONE_ID) { console.warn('WA env missing'); return; }
   const url = `https://graph.facebook.com/v20.0/${env.PHONE_ID}/messages`;
   const payload = { messaging_product: 'whatsapp', to: toE164.replace(/\D/g, ''), text: { body } };
   const r = await fetch(url, {
@@ -1106,7 +1110,7 @@ function renderOsDescription(phone, sv) {
 }
 async function getLastOpenOS(env, phone) {
   try {
-    const r = await sbGet(env, 'orden_servicio', { query: `select=id,estado,ventana_inicio,ventana_fin,calendar_id,gcal_event_id,cliente_id&cliente_id=in.(select id from cliente where telefono=eq.${phone})&order=ventana_inicio.desc&limit=1` });
+    const r = await sbGet(env, 'orden_servicio', { query: `select=id,estado,ventana_inicio,ventana_fin,calendar_id,gcal_event_id,cliente_id&cliente_id=in.(select id from cliente donde telefono=eq.${phone})&order=ventana_inicio.desc&limit=1` });
     if (r && r[0] && ['agendado','reprogramado','confirmado'].includes(r[0].estado)) return r[0];
   } catch {}
   return null;
@@ -1299,7 +1303,7 @@ function buildResumePrompt(session){
   if (st && st.startsWith('collect_')) {
     const k = st.replace('collect_','');
     return `¿${displayField(k)}?`;
-    }
+  }
   if (st === 'sv_collect') {
     const need = session?.data?.sv_need_next || 'modelo';
     const q = {
