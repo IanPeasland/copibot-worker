@@ -1,24 +1,22 @@
 name: Deploy Worker
-
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:
-
-permissions:
-  contents: read
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      # Publica el worker sin tocar variables/secrets del dashboard
-      - name: Publish to Cloudflare Workers
-        uses: cloudflare/wrangler-action@v3
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          apiToken: ${{ secrets.CF_API_TOKEN }}
-          accountId: ${{ secrets.CF_ACCOUNT_ID }}
-          command: deploy
+          node-version: 20
+      # Fijamos versión de wrangler para evitar cambios sorpresivos
+      - run: npm i -g wrangler@3.33.2
+
+      # Deploy (sin tocar secrets/vars)
+      - name: Publish to Cloudflare Workers
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: wrangler deploy --minify
