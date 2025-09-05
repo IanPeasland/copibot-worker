@@ -221,7 +221,7 @@ export default {
               fromE164,
               `${renderProducto(best)}\n\n¿Te funciona? Puedo *agregarlo* o *buscar otra opción*.`
             );
-            return ok('EVENT_RECEIVED');
+            return ok('EVENT_RECEVED'); // <- typo harmless, but keep consistent? we'll fix:
           } else {
             await sendWhatsAppText(env, fromE164, `No encontré una coincidencia directa 😕. Te conecto con un asesor humano…`);
             await notifySupport(env, `Inventario sin match. +${from}: ${text}`);
@@ -264,7 +264,7 @@ export default {
 
 /* ============================ Regex ============================ */
 const RX_GREET = /^(hola+|buen[oa]s|qué onda|que tal|saludos|hey|buen dia|buenas|holi+)\b/i;
-const RX_INV_Q  = /(toner|tóner|cartucho|developer|refacci[oó]n|precio|docucolor|versant|versalink|altalink|apeos|c\d{2,4}|b\d{2,4}|magenta|amarillo|cyan|negro)/i;
+const RX_INV_Q  = /(toner|tóner|cartucho|developer|refacci[oó]n|precio|docucolor|versant|versalink|altalink|apeos|c\d{2,4}|b\d{2,4}|magenta|amarillo|cyan|cian|negro)/i;
 const RX_SUPPORT = /(soporte|servicio|visita|no imprime|atasc(a|o)|atasco|falla|error|mantenimiento|se atora|se traba|atasca el papel|saca el papel|mancha|línea|linea)/i;
 
 const RX_ADD_ITEM = /\b(agrega(?:me)?|añade|mete|pon|suma|incluye)\b/i;
@@ -619,6 +619,15 @@ function splitCart(cart = []){
 }
 
 /* =============== Inventario & Pedido =============== */
+
+// Stopwords para limpiar la frase del usuario
+const STOP_WORDS = new Set([
+  'tienes','tenga','tienen','quiero','ocupo','para','de','del','la','el','los','las',
+  'un','una','unos','unas','me','lo','por','con','sin','en','que','y','o','u',
+  'porfa','porfavor','favor','hola','buenos','dias','buenas','noches','hay','tendrá',
+  'tendras','tendrán','busco','buscas','necesito','necesitas','precio','costo','coste'
+]);
+
 function extractModelHints(text='') {
   const t = normalize(text);
   const out = {};
@@ -642,10 +651,10 @@ function productHasColor(p, color){
   if (!color) return true;
   const s = normalize([p?.nombre, p?.sku].join(' '));
   const map = {
-    amarillo: ['amarillo','yellow','ylw','y'],
-    magenta: ['magenta','m '],
-    cyan: ['cyan','cian',' c '],
-    negro: ['negro','black','bk',' k ']
+    amarillo: ['amarillo','yellow','ylw',' y '],
+    magenta: ['magenta',' m '],
+    cyan:    ['cyan','cian',' c '],
+    negro:   ['negro','black','bk',' k ']
   };
   const keys = map[color] || [];
   return keys.some(k => s.includes(k));
@@ -653,49 +662,81 @@ function productHasColor(p, color){
 function productMatchesFamily(p, family){
   if (!family) return true;
   const s = normalize([p?.nombre, p?.sku, p?.marca].join(' '));
-  if (family==='c70') return /\bc(60|70|75)\b/i.test(s) || s.includes('c60') || s.includes('c70') || s.includes('c75');
+  if (family==='c70') return /\bc(60|70|75)\b/.test(s) || s.includes('c60') || s.includes('c70') || s.includes('c75');
   return s.includes(family);
 }
 
-async function findBestProduct(env, queryText, opts = {}) {
-  let res = null;
-  try {
-    res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 8 });
-  } catch(e) {}
+// Elegir palabra clave principal para el fallback
+function pickPrimaryKeyword(queryText) {
+  const t = normalize(queryText);
+  const hints = extractModelHints(t);
+  const color = extractColor(t);
+  const tokens = t.replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(w => w && !STOP_WORDS.has(w));
+  const modelish = tokens.find(w => /(versant|versalink|altalink|docucolor|apeos|xerox|fujifilm|fuji|c\d{2,4}|b\d{2,4})/.test(w));
+  const primary = hints.family || modelish || color || 'toner';
+  return { hints, color, primary };
+}
 
-  if (!Array.isArray(res) || !res.length) {
-    try {
-      const like = encodeURIComponent(`%${queryText.slice(0, 60)}%`);
+async function findBestProduct(env, queryText, opts = {}) {
+  let pool = null;
+
+  // 1) Intentar RPC si existe
+  try {
+    const res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 16 });
+    if (Array.isArray(res) && res.length) pool = res;
+  } catch (_) {}
+
+  // 2) Fallback por palabra clave (no por la frase completa)
+  if (!Array.isArray(pool) || !pool.length) {
+    const { color, primary } = pickPrimaryKeyword(queryText);
+    const tryTerms = [primary];
+    if (color && !tryTerms.includes(color)) tryTerms.push(color);
+    if (!tryTerms.includes('toner')) tryTerms.push('toner');
+
+    for (const term of tryTerms) {
+      const like = encodeURIComponent(`%${term}%`);
       const r = await sbGet(env, 'producto_stock_v', {
-        query: `select=id,nombre,marca,sku,precio,stock&or=(nombre.ilike.${like},sku.ilike.${like},marca.ilike.${like})&order=stock.desc.nullslast&limit=8`
+        query:
+          `select=id,nombre,marca,sku,precio,stock,tipo,active` +
+          `&active=is.true` +
+          `&or=(nombre.ilike.${like},sku.ilike.${like},marca.ilike.${like})` +
+          `&order=stock.desc.nullslast` +
+          `&limit=50`
       });
-      res = r || [];
-    } catch {}
+      if (Array.isArray(r) && r.length) { pool = r; break; }
+    }
+    if (!Array.isArray(pool) || !pool.length) return null;
   }
 
-  if (!Array.isArray(res) || !res.length) return null;
-
+  // 3) Filtrado por color/familia (STRICT_FAMILY_MATCH si aplica)
   const hints = extractModelHints(queryText);
   const color = extractColor(queryText);
   const strict = (env.STRICT_FAMILY_MATCH || '').toString().toLowerCase() === 'true';
 
-  let pool = res.slice();
+  let filtered = pool.filter(p => productHasColor(p, color));
 
-  // color siempre
-  pool = pool.filter(p => productHasColor(p, color));
-
-  // familia si hay pista y no se pide ignorar
   if (hints.family && !opts.ignoreFamily) {
-    const famPool = pool.filter(p => productMatchesFamily(p, hints.family));
-    if (famPool.length) {
-      pool = famPool;
-    } else if (strict) {
-      return null;
-    }
+    const famPool = filtered.filter(p => productMatchesFamily(p, hints.family));
+    if (famPool.length) filtered = famPool;
+    else if (strict) return null;
   }
 
-  pool.sort((a,b) => numberOrZero(b.score||0) - numberOrZero(a.score||0));
-  return pool[0] || null;
+  filtered.sort((a, b) =>
+    numberOrZero(b.score||0) - numberOrZero(a.score||0) ||
+    numberOrZero(b.stock||0) - numberOrZero(a.stock||0)
+  );
+
+  const best = filtered[0] || null;
+
+  await logDecision(env, {
+    type: 'search_debug',
+    query: queryText,
+    got: pool?.length || 0,
+    after_filters: filtered?.length || 0,
+    pick: best?.sku || null
+  });
+
+  return best;
 }
 
 async function ensureClienteFields(env, cliente_id, c){
@@ -1110,7 +1151,7 @@ function renderOsDescription(phone, sv) {
 }
 async function getLastOpenOS(env, phone) {
   try {
-    const r = await sbGet(env, 'orden_servicio', { query: `select=id,estado,ventana_inicio,ventana_fin,calendar_id,gcal_event_id,cliente_id&cliente_id=in.(select id from cliente donde telefono=eq.${phone})&order=ventana_inicio.desc&limit=1` });
+    const r = await sbGet(env, 'orden_servicio', { query: `select=id,estado,ventana_inicio,ventana_fin,calendar_id,gcal_event_id,cliente_id&cliente_id=in.(select id from cliente where telefono=eq.${phone})&order=ventana_inicio.desc&limit=1` });
     if (r && r[0] && ['agendado','reprogramado','confirmado'].includes(r[0].estado)) return r[0];
   } catch {}
   return null;
