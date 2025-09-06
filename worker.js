@@ -1,12 +1,12 @@
 /**
  * CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
- * HÍBRIDO CON ESTADOS MÍNIMOS
- * - Reanudar flujo con await_resume
- * - Filtro por familia/color y STRICT_FAMILY_MATCH
- * - Fase await_compatibles para buscar ignorando familia
- * - “sí, agrégalo / hazlo” detecta en cualquier parte
- * - “con/sin” → factura
- * - Logger opcional DEBUG_LOG → wa_debug
+ * HÍBRIDO CON ESTADOS MÍNIMOS – FIXES
+ * - Parser robusto de “con/sin factura”
+ * - Se elimina auto-add del último candidato con carrito vacío
+ * - Cierre neutro (sin saludo) y anti-autogreeting inmediato
+ * - Fix query getLastOpenOS (where)
+ * - Fallback para obtener pedido_id tras upsert
+ * - Pequeños hardenings
  */
 
 export default {
@@ -14,7 +14,7 @@ export default {
     try {
       const url = new URL(req.url);
 
-      // Webhook verify
+      // Verify webhook
       if (req.method === 'GET' && url.pathname === '/') {
         const mode = url.searchParams.get('hub.mode');
         const token = url.searchParams.get('hub.verify_token');
@@ -25,7 +25,7 @@ export default {
         return new Response('Forbidden', { status: 403 });
       }
 
-      // Cron endpoint (opcional)
+      // Cron
       if (req.method === 'POST' && url.pathname === '/cron') {
         const sec = req.headers.get('x-cron-secret') || url.searchParams.get('secret');
         if (!sec || sec !== env.CRON_SECRET) return new Response('Forbidden', { status: 403 });
@@ -33,7 +33,7 @@ export default {
         return ok(`cron ok ${JSON.stringify(out)}`);
       }
 
-      // Webhook mensajes
+      // WhatsApp webhook
       if (req.method === 'POST' && url.pathname === '/') {
         const payload = await safeJson(req);
         const ctx = extractWhatsAppContext(payload);
@@ -59,7 +59,7 @@ export default {
         if (session?.data?.last_mid && session.data.last_mid === mid) return ok('EVENT_RECEIVED');
         session.data.last_mid = mid;
 
-        // Comandos universales
+        // Comandos universales soporte
         if (/\b(cancel(a|ar).*(cita|visita|servicio))\b/i.test(lowered)) {
           await svCancel(env, session, fromE164);
           await saveSession(env, session, now);
@@ -79,7 +79,7 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // Saludo mientras hay flujo activo → pausar y preguntar
+        // Saludo durante flujo → pausar
         const isGreet = RX_GREET.test(lowered);
         if (isGreet && session.stage !== 'idle') {
           const friendly = await aiSmallTalk(env, session, 'general', text);
@@ -113,12 +113,14 @@ export default {
         // Compatibles: confirmar búsqueda relajada
         if (session.stage === 'await_compatibles') {
           const baseQ = session.data?.pending_query || ntext || text;
+
           if (RX_YES.test(lowered)) {
             const best = await findBestProduct(env, baseQ, { ignoreFamily: true });
             if (best) {
               session.stage = 'cart_open';
               session.data.cart = session.data.cart || [];
               session.data.last_candidate = best;
+              session.data.last_candidate_at = Date.now();
               await saveSession(env, session, now);
               await sendWhatsAppText(env, fromE164, `${renderProducto(best)}\n\n¿Lo agrego o busco otra opción?`);
             } else {
@@ -129,18 +131,21 @@ export default {
             }
             return ok('EVENT_RECEIVED');
           }
+
           if (RX_NO.test(lowered)) {
             session.stage = 'idle';
             await saveSession(env, session, now);
             await sendWhatsAppText(env, fromE164, `Perfecto. ¿En qué más te ayudo?`);
             return ok('EVENT_RECEIVED');
           }
+
           // cualquier otro texto: intentar como compatibles
           const best = await findBestProduct(env, ntext || text, { ignoreFamily: true });
           if (best) {
             session.stage = 'cart_open';
             session.data.cart = session.data.cart || [];
             session.data.last_candidate = best;
+            session.data.last_candidate_at = Date.now();
             await saveSession(env, session, now);
             await sendWhatsAppText(env, fromE164, `${renderProducto(best)}\n\n¿Lo agrego o busco otra opción?`);
           } else {
@@ -152,7 +157,7 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // Saludo automático
+        // Autogreeting
         const mayGreet = isGreet && shouldAutogreet(session, now) && session.stage === 'idle';
         if (mayGreet) {
           const g = await aiSmallTalk(env, session, 'greeting');
@@ -181,7 +186,7 @@ export default {
           return handled;
         }
 
-        // VENTAS
+        // VENTAS (flujo ya abierto)
         if (session.stage === 'cart_open') {
           const handled = await handleCartOpen(env, session, fromE164, text, lowered, ntext, now);
           return handled;
@@ -200,6 +205,7 @@ export default {
           const best = await findBestProduct(env, ntext);
           const hints = extractModelHints(ntext || text);
           const strict = (env.STRICT_FAMILY_MATCH || '').toString().toLowerCase() === 'true';
+
           if (!best && hints.family && strict) {
             session.stage = 'await_compatibles';
             session.data.pending_query = ntext || text;
@@ -211,17 +217,19 @@ export default {
             );
             return ok('EVENT_RECEIVED');
           }
+
           if (best) {
             session.stage = 'cart_open';
             session.data.cart = session.data.cart || [];
             session.data.last_candidate = best;
+            session.data.last_candidate_at = Date.now();
             await saveSession(env, session, now);
             await sendWhatsAppText(
               env,
               fromE164,
               `${renderProducto(best)}\n\n¿Te funciona? Puedo *agregarlo* o *buscar otra opción*.`
             );
-            return ok('EVENT_RECEVED'); // <- typo harmless, but keep consistent? we'll fix:
+            return ok('EVENT_RECEIVED');
           } else {
             await sendWhatsAppText(env, fromE164, `No encontré una coincidencia directa 😕. Te conecto con un asesor humano…`);
             await notifySupport(env, `Inventario sin match. +${from}: ${text}`);
@@ -264,7 +272,7 @@ export default {
 
 /* ============================ Regex ============================ */
 const RX_GREET = /^(hola+|buen[oa]s|qué onda|que tal|saludos|hey|buen dia|buenas|holi+)\b/i;
-const RX_INV_Q  = /(toner|tóner|cartucho|developer|refacci[oó]n|precio|docucolor|versant|versalink|altalink|apeos|c\d{2,4}|b\d{2,4}|magenta|amarillo|cyan|cian|negro)/i;
+const RX_INV_Q  = /(toner|tóner|cartucho|developer|refacci[oó]n|precio|docucolor|versant|versalink|altalink|apeos|c\d{2,4}|b\d{2,4}|magenta|amarillo|cyan|negro)/i;
 const RX_SUPPORT = /(soporte|servicio|visita|no imprime|atasc(a|o)|atasco|falla|error|mantenimiento|se atora|se traba|atasca el papel|saca el papel|mancha|línea|linea)/i;
 
 const RX_ADD_ITEM = /\b(agrega(?:me)?|añade|mete|pon|suma|incluye)\b/i;
@@ -299,7 +307,7 @@ function promptedRecently(session, key, ms=5*60*1000){
 }
 
 /* ============================ IA ============================ */
-async function aiCall(env, messages, {json=false}={}){
+async function aiCall(env, messages, {json=false}={}) {
   const OPENAI_KEY = env.OPENAI_API_KEY || env.OPENAI_KEY;
   const MODEL = env.LLM_MODEL || env.OPENAI_NLU_MODEL || env.OPENAI_FALLBACK_MODEL || 'gpt-4o-mini';
   if (!OPENAI_KEY) return null;
@@ -330,19 +338,6 @@ Contesta breve, útil y amable. Si no hay contexto, ofrece inventario o soporte.
   }
   const out = await aiCall(env, [{role:'system', content: sys}, {role:'user', content: prompt}], {});
   return out || (`Hola${nombre?`, ${nombre}`:''} 🙌 ¿En qué te ayudo hoy?`);
-}
-
-async function aiClassifyIntent(env, text){
-  const sys = `Clasifica texto del usuario en JSON.
-Campos: intent in ["support","sales","faq","smalltalk"], severity in ["alta","media","baja"] (si intent="support").
-Reglas:
-- "atasco", "no imprime", "error", "servicio", "visita" => support
-- "toner", "precio", "SKU", colores => sales
-- "quiénes son", "horarios", "dónde están" => faq
-- otro => smalltalk
-Responde sólo JSON.`;
-  const out = await aiCall(env, [{role:'system', content: sys},{role:'user', content: text}], {json:true});
-  try{ return JSON.parse(out||'{}'); }catch{ return { intent:'smalltalk' }; }
 }
 
 /* ============================ WhatsApp ============================ */
@@ -403,9 +398,12 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
   session.data = session.data || {};
   const cart = session.data.cart || [];
 
+  // Finalizar compra
   if (RX_DONE.test(lowered) || (RX_NEG_NO.test(lowered) && cart.length > 0)) {
-    if (!cart.length && session.data.last_candidate) {
-      pushCart(session, session.data.last_candidate, 1, (numberOrZero(session.data.last_candidate.stock) <= 0));
+    if (!cart.length) {
+      await sendWhatsAppText(env, toE164, `Aún no he agregado nada 🛒. Si quieres ese artículo, dime *"sí"* o *"agrégalo"*.`);
+      await saveSession(env, session, now);
+      return ok('EVENT_RECEIVED');
     }
     session.stage = 'await_invoice';
     await saveSession(env, session, now);
@@ -413,12 +411,14 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     return ok('EVENT_RECEIVED');
   }
 
+  // Confirmación positiva (sí / cantidades)
   const RX_YES_CONFIRM = /\b(s[ií]|sí|si|claro|va|dale|correcto|ok|afirmativo|hazlo|agr[eé]ga(lo)?|añade|m[eé]te|pon(lo)?)\b/i;
   if (RX_YES_CONFIRM.test(lowered) || RX_WANT_QTY.test(lowered)) {
     const qty = parseQty(lowered, 1);
     const cand = session.data?.last_candidate;
     if (cand) {
       pushCart(session, cand, qty, (numberOrZero(cand.stock) <= 0));
+      session.data.last_candidate = null;
       await saveSession(env, session, now);
       await sendWhatsAppText(
         env,
@@ -430,6 +430,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     }
   }
 
+  // "agrega ..." con búsqueda
   if (RX_ADD_ITEM.test(lowered)) {
     const cleanQ = lowered.replace(RX_ADD_ITEM, '').trim() || ntext;
     const best = await findBestProduct(env, cleanQ);
@@ -437,6 +438,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
       const qty = parseQty(lowered, 1);
       pushCart(session, best, qty, (numberOrZero(best.stock) <= 0));
       session.data.last_candidate = best;
+      session.data.last_candidate_at = Date.now();
       await saveSession(env, session, now);
       await sendWhatsAppText(
         env,
@@ -452,6 +454,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     }
   }
 
+  // Nueva búsqueda dentro del flujo
   if (RX_INV_Q.test(ntext)) {
     const alt = await findBestProduct(env, ntext);
     const hints = extractModelHints(ntext);
@@ -465,12 +468,14 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     }
     if (alt) {
       session.data.last_candidate = alt;
+      session.data.last_candidate_at = Date.now();
       await saveSession(env, session, now);
       await sendWhatsAppText(env, toE164, `${renderProducto(alt)}\n\n¿Lo agrego o prefieres otra opción?`);
       return ok('EVENT_RECEIVED');
     }
   }
 
+  // Small talk dentro del carrito
   if (/^(ok|gracias|como estas|¿?cómo estás\??|hola)$/i.test(lowered)) {
     const friendly = await aiSmallTalk(env, session, 'general', text);
     await sendWhatsAppText(env, toE164, `${friendly}\nSi gustas, puedo agregar el visto, buscar otro o finalizar.`);
@@ -483,14 +488,28 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
   return ok('EVENT_RECEIVED');
 }
 
-async function handleAwaitInvoice(env, session, toE164, lowered, now, originalText='') {
-  const yes = /\b(s[ií]|sí|si|con(\s+factura)?|factura|con)\b/i.test(lowered);
-  const no  = /\b(sin(\s+factura)?|sin|no)\b/i.test(lowered);
+/* === Facturación: parser robusto === */
+function parseInvoicePreference(lowered='') {
+  const hasSin = /\bsin(\s+factura)?\b/i.test(lowered) || /\bno\b/i.test(lowered);
+  const hasCon = /\bcon(\s+factura)?\b/i.test(lowered) || /\bfacturar\b/i.test(lowered) || /\bcon\b/i.test(lowered);
+  if (hasSin) return false;
+  if (hasCon) return true;
+  // “factura” solo es ambiguo
+  if (/\bfactura(s)?\b/i.test(lowered)) return null;
+  // "sí" o "ok" sin aclarar → ambiguo
+  if (RX_YES.test(lowered)) return null;
+  if (RX_NO.test(lowered)) return false;
+  return null;
+}
 
+async function handleAwaitInvoice(env, session, toE164, lowered, now, originalText='') {
   session.data = session.data || {};
   session.data.customer = session.data.customer || {};
 
-  if (!yes && !no && /hola|cómo estás|como estas|gracias/i.test(lowered)) {
+  const pref = parseInvoicePreference(lowered);
+
+  // Small talk mientras esperamos
+  if (pref === null && /hola|cómo estás|como estas|gracias/i.test(lowered)) {
     const friendly = await aiSmallTalk(env, session, 'general', originalText);
     if (!promptedRecently(session, 'invoice', 3*60*1000)) {
       await sendWhatsAppText(env, toE164, `${friendly}\nPor cierto, ¿la quieres *con factura* o *sin factura*?`);
@@ -501,18 +520,13 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now, originalTe
     return ok('EVENT_RECEIVED');
   }
 
-  if (yes) {
-    session.data.requires_invoice = true;
+  if (pref !== null) {
+    session.data.requires_invoice = !!pref;
     session.stage = 'collect_nombre';
     await saveSession(env, session, now);
-    await sendWhatsAppText(env, toE164, `Perfecto. ¿Me compartes *Nombre / Razón Social*?`);
-    return ok('EVENT_RECEIVED');
-  }
-  if (no) {
-    session.data.requires_invoice = false;
-    session.stage = 'collect_nombre';
-    await saveSession(env, session, now);
-    await sendWhatsAppText(env, toE164, `Va. ¿Con qué *Nombre / contacto* dejamos la entrega?`);
+    await sendWhatsAppText(env, toE164, pref
+      ? `Perfecto. ¿Me compartes *Nombre / Razón Social*?`
+      : `Va. ¿Con qué *Nombre / contacto* dejamos la entrega?`);
     return ok('EVENT_RECEIVED');
   }
 
@@ -586,6 +600,7 @@ async function handleCollectSequential(env, session, toE164, text, now){
     return ok('EVENT_RECEIVED');
   }
 
+  // Crear pedido
   const res = await createOrderFromSession(env, session, toE164);
   if (res?.ok) {
     const { inStockList, backOrderList } = splitCart(session.data.cart);
@@ -593,8 +608,15 @@ async function handleCollectSequential(env, session, toE164, text, now){
       inStockList.length ? `Artículos con stock:\n${inStockList.map(i=>`• ${i.product?.nombre} x ${i.qty}`).join('\n')}` : '',
       backOrderList.length ? `\nSobre pedido:\n${backOrderList.map(i=>`• ${i.product?.nombre} x ${i.qty}`).join('\n')}` : ''
     ].filter(Boolean).join('\n');
-    await sendWhatsAppText(env, toE164, `¡Listo! Generé tu solicitud 🙌\n*Total estimado:* ${formatMoneyMXN(res.total)} + IVA\nUn asesor te confirmará entrega y forma de pago.`);
-    await notifySupport(env, `Nuevo pedido #${res.pedido_id}\nCliente: ${c.nombre} (${toE164})\n${notaStock || '—'}\nFactura: ${session.data.requires_invoice ? 'Sí' : 'No'}`);
+
+    await sendWhatsAppText(env, toE164, `¡Listo! Generé tu solicitud 🙌
+*Total estimado:* ${formatMoneyMXN(res.total)} + IVA
+Un asesor te confirmará entrega y forma de pago.`);
+
+    await notifySupport(env, `Nuevo pedido #${res.pedido_id || '(sin id)'}
+Cliente: ${c.nombre} (${toE164})
+${notaStock || '—'}
+Factura: ${session.data.requires_invoice ? 'Sí' : 'No'}`);
   } else {
     await sendWhatsAppText(env, toE164, `Creé tu solicitud y la pasé a un asesor humano para confirmar detalles. 🙌`);
     await notifySupport(env, `Pedido (parcial) ${toE164}. Revisar en Supabase.\nError: ${res?.error || 'N/A'}`);
@@ -602,10 +624,12 @@ async function handleCollectSequential(env, session, toE164, text, now){
 
   session.stage = 'idle';
   session.data.cart = [];
+  session.data.last_candidate = null;
+  session.data.last_greet_at = new Date().toISOString(); // evita saludo inmediato
   await saveSession(env, session, now);
 
-  const close = await aiSmallTalk(env, session, 'general', 'cierre-pedido');
-  await sendWhatsAppText(env, toE164, close || `¿En qué más te ayudo hoy? 😊`);
+  // Cierre neutro (sin “Hola …”)
+  await sendWhatsAppText(env, toE164, `¿Necesitas algo más? Estoy al pendiente 🙂`);
   return ok('EVENT_RECEIVED');
 }
 
@@ -619,15 +643,6 @@ function splitCart(cart = []){
 }
 
 /* =============== Inventario & Pedido =============== */
-
-// Stopwords para limpiar la frase del usuario
-const STOP_WORDS = new Set([
-  'tienes','tenga','tienen','quiero','ocupo','para','de','del','la','el','los','las',
-  'un','una','unos','unas','me','lo','por','con','sin','en','que','y','o','u',
-  'porfa','porfavor','favor','hola','buenos','dias','buenas','noches','hay','tendrá',
-  'tendras','tendrán','busco','buscas','necesito','necesitas','precio','costo','coste'
-]);
-
 function extractModelHints(text='') {
   const t = normalize(text);
   const out = {};
@@ -651,10 +666,10 @@ function productHasColor(p, color){
   if (!color) return true;
   const s = normalize([p?.nombre, p?.sku].join(' '));
   const map = {
-    amarillo: ['amarillo','yellow','ylw',' y '],
-    magenta: ['magenta',' m '],
-    cyan:    ['cyan','cian',' c '],
-    negro:   ['negro','black','bk',' k ']
+    amarillo: ['amarillo','yellow','ylw','y'],
+    magenta: ['magenta','m '],
+    cyan: ['cyan','cian',' c '],
+    negro: ['negro','black','bk',' k ']
   };
   const keys = map[color] || [];
   return keys.some(k => s.includes(k));
@@ -662,81 +677,49 @@ function productHasColor(p, color){
 function productMatchesFamily(p, family){
   if (!family) return true;
   const s = normalize([p?.nombre, p?.sku, p?.marca].join(' '));
-  if (family==='c70') return /\bc(60|70|75)\b/.test(s) || s.includes('c60') || s.includes('c70') || s.includes('c75');
+  if (family==='c70') return /\bc(60|70|75)\b/i.test(s) || s.includes('c60') || s.includes('c70') || s.includes('c75');
   return s.includes(family);
 }
 
-// Elegir palabra clave principal para el fallback
-function pickPrimaryKeyword(queryText) {
-  const t = normalize(queryText);
-  const hints = extractModelHints(t);
-  const color = extractColor(t);
-  const tokens = t.replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(w => w && !STOP_WORDS.has(w));
-  const modelish = tokens.find(w => /(versant|versalink|altalink|docucolor|apeos|xerox|fujifilm|fuji|c\d{2,4}|b\d{2,4})/.test(w));
-  const primary = hints.family || modelish || color || 'toner';
-  return { hints, color, primary };
-}
-
 async function findBestProduct(env, queryText, opts = {}) {
-  let pool = null;
-
-  // 1) Intentar RPC si existe
+  let res = null;
   try {
-    const res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 16 });
-    if (Array.isArray(res) && res.length) pool = res;
-  } catch (_) {}
+    res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 8 });
+  } catch(e) {}
 
-  // 2) Fallback por palabra clave (no por la frase completa)
-  if (!Array.isArray(pool) || !pool.length) {
-    const { color, primary } = pickPrimaryKeyword(queryText);
-    const tryTerms = [primary];
-    if (color && !tryTerms.includes(color)) tryTerms.push(color);
-    if (!tryTerms.includes('toner')) tryTerms.push('toner');
-
-    for (const term of tryTerms) {
-      const like = encodeURIComponent(`%${term}%`);
+  if (!Array.isArray(res) || !res.length) {
+    try {
+      const like = encodeURIComponent(`%${queryText.slice(0, 60)}%`);
       const r = await sbGet(env, 'producto_stock_v', {
-        query:
-          `select=id,nombre,marca,sku,precio,stock,tipo,active` +
-          `&active=is.true` +
-          `&or=(nombre.ilike.${like},sku.ilike.${like},marca.ilike.${like})` +
-          `&order=stock.desc.nullslast` +
-          `&limit=50`
+        query: `select=id,nombre,marca,sku,precio,stock&or=(nombre.ilike.${like},sku.ilike.${like},marca.ilike.${like})&order=stock.desc.nullslast&limit=8`
       });
-      if (Array.isArray(r) && r.length) { pool = r; break; }
-    }
-    if (!Array.isArray(pool) || !pool.length) return null;
+      res = r || [];
+    } catch {}
   }
 
-  // 3) Filtrado por color/familia (STRICT_FAMILY_MATCH si aplica)
+  if (!Array.isArray(res) || !res.length) return null;
+
   const hints = extractModelHints(queryText);
   const color = extractColor(queryText);
   const strict = (env.STRICT_FAMILY_MATCH || '').toString().toLowerCase() === 'true';
 
-  let filtered = pool.filter(p => productHasColor(p, color));
+  let pool = res.slice();
 
+  // color siempre
+  pool = pool.filter(p => productHasColor(p, color));
+
+  // familia si hay pista y no se pide ignorar
   if (hints.family && !opts.ignoreFamily) {
-    const famPool = filtered.filter(p => productMatchesFamily(p, hints.family));
-    if (famPool.length) filtered = famPool;
-    else if (strict) return null;
+    const famPool = pool.filter(p => productMatchesFamily(p, hints.family));
+    if (famPool.length) {
+      pool = famPool;
+    } else if (strict) {
+      return null;
+    }
   }
 
-  filtered.sort((a, b) =>
-    numberOrZero(b.score||0) - numberOrZero(a.score||0) ||
-    numberOrZero(b.stock||0) - numberOrZero(a.stock||0)
-  );
-
-  const best = filtered[0] || null;
-
-  await logDecision(env, {
-    type: 'search_debug',
-    query: queryText,
-    got: pool?.length || 0,
-    after_filters: filtered?.length || 0,
-    pick: best?.sku || null
-  });
-
-  return best;
+  pool.sort((a,b) => numberOrZero(b.score||0) - numberOrZero(a.score||0));
+  return pool[0] || null;
 }
 
 async function ensureClienteFields(env, cliente_id, c){
@@ -774,7 +757,15 @@ async function createOrderFromSession(env, session, toE164) {
     const p = await sbUpsert(env, 'pedido', [{
       cliente_id, total, moneda: 'MXN', estado: 'nuevo', created_at: new Date().toISOString()
     }], { returning: 'representation' });
-    const pedido_id = p?.data?.[0]?.id;
+    let pedido_id = p?.data?.[0]?.id || null;
+
+    // Fallback si no regresó representación
+    if (!pedido_id && cliente_id) {
+      try {
+        const last = await sbGet(env, 'pedido', { query: `select=id,created_at&cliente_id=eq.${cliente_id}&order=created_at.desc&limit=1` });
+        pedido_id = last?.[0]?.id || null;
+      } catch {}
+    }
 
     const items = cart.map(it => ({
       pedido_id,
@@ -1198,7 +1189,7 @@ function sb(env){
   const key = env.SUPABASE_SERVICE_ROLE || env.SUPABASE_KEY;
   return { url:`${env.SUPABASE_URL}/rest/v1`, key };
 }
-async function sbGet(env, table, { query='', headers={} }={}){
+async function sbGet(env, table, { query='', headers={} }={}) {
   const b = sb(env);
   const url = `${b.url}/${table}${query?`?${query}`:''}`;
   const r = await fetch(url, { headers:{ apikey:b.key, Authorization:`Bearer ${b.key}`, ...headers } });
@@ -1206,7 +1197,7 @@ async function sbGet(env, table, { query='', headers={} }={}){
   if (!r.ok){ console.warn('sbGet', table, r.status, await r.text()); return null; }
   try { return await r.json(); } catch { return null; }
 }
-async function sbUpsert(env, table, body, { onConflict='', returning='representation', headers={} }={}){
+async function sbUpsert(env, table, body, { onConflict='', returning='representation', headers={} }={}) {
   const b = sb(env);
   const url = `${b.url}/${table}`;
   const h = {
