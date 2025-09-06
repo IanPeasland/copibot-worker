@@ -1,12 +1,12 @@
 /**
  * CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
- * HÍBRIDO CON ESTADOS MÍNIMOS – FIXES
- * - Parser robusto de “con/sin factura”
- * - Se elimina auto-add del último candidato con carrito vacío
- * - Cierre neutro (sin saludo) y anti-autogreeting inmediato
- * - Fix query getLastOpenOS (where)
- * - Fallback para obtener pedido_id tras upsert
- * - Pequeños hardenings
+ * HÍBRIDO CON ESTADOS MÍNIMOS
+ * - Reanudar flujo con await_resume
+ * - Filtro por familia/color y STRICT_FAMILY_MATCH
+ * - Fase await_compatibles para buscar ignorando familia
+ * - “sí, agrégalo / hazlo” detecta en cualquier parte
+ * - “con/sin” → factura (con prioridad a “sin”)
+ * - Logger opcional DEBUG_LOG → wa_debug
  */
 
 export default {
@@ -14,7 +14,7 @@ export default {
     try {
       const url = new URL(req.url);
 
-      // Verify webhook
+      // Webhook verify
       if (req.method === 'GET' && url.pathname === '/') {
         const mode = url.searchParams.get('hub.mode');
         const token = url.searchParams.get('hub.verify_token');
@@ -25,7 +25,7 @@ export default {
         return new Response('Forbidden', { status: 403 });
       }
 
-      // Cron
+      // Cron endpoint (opcional)
       if (req.method === 'POST' && url.pathname === '/cron') {
         const sec = req.headers.get('x-cron-secret') || url.searchParams.get('secret');
         if (!sec || sec !== env.CRON_SECRET) return new Response('Forbidden', { status: 403 });
@@ -33,7 +33,7 @@ export default {
         return ok(`cron ok ${JSON.stringify(out)}`);
       }
 
-      // WhatsApp webhook
+      // Webhook mensajes
       if (req.method === 'POST' && url.pathname === '/') {
         const payload = await safeJson(req);
         const ctx = extractWhatsAppContext(payload);
@@ -59,7 +59,7 @@ export default {
         if (session?.data?.last_mid && session.data.last_mid === mid) return ok('EVENT_RECEIVED');
         session.data.last_mid = mid;
 
-        // Comandos universales soporte
+        // Comandos universales
         if (/\b(cancel(a|ar).*(cita|visita|servicio))\b/i.test(lowered)) {
           await svCancel(env, session, fromE164);
           await saveSession(env, session, now);
@@ -79,7 +79,7 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // Saludo durante flujo → pausar
+        // Saludo mientras hay flujo activo → pausar y preguntar
         const isGreet = RX_GREET.test(lowered);
         if (isGreet && session.stage !== 'idle') {
           const friendly = await aiSmallTalk(env, session, 'general', text);
@@ -113,14 +113,12 @@ export default {
         // Compatibles: confirmar búsqueda relajada
         if (session.stage === 'await_compatibles') {
           const baseQ = session.data?.pending_query || ntext || text;
-
           if (RX_YES.test(lowered)) {
             const best = await findBestProduct(env, baseQ, { ignoreFamily: true });
             if (best) {
               session.stage = 'cart_open';
               session.data.cart = session.data.cart || [];
               session.data.last_candidate = best;
-              session.data.last_candidate_at = Date.now();
               await saveSession(env, session, now);
               await sendWhatsAppText(env, fromE164, `${renderProducto(best)}\n\n¿Lo agrego o busco otra opción?`);
             } else {
@@ -131,21 +129,18 @@ export default {
             }
             return ok('EVENT_RECEIVED');
           }
-
           if (RX_NO.test(lowered)) {
             session.stage = 'idle';
             await saveSession(env, session, now);
             await sendWhatsAppText(env, fromE164, `Perfecto. ¿En qué más te ayudo?`);
             return ok('EVENT_RECEIVED');
           }
-
           // cualquier otro texto: intentar como compatibles
           const best = await findBestProduct(env, ntext || text, { ignoreFamily: true });
           if (best) {
             session.stage = 'cart_open';
             session.data.cart = session.data.cart || [];
             session.data.last_candidate = best;
-            session.data.last_candidate_at = Date.now();
             await saveSession(env, session, now);
             await sendWhatsAppText(env, fromE164, `${renderProducto(best)}\n\n¿Lo agrego o busco otra opción?`);
           } else {
@@ -157,8 +152,18 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // Autogreeting
-        const mayGreet = isGreet && shouldAutogreet(session, now) && session.stage === 'idle';
+        // === Detecta intención ANTES del autogreeting ===
+        const hardSupport = RX_SUPPORT.test(ntext);
+        const looksInv = RX_INV_Q.test(ntext);
+
+        // Saludo automático SOLO si no hay intención clara de ventas/soporte
+        const mayGreet =
+          isGreet &&
+          shouldAutogreet(session, now) &&
+          session.stage === 'idle' &&
+          !looksInv &&
+          !hardSupport;
+
         if (mayGreet) {
           const g = await aiSmallTalk(env, session, 'greeting');
           await sendWhatsAppText(env, fromE164, g);
@@ -166,9 +171,6 @@ export default {
           await saveSession(env, session, now);
           return ok('EVENT_RECEIVED');
         }
-
-        const hardSupport = RX_SUPPORT.test(ntext);
-        const looksInv = RX_INV_Q.test(ntext);
 
         // FAQs
         const faqAns = await maybeFAQ(env, ntext);
@@ -186,7 +188,7 @@ export default {
           return handled;
         }
 
-        // VENTAS (flujo ya abierto)
+        // VENTAS
         if (session.stage === 'cart_open') {
           const handled = await handleCartOpen(env, session, fromE164, text, lowered, ntext, now);
           return handled;
@@ -205,7 +207,6 @@ export default {
           const best = await findBestProduct(env, ntext);
           const hints = extractModelHints(ntext || text);
           const strict = (env.STRICT_FAMILY_MATCH || '').toString().toLowerCase() === 'true';
-
           if (!best && hints.family && strict) {
             session.stage = 'await_compatibles';
             session.data.pending_query = ntext || text;
@@ -217,12 +218,10 @@ export default {
             );
             return ok('EVENT_RECEIVED');
           }
-
           if (best) {
             session.stage = 'cart_open';
             session.data.cart = session.data.cart || [];
             session.data.last_candidate = best;
-            session.data.last_candidate_at = Date.now();
             await saveSession(env, session, now);
             await sendWhatsAppText(
               env,
@@ -307,7 +306,7 @@ function promptedRecently(session, key, ms=5*60*1000){
 }
 
 /* ============================ IA ============================ */
-async function aiCall(env, messages, {json=false}={}) {
+async function aiCall(env, messages, {json=false}={}){
   const OPENAI_KEY = env.OPENAI_API_KEY || env.OPENAI_KEY;
   const MODEL = env.LLM_MODEL || env.OPENAI_NLU_MODEL || env.OPENAI_FALLBACK_MODEL || 'gpt-4o-mini';
   if (!OPENAI_KEY) return null;
@@ -338,6 +337,19 @@ Contesta breve, útil y amable. Si no hay contexto, ofrece inventario o soporte.
   }
   const out = await aiCall(env, [{role:'system', content: sys}, {role:'user', content: prompt}], {});
   return out || (`Hola${nombre?`, ${nombre}`:''} 🙌 ¿En qué te ayudo hoy?`);
+}
+
+async function aiClassifyIntent(env, text){
+  const sys = `Clasifica texto del usuario en JSON.
+Campos: intent in ["support","sales","faq","smalltalk"], severity in ["alta","media","baja"] (si intent="support").
+Reglas:
+- "atasco", "no imprime", "error", "servicio", "visita" => support
+- "toner", "precio", "SKU", colores => sales
+- "quiénes son", "horarios", "dónde están" => faq
+- otro => smalltalk
+Responde sólo JSON.`;
+  const out = await aiCall(env, [{role:'system', content: sys},{role:'user', content: text}], {json:true});
+  try{ return JSON.parse(out||'{}'); }catch{ return { intent:'smalltalk' }; }
 }
 
 /* ============================ WhatsApp ============================ */
@@ -398,12 +410,9 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
   session.data = session.data || {};
   const cart = session.data.cart || [];
 
-  // Finalizar compra
   if (RX_DONE.test(lowered) || (RX_NEG_NO.test(lowered) && cart.length > 0)) {
-    if (!cart.length) {
-      await sendWhatsAppText(env, toE164, `Aún no he agregado nada 🛒. Si quieres ese artículo, dime *"sí"* o *"agrégalo"*.`);
-      await saveSession(env, session, now);
-      return ok('EVENT_RECEIVED');
+    if (!cart.length && session.data.last_candidate) {
+      pushCart(session, session.data.last_candidate, 1, (numberOrZero(session.data.last_candidate.stock) <= 0));
     }
     session.stage = 'await_invoice';
     await saveSession(env, session, now);
@@ -411,14 +420,12 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     return ok('EVENT_RECEIVED');
   }
 
-  // Confirmación positiva (sí / cantidades)
   const RX_YES_CONFIRM = /\b(s[ií]|sí|si|claro|va|dale|correcto|ok|afirmativo|hazlo|agr[eé]ga(lo)?|añade|m[eé]te|pon(lo)?)\b/i;
   if (RX_YES_CONFIRM.test(lowered) || RX_WANT_QTY.test(lowered)) {
     const qty = parseQty(lowered, 1);
     const cand = session.data?.last_candidate;
     if (cand) {
       pushCart(session, cand, qty, (numberOrZero(cand.stock) <= 0));
-      session.data.last_candidate = null;
       await saveSession(env, session, now);
       await sendWhatsAppText(
         env,
@@ -430,7 +437,6 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     }
   }
 
-  // "agrega ..." con búsqueda
   if (RX_ADD_ITEM.test(lowered)) {
     const cleanQ = lowered.replace(RX_ADD_ITEM, '').trim() || ntext;
     const best = await findBestProduct(env, cleanQ);
@@ -438,7 +444,6 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
       const qty = parseQty(lowered, 1);
       pushCart(session, best, qty, (numberOrZero(best.stock) <= 0));
       session.data.last_candidate = best;
-      session.data.last_candidate_at = Date.now();
       await saveSession(env, session, now);
       await sendWhatsAppText(
         env,
@@ -454,7 +459,6 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     }
   }
 
-  // Nueva búsqueda dentro del flujo
   if (RX_INV_Q.test(ntext)) {
     const alt = await findBestProduct(env, ntext);
     const hints = extractModelHints(ntext);
@@ -468,14 +472,12 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     }
     if (alt) {
       session.data.last_candidate = alt;
-      session.data.last_candidate_at = Date.now();
       await saveSession(env, session, now);
       await sendWhatsAppText(env, toE164, `${renderProducto(alt)}\n\n¿Lo agrego o prefieres otra opción?`);
       return ok('EVENT_RECEIVED');
     }
   }
 
-  // Small talk dentro del carrito
   if (/^(ok|gracias|como estas|¿?cómo estás\??|hola)$/i.test(lowered)) {
     const friendly = await aiSmallTalk(env, session, 'general', text);
     await sendWhatsAppText(env, toE164, `${friendly}\nSi gustas, puedo agregar el visto, buscar otro o finalizar.`);
@@ -488,28 +490,15 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
   return ok('EVENT_RECEIVED');
 }
 
-/* === Facturación: parser robusto === */
-function parseInvoicePreference(lowered='') {
-  const hasSin = /\bsin(\s+factura)?\b/i.test(lowered) || /\bno\b/i.test(lowered);
-  const hasCon = /\bcon(\s+factura)?\b/i.test(lowered) || /\bfacturar\b/i.test(lowered) || /\bcon\b/i.test(lowered);
-  if (hasSin) return false;
-  if (hasCon) return true;
-  // “factura” solo es ambiguo
-  if (/\bfactura(s)?\b/i.test(lowered)) return null;
-  // "sí" o "ok" sin aclarar → ambiguo
-  if (RX_YES.test(lowered)) return null;
-  if (RX_NO.test(lowered)) return false;
-  return null;
-}
-
 async function handleAwaitInvoice(env, session, toE164, lowered, now, originalText='') {
+  // Prioriza la negación para que "sin factura" no se tome como "sí"
+  const saysNo  = /\b(sin(\s+factura)?|sin|no)\b/i.test(lowered);
+  const saysYes = !saysNo && /\b(s[ií]|sí|si|con(\s+factura)?|con|factura)\b/i.test(lowered);
+
   session.data = session.data || {};
   session.data.customer = session.data.customer || {};
 
-  const pref = parseInvoicePreference(lowered);
-
-  // Small talk mientras esperamos
-  if (pref === null && /hola|cómo estás|como estas|gracias/i.test(lowered)) {
+  if (!saysYes && !saysNo && /hola|cómo estás|como estas|gracias/i.test(lowered)) {
     const friendly = await aiSmallTalk(env, session, 'general', originalText);
     if (!promptedRecently(session, 'invoice', 3*60*1000)) {
       await sendWhatsAppText(env, toE164, `${friendly}\nPor cierto, ¿la quieres *con factura* o *sin factura*?`);
@@ -520,13 +509,18 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now, originalTe
     return ok('EVENT_RECEIVED');
   }
 
-  if (pref !== null) {
-    session.data.requires_invoice = !!pref;
+  if (saysYes) {
+    session.data.requires_invoice = true;
     session.stage = 'collect_nombre';
     await saveSession(env, session, now);
-    await sendWhatsAppText(env, toE164, pref
-      ? `Perfecto. ¿Me compartes *Nombre / Razón Social*?`
-      : `Va. ¿Con qué *Nombre / contacto* dejamos la entrega?`);
+    await sendWhatsAppText(env, toE164, `Perfecto. ¿Me compartes *Nombre / Razón Social*?`);
+    return ok('EVENT_RECEIVED');
+  }
+  if (saysNo) {
+    session.data.requires_invoice = false;
+    session.stage = 'collect_nombre';
+    await saveSession(env, session, now);
+    await sendWhatsAppText(env, toE164, `Va. ¿Con qué *Nombre / contacto* dejamos la entrega?`);
     return ok('EVENT_RECEIVED');
   }
 
@@ -600,7 +594,6 @@ async function handleCollectSequential(env, session, toE164, text, now){
     return ok('EVENT_RECEIVED');
   }
 
-  // Crear pedido
   const res = await createOrderFromSession(env, session, toE164);
   if (res?.ok) {
     const { inStockList, backOrderList } = splitCart(session.data.cart);
@@ -608,15 +601,8 @@ async function handleCollectSequential(env, session, toE164, text, now){
       inStockList.length ? `Artículos con stock:\n${inStockList.map(i=>`• ${i.product?.nombre} x ${i.qty}`).join('\n')}` : '',
       backOrderList.length ? `\nSobre pedido:\n${backOrderList.map(i=>`• ${i.product?.nombre} x ${i.qty}`).join('\n')}` : ''
     ].filter(Boolean).join('\n');
-
-    await sendWhatsAppText(env, toE164, `¡Listo! Generé tu solicitud 🙌
-*Total estimado:* ${formatMoneyMXN(res.total)} + IVA
-Un asesor te confirmará entrega y forma de pago.`);
-
-    await notifySupport(env, `Nuevo pedido #${res.pedido_id || '(sin id)'}
-Cliente: ${c.nombre} (${toE164})
-${notaStock || '—'}
-Factura: ${session.data.requires_invoice ? 'Sí' : 'No'}`);
+    await sendWhatsAppText(env, toE164, `¡Listo! Generé tu solicitud 🙌\n*Total estimado:* ${formatMoneyMXN(res.total)} + IVA\nUn asesor te confirmará entrega y forma de pago.`);
+    await notifySupport(env, `Nuevo pedido #${res.pedido_id ?? '—'}\nCliente: ${c.nombre} (${toE164})\n${notaStock || '—'}\nFactura: ${session.data.requires_invoice ? 'Sí' : 'No'}`);
   } else {
     await sendWhatsAppText(env, toE164, `Creé tu solicitud y la pasé a un asesor humano para confirmar detalles. 🙌`);
     await notifySupport(env, `Pedido (parcial) ${toE164}. Revisar en Supabase.\nError: ${res?.error || 'N/A'}`);
@@ -624,12 +610,10 @@ Factura: ${session.data.requires_invoice ? 'Sí' : 'No'}`);
 
   session.stage = 'idle';
   session.data.cart = [];
-  session.data.last_candidate = null;
-  session.data.last_greet_at = new Date().toISOString(); // evita saludo inmediato
   await saveSession(env, session, now);
 
-  // Cierre neutro (sin “Hola …”)
-  await sendWhatsAppText(env, toE164, `¿Necesitas algo más? Estoy al pendiente 🙂`);
+  const close = await aiSmallTalk(env, session, 'general', 'cierre-pedido');
+  await sendWhatsAppText(env, toE164, close || `¿En qué más te ayudo hoy? 😊`);
   return ok('EVENT_RECEIVED');
 }
 
@@ -757,15 +741,7 @@ async function createOrderFromSession(env, session, toE164) {
     const p = await sbUpsert(env, 'pedido', [{
       cliente_id, total, moneda: 'MXN', estado: 'nuevo', created_at: new Date().toISOString()
     }], { returning: 'representation' });
-    let pedido_id = p?.data?.[0]?.id || null;
-
-    // Fallback si no regresó representación
-    if (!pedido_id && cliente_id) {
-      try {
-        const last = await sbGet(env, 'pedido', { query: `select=id,created_at&cliente_id=eq.${cliente_id}&order=created_at.desc&limit=1` });
-        pedido_id = last?.[0]?.id || null;
-      } catch {}
-    }
+    const pedido_id = p?.data?.[0]?.id;
 
     const items = cart.map(it => ({
       pedido_id,
@@ -1189,7 +1165,7 @@ function sb(env){
   const key = env.SUPABASE_SERVICE_ROLE || env.SUPABASE_KEY;
   return { url:`${env.SUPABASE_URL}/rest/v1`, key };
 }
-async function sbGet(env, table, { query='', headers={} }={}) {
+async function sbGet(env, table, { query='', headers={} }={}){
   const b = sb(env);
   const url = `${b.url}/${table}${query?`?${query}`:''}`;
   const r = await fetch(url, { headers:{ apikey:b.key, Authorization:`Bearer ${b.key}`, ...headers } });
@@ -1197,7 +1173,7 @@ async function sbGet(env, table, { query='', headers={} }={}) {
   if (!r.ok){ console.warn('sbGet', table, r.status, await r.text()); return null; }
   try { return await r.json(); } catch { return null; }
 }
-async function sbUpsert(env, table, body, { onConflict='', returning='representation', headers={} }={}) {
+async function sbUpsert(env, table, body, { onConflict='', returning='representation', headers={} }={}){
   const b = sb(env);
   const url = `${b.url}/${table}`;
   const h = {
