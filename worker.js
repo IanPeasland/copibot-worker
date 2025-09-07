@@ -1,9 +1,10 @@
 /** CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
- * Cambios clave:
- * - Color matching ESTRICTO (evita que “Y” coincida con “cyan”, etc.)
+ * Cambios clave (esta versión):
+ * - FIX: ReferenceError en renderProducto (variable declarada correctamente)
+ * - Color matching estricto (amarillo/magenta/cyan/negro)
  * - findBestProduct(query, { ignoreFamily, excludeSku })
- * - En carrito entiende “busca otro / otra opción” y muestra el siguiente (excluye SKU actual)
- * - Guardamos last_query para repetir la búsqueda con el mismo texto
+ * - En carrito entiende “busca otro / otra opción” (excluye SKU actual)
+ * - Guarda last_query para repetir búsqueda
  * - Autogreeting no interrumpe ventas/soporte
  * - “sin factura” se interpreta bien
  */
@@ -58,7 +59,7 @@ export default {
         if (session?.data?.last_mid && session.data.last_mid === mid) return ok('EVENT_RECEIVED');
         session.data.last_mid = mid;
 
-        // Comandos universales
+        // Comandos universales (soporte)
         if (/\b(cancel(a|ar).*(cita|visita|servicio))\b/i.test(lowered)) {
           await svCancel(env, session, fromE164);
           await saveSession(env, session, now);
@@ -155,7 +156,7 @@ export default {
 
         // === Detecta intención ANTES del autogreeting ===
         const hardSupport = RX_SUPPORT.test(ntext);
-        const looksInv = RX_INV_Q.test(ntext);
+        const looksInv = RX_INV_Q.test(ntext); // ventas
 
         // Saludo automático SOLO si no hay intención clara de ventas/soporte
         const mayGreet =
@@ -203,9 +204,14 @@ export default {
           return handled;
         }
 
-        // Inicio ventas
+        // Inicio ventas (cuando estamos en idle)
         if (session.stage === 'idle' && looksInv) {
-          const best = await findBestProduct(env, ntext);
+          let best = null;
+          try {
+            best = await findBestProduct(env, ntext);
+          } catch (e) {
+            console.warn('findBestProduct error', e);
+          }
           const hints = extractModelHints(ntext || text);
           const strict = (env.STRICT_FAMILY_MATCH || '').toString().toLowerCase() === 'true';
           if (!best && hints.family && strict) {
@@ -273,11 +279,11 @@ export default {
 
 /* ============================ Regex ============================ */
 const RX_GREET = /^(hola+|buen[oa]s|qué onda|que tal|saludos|hey|buen dia|buenas|holi+)\b/i;
-const RX_INV_Q  = /(toner|tóner|cartucho|developer|refacci[oó]n|precio|docucolor|versant|versalink|altalink|apeos|c\d{2,4}|b\d{2,4}|magenta|amarill|cyan|cian|negro|black)/i;
+const RX_INV_Q  = /(toner|tóner|cartucho|developer|refacci[oó]n|precio|docucolor|versant|versalink|altalink|apeos|c\d{2,4}|b\d{2,4}|magenta|amarill|yellow|cyan|cian|negro|black|sku)/i;
 const RX_SUPPORT = /(soporte|servicio|visita|no imprime|atasc(a|o)|atasco|falla|error|mantenimiento|se atora|se traba|atasca el papel|saca el papel|mancha|línea|linea)/i;
 
 const RX_ADD_ITEM = /\b(agrega(?:me)?|añade|mete|pon|suma|incluye)\b/i;
-const RX_FIND_OTHER = /\b(busca(?:r)?\s+(otro|otra)|otra\s+opci[oó]n)\b/i;
+const RX_FIND_OTHER = /\b(busca(?:r)?\s+(otro|otra)|otra\s+opci[oó]n|busca\s+otra)\b/i;
 const RX_DONE = /\b(es(ta)? (todo|suficiente)|ser[ií]a todo|nada m[aá]s|con eso|as[ií] est[aá] bien|ya qued[oó]|listo|est[aá] listo)\b/i;
 const RX_NEG_NO = /\bno\b/i;
 const RX_WANT_QTY = /\b(quiero|ocupo|me llevo|pon|agrega|añade|mete|dame|manda|env[ií]ame|p[oó]n)\s+(\d+)\b/i;
@@ -405,8 +411,8 @@ function renderProducto(p) {
   const sku = p.sku ? `\nSKU: ${p.sku}` : '';
   const marca = p.marca ? `\nMarca: ${p.marca}` : '';
   const s = numberOrZero(p.stock);
-  theStock = s > 0 ? `${s} pzas en stock` : `0 pzas — *sobre pedido* (lo pedimos para ti)`;
-  return `1. ${p.nombre}${marca}${sku}\n${precio}\n${theStock}\n\nEste suele ser el indicado para tu equipo.`;
+  const stockLine = s > 0 ? `${s} pzas en stock` : `0 pzas — *sobre pedido* (lo pedimos para ti)`;
+  return `1. ${p.nombre}${marca}${sku}\n${precio}\n${stockLine}\n\nEste suele ser el indicado para tu equipo.`;
 }
 
 async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
