@@ -1,12 +1,8 @@
-/**
- * CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
- * HÍBRIDO CON ESTADOS MÍNIMOS
- * - Reanudar flujo con await_resume
- * - Filtro por familia/color y STRICT_FAMILY_MATCH
- * - Fase await_compatibles para buscar ignorando familia
- * - “sí, agrégalo / hazlo” detecta en cualquier parte
- * - “con/sin” → factura (con prioridad a “sin”)
- * - Logger opcional DEBUG_LOG → wa_debug
+/** CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
+ * Cambios:
+ * - Autogreeting no interrumpe ventas/soporte
+ * - “sin factura” se interpreta bien
+ * - findBestProduct con fallback robusto por familia/color/toner (arregla búsquedas como “tienes toner amarillo para versant?”)
  */
 
 export default {
@@ -665,45 +661,78 @@ function productMatchesFamily(p, family){
   return s.includes(family);
 }
 
+/* === NUEVO findBestProduct robusto === */
 async function findBestProduct(env, queryText, opts = {}) {
-  let res = null;
-  try {
-    res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 8 });
-  } catch(e) {}
-
-  if (!Array.isArray(res) || !res.length) {
-    try {
-      const like = encodeURIComponent(`%${queryText.slice(0, 60)}%`);
-      const r = await sbGet(env, 'producto_stock_v', {
-        query: `select=id,nombre,marca,sku,precio,stock&or=(nombre.ilike.${like},sku.ilike.${like},marca.ilike.${like})&order=stock.desc.nullslast&limit=8`
-      });
-      res = r || [];
-    } catch {}
-  }
-
-  if (!Array.isArray(res) || !res.length) return null;
-
   const hints = extractModelHints(queryText);
   const color = extractColor(queryText);
   const strict = (env.STRICT_FAMILY_MATCH || '').toString().toLowerCase() === 'true';
 
-  let pool = res.slice();
+  const pick = (arr) => {
+    if (!Array.isArray(arr) || !arr.length) return null;
+    let pool = arr.slice();
 
-  // color siempre
-  pool = pool.filter(p => productHasColor(p, color));
+    // Filtrado por color
+    pool = pool.filter(p => productHasColor(p, color));
 
-  // familia si hay pista y no se pide ignorar
-  if (hints.family && !opts.ignoreFamily) {
-    const famPool = pool.filter(p => productMatchesFamily(p, hints.family));
-    if (famPool.length) {
-      pool = famPool;
-    } else if (strict) {
-      return null;
+    // Filtrado por familia (preferente; solo bloquea si strict=true)
+    if (hints.family && !opts.ignoreFamily) {
+      const famPool = pool.filter(p => productMatchesFamily(p, hints.family));
+      if (famPool.length) pool = famPool;
+      else if (strict) return null;
     }
+
+    // Orden: stock>0 primero, luego score (si viene del RPC), luego precio más bajo
+    pool.sort((a,b) => {
+      const sa = numberOrZero(a.stock) > 0 ? 1 : 0;
+      const sb = numberOrZero(b.stock) > 0 ? 1 : 0;
+      if (sa !== sb) return sb - sa;
+      const sc = numberOrZero(b.score||0) - numberOrZero(a.score||0);
+      if (sc !== 0) return sc;
+      return numberOrZero(a.precio||0) - numberOrZero(b.precio||0);
+    });
+    return pool[0] || null;
+  };
+
+  // 1) RPC (si existe)
+  try {
+    const res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 12 });
+    const best = pick(res);
+    if (best) return best;
+  } catch {}
+
+  // 2) Búsqueda por familia (si se detectó)
+  if (hints.family) {
+    try {
+      const like = encodeURIComponent(`%${hints.family}%`);
+      const r = await sbGet(env, 'producto_stock_v', {
+        query: `select=id,nombre,marca,sku,precio,stock,tipo&or=(nombre.ilike.${like},sku.ilike.${like},marca.ilike.${like})&order=stock.desc.nullslast,precio.asc&limit=50`
+      });
+      const best = pick(r);
+      if (best) return best;
+      if (strict && !opts.ignoreFamily) return null;
+    } catch {}
   }
 
-  pool.sort((a,b) => numberOrZero(b.score||0) - numberOrZero(a.score||0));
-  return pool[0] || null;
+  // 3) Pool amplio de TONERS y filtrado en memoria
+  try {
+    const r = await sbGet(env, 'producto_stock_v', {
+      query: `select=id,nombre,marca,sku,precio,stock,tipo&tipo=eq.toner&order=stock.desc.nullslast,precio.asc&limit=120`
+    });
+    const best = pick(r);
+    if (best) return best;
+  } catch {}
+
+  // 4) fallback final: búsqueda simple por “toner” en nombre/sku
+  try {
+    const like = encodeURIComponent(`%toner%`);
+    const r = await sbGet(env, 'producto_stock_v', {
+      query: `select=id,nombre,marca,sku,precio,stock&or=(nombre.ilike.${like},sku.ilike.${like})&order=stock.desc.nullslast,precio.asc&limit=120`
+    });
+    const best = pick(r);
+    if (best) return best;
+  } catch {}
+
+  return null;
 }
 
 async function ensureClienteFields(env, cliente_id, c){
