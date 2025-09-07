@@ -1,12 +1,12 @@
 /** CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
  * Cambios clave (esta versión):
- * - FIX: ReferenceError en renderProducto (variable declarada correctamente)
- * - Color matching estricto (amarillo/magenta/cyan/negro)
- * - findBestProduct(query, { ignoreFamily, excludeSku })
- * - En carrito entiende “busca otro / otra opción” (excluye SKU actual)
- * - Guarda last_query para repetir búsqueda
- * - Autogreeting no interrumpe ventas/soporte
- * - “sin factura” se interpreta bien
+ * - NUEVO flujo: al responder "sí" a un artículo, se pregunta "¿cuántas piezas necesitas?"
+ * - Manejo de sobrepedido: si la cantidad solicitada > stock, se agrega lo disponible y el resto como "sobre pedido"
+ * - Estado nuevo: await_qty
+ * - Mensajes claros de disponibilidad (ej. "tengo 1 en stock; las otras 2 van sobre pedido")
+ * - FIX previo: renderProducto sin ReferenceError
+ * - Búsqueda robusta por familia/color + compatibles
+ * - “sin factura” no se interpreta como “sí”
  */
 
 export default {
@@ -190,11 +190,20 @@ export default {
           return handled;
         }
 
-        // VENTAS
+        // ===== VENTAS =====
+        // 1) Esperando cantidad (tras un "sí")
+        if (session.stage === 'await_qty') {
+          const handled = await handleAwaitQty(env, session, fromE164, text, lowered, ntext, now);
+          return handled;
+        }
+
+        // 2) Carrito abierto
         if (session.stage === 'cart_open') {
           const handled = await handleCartOpen(env, session, fromE164, text, lowered, ntext, now);
           return handled;
         }
+
+        // 3) Proceso de factura/datos
         if (session.stage === 'await_invoice') {
           const handled = await handleAwaitInvoice(env, session, fromE164, lowered, now, text);
           return handled;
@@ -204,7 +213,7 @@ export default {
           return handled;
         }
 
-        // Inicio ventas (cuando estamos en idle)
+        // 4) Inicio ventas (idle + intención inventario)
         if (session.stage === 'idle' && looksInv) {
           let best = null;
           try {
@@ -288,7 +297,8 @@ const RX_DONE = /\b(es(ta)? (todo|suficiente)|ser[ií]a todo|nada m[aá]s|con es
 const RX_NEG_NO = /\bno\b/i;
 const RX_WANT_QTY = /\b(quiero|ocupo|me llevo|pon|agrega|añade|mete|dame|manda|env[ií]ame|p[oó]n)\s+(\d+)\b/i;
 
-const RX_YES = /\b(s[ií]|sí|si|claro|va|dale|correcto|ok|seguim(?:os)?|contin[uú]a(?:r)?|adelante|afirmativo|hazlo|agr[eé]ga)\b/i;
+const RX_YES_CONFIRM = /\b(s[ií]|sí|si|claro|va|dale|correcto|ok|afirmativo|hazlo|de acuerdo)\b/i;
+const RX_YES = RX_YES_CONFIRM;
 const RX_NO  = /\b(no|luego|despu[eé]s|pausa|ahorita no|cancelar|det[eé]n|mejor no)\b/i;
 
 /* ============================ Helpers ============================ */
@@ -312,6 +322,10 @@ function promptedRecently(session, key, ms=5*60*1000){
   const ok = (Date.now() - last) < ms;
   session.data.prompts[key] = new Date().toISOString();
   return ok;
+}
+function parseBareNumber(text, fallback=NaN){
+  const m = text.match(/\b(\d{1,4})\b/);
+  return m ? Number(m[1]) : fallback;
 }
 
 /* ============================ IA ============================ */
@@ -402,9 +416,17 @@ function pushCart(session, product, qty, backorder = false) {
   session.data = session.data || {};
   session.data.cart = session.data.cart || [];
   const key = product?.id || product?.sku || product?.nombre;
-  const existing = session.data.cart.find(i => i.key === key);
+  const existing = session.data.cart.find(i => i.key === key && i.backorder === backorder);
   if (existing) existing.qty += qty;
   else session.data.cart.push({ key, product, qty, backorder });
+}
+function addQtyWithBackorder(session, product, qty){
+  const available = Math.max(0, numberOrZero(product.stock));
+  const inStock = Math.min(available, qty);
+  const backorderQty = Math.max(0, qty - inStock);
+  if (inStock > 0) pushCart(session, product, inStock, false);
+  if (backorderQty > 0) pushCart(session, product, backorderQty, true);
+  return { inStock, backorderQty };
 }
 function renderProducto(p) {
   const precio = priceWithIVA(p.precio);
@@ -413,6 +435,45 @@ function renderProducto(p) {
   const s = numberOrZero(p.stock);
   const stockLine = s > 0 ? `${s} pzas en stock` : `0 pzas — *sobre pedido* (lo pedimos para ti)`;
   return `1. ${p.nombre}${marca}${sku}\n${precio}\n${stockLine}\n\nEste suele ser el indicado para tu equipo.`;
+}
+
+async function handleAwaitQty(env, session, toE164, text, lowered, ntext, now){
+  // cancelar o cambiar de idea
+  if (RX_NO.test(lowered)) {
+    session.stage = 'cart_open';
+    await saveSession(env, session, now);
+    await sendWhatsAppText(env, toE164, `Sin problema. ¿Busco *otra opción* o finalizamos?`);
+    return ok('EVENT_RECEIVED');
+  }
+
+  const qty = parseBareNumber(lowered);
+  if (!Number.isFinite(qty) || qty <= 0) {
+    const s = numberOrZero(session.data?.last_candidate?.stock);
+    await sendWhatsAppText(env, toE164, `¿Cuántas piezas necesitas? Escribe un número (ej. 2).${s?` Hay ${s} en stock; el resto iría *sobre pedido*.`:''}`);
+    return ok('EVENT_RECEIVED');
+  }
+
+  const cand = session.data?.last_candidate;
+  if (!cand) {
+    session.stage = 'cart_open';
+    await saveSession(env, session, now);
+    await sendWhatsAppText(env, toE164, `Perfecto. Puedo agregar el visto, buscar otro o finalizar.`);
+    return ok('EVENT_RECEIVED');
+  }
+
+  const { inStock, backorderQty } = addQtyWithBackorder(session, cand, qty);
+  session.stage = 'cart_open';
+  await saveSession(env, session, now);
+
+  let extra = '';
+  if (backorderQty > 0) extra = ` (${inStock} en stock y ${backorderQty} *sobre pedido*)`;
+
+  await sendWhatsAppText(
+    env,
+    toE164,
+    `Añadí 🛒\n• ${cand.nombre} x ${qty} ${priceWithIVA(cand.precio)}${extra}\n\n¿Deseas agregar algo más o finalizamos?`
+  );
+  return ok('EVENT_RECEIVED');
 }
 
 async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
@@ -435,9 +496,11 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     return ok('EVENT_RECEIVED');
   }
 
+  // Finalizar / pasar a facturación
   if (RX_DONE.test(lowered) || (RX_NEG_NO.test(lowered) && cart.length > 0)) {
     if (!cart.length && session.data.last_candidate) {
-      pushCart(session, session.data.last_candidate, 1, (numberOrZero(session.data.last_candidate.stock) <= 0));
+      // si aún no había cart, agrega 1 por defecto
+      addQtyWithBackorder(session, session.data.last_candidate, 1);
     }
     session.stage = 'await_invoice';
     await saveSession(env, session, now);
@@ -445,36 +508,50 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     return ok('EVENT_RECEIVED');
   }
 
-  const RX_YES_CONFIRM = /\b(s[ií]|sí|si|claro|va|dale|correcto|ok|afirmativo|hazlo|agr[eé]ga(lo)?|añade|m[eé]te|pon(lo)?)\b/i;
-  if (RX_YES_CONFIRM.test(lowered) || RX_WANT_QTY.test(lowered)) {
+  // "Quiero 2", "pon 3", etc. (trae cantidad)
+  if (RX_WANT_QTY.test(lowered)) {
     const qty = parseQty(lowered, 1);
     const cand = session.data?.last_candidate;
     if (cand) {
-      pushCart(session, cand, qty, (numberOrZero(cand.stock) <= 0));
+      const { inStock, backorderQty } = addQtyWithBackorder(session, cand, qty);
       await saveSession(env, session, now);
+      let extra = '';
+      if (backorderQty > 0) extra = ` (${inStock} en stock y ${backorderQty} *sobre pedido*)`;
       await sendWhatsAppText(
         env,
         toE164,
-        `Añadí 🛒\n• ${cand.nombre} x ${qty} ${priceWithIVA(cand.precio)}${(numberOrZero(cand.stock) <= 0 ? ' (sobre pedido)' : '')}\n\n¿Deseas agregar algo más?`
+        `Añadí 🛒\n• ${cand.nombre} x ${qty} ${priceWithIVA(cand.precio)}${extra}\n\n¿Deseas agregar algo más?`
       );
-      await logDecision(env, { type:'cart_yes', from: session.from, stage: session.stage, text, last_candidate: cand?.sku || null });
+      await logDecision(env, { type:'cart_yes_qty', from: session.from, stage: session.stage, qty, last_candidate: cand?.sku || null });
       return ok('EVENT_RECEIVED');
     }
   }
 
+  // "Sí" (sin cantidad) → pedir cantidad
+  if (RX_YES_CONFIRM.test(lowered)) {
+    session.stage = 'await_qty';
+    await saveSession(env, session, now);
+    const s = numberOrZero(session.data?.last_candidate?.stock);
+    await sendWhatsAppText(env, toE164, `De acuerdo. ¿Cuántas *piezas* necesitas?${s?` (hay ${s} en stock; el resto iría *sobre pedido*)`:''}`);
+    return ok('EVENT_RECEIVED');
+  }
+
+  // "agrega ..." buscando otro artículo directo
   if (RX_ADD_ITEM.test(lowered)) {
     const cleanQ = lowered.replace(RX_ADD_ITEM, '').trim() || ntext;
     const best = await findBestProduct(env, cleanQ);
     if (best) {
-      const qty = parseQty(lowered, 1);
-      pushCart(session, best, qty, (numberOrZero(best.stock) <= 0));
+      const qty = parseBareNumber(lowered) || 1;
+      const { inStock, backorderQty } = addQtyWithBackorder(session, best, qty);
       session.data.last_candidate = best;
       session.data.last_query = cleanQ;
       await saveSession(env, session, now);
+      let extra = '';
+      if (backorderQty > 0) extra = ` (${inStock} en stock y ${backorderQty} *sobre pedido*)`;
       await sendWhatsAppText(
         env,
         toE164,
-        `Sumé:\n• ${best.nombre} x ${qty} ${priceWithIVA(best.precio)}${(numberOrZero(best.stock) <= 0 ? ' (sobre pedido)' : '')}\n\n¿Quieres agregar algo más?`
+        `Sumé:\n• ${best.nombre} x ${qty} ${priceWithIVA(best.precio)}${extra}\n\n¿Quieres agregar algo más?`
       );
       return ok('EVENT_RECEIVED');
     } else {
@@ -485,6 +562,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     }
   }
 
+  // Buscar otra vez por palabras de inventario
   if (RX_INV_Q.test(ntext)) {
     const alt = await findBestProduct(env, ntext);
     const hints = extractModelHints(ntext);
@@ -500,14 +578,15 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
       session.data.last_candidate = alt;
       session.data.last_query = ntext;
       await saveSession(env, session, now);
-      await sendWhatsAppText(env, toE164, `${renderProducto(alt)}\n\n¿Lo agrego o prefieres otra opción?`);
+      await sendWhatsAppText(env, toE164, `${renderProducto(alt)}\n\n¿Lo agrego o prefieres *otra opción*?`);
       return ok('EVENT_RECEIVED');
     }
   }
 
+  // Small talk breve dentro del carrito
   if (/^(ok|gracias|como estas|¿?cómo estás\??|hola)$/i.test(lowered)) {
     const friendly = await aiSmallTalk(env, session, 'general', text);
-    await sendWhatsAppText(env, toE164, `${friendly}\nSi gustas, puedo agregar el visto, buscar otro o finalizar.`);
+    await sendWhatsAppText(env, toE164, `${friendly}\nSi gustas, puedo *agregar* el visto, *buscar otra opción* o *finalizar*.`);
     await saveSession(env, session, now);
     return ok('EVENT_RECEIVED');
   }
@@ -703,20 +782,15 @@ async function findBestProduct(env, queryText, opts = {}) {
     if (!Array.isArray(arr) || !arr.length) return null;
     let pool = arr.slice();
 
-    // Excluir SKU actual si se pide otra opción
     if (exclude) pool = pool.filter(p => (p?.sku || '').toLowerCase() !== exclude);
-
-    // Filtrado por color
     pool = pool.filter(p => productHasColor(p, color));
 
-    // Filtrado por familia (preferente; solo bloquea si strict=true)
     if (hints.family && !opts.ignoreFamily) {
       const famPool = pool.filter(p => productMatchesFamily(p, hints.family));
       if (famPool.length) pool = famPool;
       else if (strict) return null;
     }
 
-    // Orden: stock>0 primero, luego score (si viene del RPC), luego precio más bajo
     pool.sort((a,b) => {
       const sa = numberOrZero(a.stock) > 0 ? 1 : 0;
       const sb = numberOrZero(b.stock) > 0 ? 1 : 0;
@@ -817,14 +891,14 @@ async function createOrderFromSession(env, session, toE164) {
     }));
     await sbUpsert(env, 'pedido_item', items, { returning: 'minimal' });
 
-    // decremento de stock simple
+    // decremento de stock simple (solo descuenta lo que pueda)
     for (const it of cart) {
       const sku = it.product?.sku;
       if (!sku) continue;
       try {
         const row = await sbGet(env, 'producto_stock_v', { query: `select=sku,stock&sku=eq.${encodeURIComponent(sku)}&limit=1` });
         const current = numberOrZero(row?.[0]?.stock);
-        const toDec = Math.min(current, Number(it.qty||0));
+        const toDec = Math.min(current, Number(it.qty||0)); // para backorder normalmente será 0
         if (toDec > 0) {
           await sbRpc(env, 'decrement_stock', { in_sku: sku, in_by: toDec });
         }
@@ -1371,6 +1445,7 @@ function displayField(k){ const map={ nombre:'Nombre / Razón Social', rfc:'RFC'
 function buildResumePrompt(session){
   const st = session?.stage || 'idle';
   if (st === 'await_invoice') return '¿La cotizamos con factura o sin factura?';
+  if (st === 'await_qty') return '¿Cuántas piezas necesitas?';
   if (st === 'cart_open') return '¿Lo agrego al carrito o prefieres otra opción?';
   if (st && st.startsWith('collect_')) {
     const k = st.replace('collect_','');
