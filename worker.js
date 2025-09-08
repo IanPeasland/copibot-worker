@@ -1,10 +1,12 @@
 /**
  * CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
- * Mejoras:
- * - En await_resume si el usuario pide producto o soporte → se atiende directo (no re-pregunta).
- * - Cierre de pedido con “¿algo más?” (post_order) y despedida si dice que no.
- * - Confirmación de cantidad con split stock/sobre pedido.
- * - “sin factura” prioriza negación.
+ * Mejoras (sep 2025):
+ * - “¿Puedo ayudarte con algo más?” entiende respuestas naturales (sí/no libres).
+ * - Detección de fallas ampliada (“mi impresora está fallando”, “problema”, etc.)
+ *   → FAQs rápidas si aplican, si no flujo de calendar.
+ * - Reutiliza datos del cliente: al elegir factura/sin factura, precarga desde DB
+ *   y sólo pide lo que falte; si nada falta, genera el pedido directo.
+ * - Evita saludo inmediato tras cerrar (“no”) en post_order.
  */
 
 export default {
@@ -93,7 +95,6 @@ export default {
           const looksInv = RX_INV_Q.test(ntext);
           const hardSupport = RX_SUPPORT.test(ntext);
 
-          // Si pide producto o soporte, atendemos directo (sin re-pregunta)
           if (looksInv) {
             const handled = await startSalesFromQuery(env, session, fromE164, text, ntext, now);
             return handled;
@@ -104,21 +105,20 @@ export default {
             return handled;
           }
 
-          if (RX_YES.test(lowered)) {
+          if (isYesish(lowered)) {
             session.stage = session?.data?.last_stage || 'idle';
             await saveSession(env, session, now);
             const prompt = buildResumePrompt(session);
             await sendWhatsAppText(env, fromE164, prompt);
             return ok('EVENT_RECEIVED');
           }
-          if (RX_NO.test(lowered)) {
+          if (isNoish(lowered)) {
             session.stage = 'idle';
             if (session?.data) delete session.data.last_stage;
             await saveSession(env, session, now);
             await sendWhatsAppText(env, fromE164, 'De acuerdo. ¿En qué te ayudo hoy?');
             return ok('EVENT_RECEIVED');
           }
-          // Cualquier otra cosa: re-preguntar de forma breve
           await sendWhatsAppText(env, fromE164, '¿Deseas continuar con tu trámite? (Sí / No)');
           return ok('EVENT_RECEIVED');
         }
@@ -126,7 +126,7 @@ export default {
         // Compatibles: confirmar búsqueda relajada
         if (session.stage === 'await_compatibles') {
           const baseQ = session.data?.pending_query || ntext || text;
-          if (RX_YES.test(lowered)) {
+          if (isYesish(lowered)) {
             const best = await findBestProduct(env, baseQ, { ignoreFamily: true });
             if (best) {
               session.stage = 'cart_open';
@@ -142,13 +142,12 @@ export default {
             }
             return ok('EVENT_RECEIVED');
           }
-          if (RX_NO.test(lowered)) {
+          if (isNoish(lowered)) {
             session.stage = 'idle';
             await saveSession(env, session, now);
             await sendWhatsAppText(env, fromE164, `Perfecto. ¿En qué más te ayudo?`);
             return ok('EVENT_RECEIVED');
           }
-          // cualquier otro texto: intentar como compatibles
           const best = await findBestProduct(env, ntext || text, { ignoreFamily: true });
           if (best) {
             session.stage = 'cart_open';
@@ -197,19 +196,17 @@ export default {
 
         // POST-ORDER: ¿algo más?
         if (session.stage === 'post_order') {
-          // si claramente dice no → despedida
-          if (RX_NO.test(lowered)) {
+          if (isNoish(lowered)) {
             session.stage = 'idle';
+            session.data.last_greet_at = now.toISOString(); // evita autogreeting inmediato
             await saveSession(env, session, now);
             await sendWhatsAppText(env, fromE164, '¡Gracias! Quedo al pendiente para cualquier otra cosa. 🙌');
             return ok('EVENT_RECEIVED');
           }
-          // si claramente dice sí → pedir qué necesita
-          if (RX_YES.test(lowered) && !looksInv && !hardSupport) {
+          if (isYesish(lowered) && !looksInv && !hardSupport) {
             await sendWhatsAppText(env, fromE164, 'Perfecto, dime qué necesitas y lo reviso. 😊');
             return ok('EVENT_RECEIVED');
           }
-          // si viene una solicitud directa, atenderla
           if (looksInv) {
             const handled = await startSalesFromQuery(env, session, fromE164, text, ntext, now);
             return handled;
@@ -218,7 +215,6 @@ export default {
             const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, intent);
             return handled;
           }
-          // otro texto: re-pregunta breve
           await sendWhatsAppText(env, fromE164, '¿Puedo ayudarte con algo más? (Sí / No)');
           return ok('EVENT_RECEIVED');
         }
@@ -288,15 +284,22 @@ export default {
 /* ============================ Regex ============================ */
 const RX_GREET = /^(hola+|buen[oa]s|qué onda|que tal|saludos|hey|buen dia|buenas|holi+)\b/i;
 const RX_INV_Q  = /(toner|tóner|cartucho|developer|refacci[oó]n|precio|docucolor|versant|versalink|altalink|apeos|c\d{2,4}|b\d{2,4}|magenta|amarillo|cyan|negro)/i;
-const RX_SUPPORT = /(soporte|servicio|visita|no imprime|atasc(a|o)|atasco|falla|error|mantenimiento|se atora|se traba|atasca el papel|saca el papel|mancha|línea|linea)/i;
+/* Ampliado para captar “fallando”, “problema”, no enciende/escanea/copia */
+const RX_SUPPORT = /(soporte|servicio|visita|no imprime|atasc(a|o)|atasco|falla(?:ndo)?|fall[oa]|problema|error|mantenimiento|se atora|se traba|atasca el papel|saca el papel|mancha|l[ií]ne?a|no escanea|no copia|no prende|no enciende|se apaga)/i;
 
 const RX_ADD_ITEM = /\b(agrega(?:me)?|añade|mete|pon|suma|incluye)\b/i;
 const RX_DONE = /\b(es(ta)? (todo|suficiente)|ser[ií]a todo|nada m[aá]s|con eso|as[ií] est[aá] bien|ya qued[oó]|listo|est[aá] listo)\b/i;
 const RX_NEG_NO = /\bno\b/i;
 const RX_WANT_QTY = /\b(quiero|ocupo|me llevo|pon|agrega|añade|mete|dame|manda|env[ií]ame|p[oó]n)\s+(\d+)\b/i;
 
-const RX_YES = /\b(s[ií]|sí|si|claro|va|dale|correcto|ok|seguim(?:os)?|contin[uú]a(?:r)?|adelante|afirmativo|hazlo|agr[eé]ga)\b/i;
-const RX_NO  = /\b(no|luego|despu[eé]s|pausa|ahorita no|cancelar|det[eé]n|mejor no)\b/i;
+/* === Natural yes/no helpers === */
+const RX_YES = /\b(s[ií]|sí|si|claro|va|dale|sale|correcto|ok|seguim(?:os)?|contin[uú]a(?:r)?|adelante|afirmativo|de acuerdo|me sirve)\b/i;
+const RX_NO  = /\b(no|nel|luego|despu[eé]s|pausa|ahorita no|cancelar|det[eé]n|mejor no)\b/i;
+function isYesish(t){ return RX_YES.test(t); }
+function isNoish(t){
+  return RX_NO.test(t) ||
+    /\b(nada\s+m[aá]s|ser[ií]a\s+todo|eso\s+es\s+todo|por\s+el\s+momento\s+no|no\s+gracias|todo\s+bien|listo(,|\s)?\s*gracias|gracias,\s*eso es todo|ya\s+est[aá])\b/i.test(t);
+}
 
 /* ============================ Helpers ============================ */
 const firstWord = (s='') => (s||'').trim().split(/\s+/)[0] || '';
@@ -359,7 +362,7 @@ async function aiClassifyIntent(env, text){
   const sys = `Clasifica texto del usuario en JSON.
 Campos: intent in ["support","sales","faq","smalltalk"], severity in ["alta","media","baja"] (si intent="support").
 Reglas:
-- "atasco", "no imprime", "error", "servicio", "visita" => support
+- "atasco", "no imprime", "error", "servicio", "visita", "fallando", "problema" => support
 - "toner", "precio", "SKU", colores => sales
 - "quiénes son", "horarios", "dónde están" => faq
 - otro => smalltalk
@@ -555,18 +558,31 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now, originalTe
     return ok('EVENT_RECEIVED');
   }
 
-  if (saysYes) {
-    session.data.requires_invoice = true;
-    session.stage = 'collect_nombre';
+  if (saysYes || saysNo) {
+    session.data.requires_invoice = !!saysYes;
+    // Precarga datos del cliente existentes y sólo pide lo que falte
+    await preloadCustomerIfAny(env, session);
+    const list = session.data.requires_invoice ? FLOW_FACT : FLOW_SHIP;
+    const need = firstMissing(list, session.data.customer);
+    if (need) {
+      session.stage = `collect_${need}`;
+      await saveSession(env, session, now);
+      await sendWhatsAppText(env, toE164, `¿${LABEL[need]}?`);
+      return ok('EVENT_RECEIVED');
+    }
+    // Si no falta nada → generar pedido directo
+    const res = await createOrderFromSession(env, session, toE164);
+    if (res?.ok) {
+      await sendWhatsAppText(env, toE164, `¡Listo! Generé tu solicitud 🙌\n*Total estimado:* ${formatMoneyMXN(res.total)} + IVA\nUn asesor te confirmará entrega y forma de pago.`);
+      await notifySupport(env, `Nuevo pedido #${res.pedido_id ?? '—'}\nCliente: ${session.data.customer?.nombre || 'N/D'} (${toE164})\nFactura: ${session.data.requires_invoice ? 'Sí' : 'No'}`);
+    } else {
+      await sendWhatsAppText(env, toE164, `Creé tu solicitud y la pasé a un asesor humano para confirmar detalles. 🙌`);
+      await notifySupport(env, `Pedido (parcial) ${toE164}. Revisar en Supabase.\nError: ${res?.error || 'N/A'}`);
+    }
+    session.stage = 'post_order';
+    session.data.cart = [];
     await saveSession(env, session, now);
-    await sendWhatsAppText(env, toE164, `Perfecto. ¿Me compartes *Nombre / Razón Social*?`);
-    return ok('EVENT_RECEIVED');
-  }
-  if (saysNo) {
-    session.data.requires_invoice = false;
-    session.stage = 'collect_nombre';
-    await saveSession(env, session, now);
-    await sendWhatsAppText(env, toE164, `Va. ¿Con qué *Nombre / contacto* dejamos la entrega?`);
+    await sendWhatsAppText(env, toE164, '¿Puedo ayudarte con algo más? (Sí / No)');
     return ok('EVENT_RECEIVED');
   }
 
@@ -589,6 +605,7 @@ const LABEL = {
   colonia:'Colonia',
   cp:'Código Postal'
 };
+function firstMissing(list, c={}){ for (const k of list){ if (!truthy(c[k])) return k; } return null; }
 
 function parseCustomerFragment(field, text){
   const t = text;
@@ -630,8 +647,7 @@ async function handleCollectSequential(env, session, toE164, text, now){
   }
   await saveSession(env, session, now);
 
-  const idx = list.indexOf(field);
-  const nextField = list[idx+1];
+  const nextField = firstMissing(list, c);
 
   if (nextField){
     session.stage = `collect_${nextField}`;
@@ -654,7 +670,6 @@ async function handleCollectSequential(env, session, toE164, text, now){
     await notifySupport(env, `Pedido (parcial) ${toE164}. Revisar en Supabase.\nError: ${res?.error || 'N/A'}`);
   }
 
-  // En lugar de saludar, hacemos seguimiento corto
   session.stage = 'post_order';
   session.data.cart = [];
   await saveSession(env, session, now);
@@ -818,6 +833,16 @@ async function startSalesFromQuery(env, session, toE164, text, ntext, now){
     await saveSession(env, session, now);
     return ok('EVENT_RECEIVED');
   }
+}
+
+/* ====== Precarga de cliente ====== */
+async function preloadCustomerIfAny(env, session){
+  try{
+    const r = await sbGet(env, 'cliente', { query: `select=nombre,rfc,email,calle,numero,colonia,ciudad,cp&telefono=eq.${session.from}&limit=1` });
+    if (r && r[0]) {
+      session.data.customer = { ...(session.data.customer||{}), ...r[0] };
+    }
+  }catch(e){ console.warn('preloadCustomerIfAny', e); }
 }
 
 async function ensureClienteFields(env, cliente_id, c){
@@ -1044,6 +1069,13 @@ Si sigue igual, agendamos visita para diagnóstico.`;
 2) Verifica tóner y que todas las puertas estén bien cerradas.
 3) Intenta imprimir una página de prueba.
 Si persiste, agendamos visita.`;
+  }
+  if (/\bmancha|l[ií]ne?a|calidad\b/.test(ntext)){
+    return `Sugerencia rápida 🎯
+1) Imprime un patrón de prueba.
+2) Revisa niveles y remueve/coloca de nuevo los tóners.
+3) Limpia rodillos si es posible.
+Si no mejora, te agendo visita para revisión.`;
   }
   return null;
 }
