@@ -7,7 +7,7 @@
  * - Reutiliza datos del cliente: al elegir factura/sin factura, precarga desde DB
  *   y sólo pide lo que falte; si nada falta, genera el pedido directo.
  * - Evita saludo inmediato tras cerrar (“no”) en post_order.
- * - NUEVO: Manejo de soporte **antes** de FAQs/IO (early short-circuit) + sbGet con try/catch.
+ * - EARLY SUPPORT: si detecta falla, entra a soporte *antes* de FAQs o llamadas externas.
  */
 
 export default {
@@ -146,7 +146,7 @@ export default {
 
         /* ================== EARLY SHORT-CIRCUIT ==================
            Si el usuario reporta una falla, atendemos soporte de inmediato,
-           antes de FAQs / OpenAI / Supabase, para evitar silencios. */
+           antes de FAQs / OpenAI / Supabase. */
         if (hardSupport) {
           const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent:'support' });
           return handled;
@@ -999,7 +999,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     ciudad: sv.ciudad || null,
     cp: sv.cp || null,
     created_at: new Date().toISOString()
-  }]];
+  }];
   const os = await sbUpsert(env, 'orden_servicio', osBody, { returning: 'representation' });
   const osId = os?.data?.[0]?.id;
 
@@ -1230,7 +1230,7 @@ function renderOsDescription(phone, sv) {
 }
 async function getLastOpenOS(env, phone) {
   try {
-    const r = await sbGet(env, 'orden_servicio', { query: `select=id,estado,ventana_inicio,ventana_fin,calendar_id,gcal_event_id,cliente_id&cliente_id=in.(select id from cliente donde telefono=eq.${phone})&order=ventana_inicio.desc&limit=1` });
+    const r = await sbGet(env, 'orden_servicio', { query: `select=id,estado,ventana_inicio,ventana_fin,calendar_id,gcal_event_id,cliente_id&cliente_id=in.(select id from cliente where telefono=eq.${phone})&order=ventana_inicio.desc&limit=1` });
     if (r && r[0] && ['agendado','reprogramado','confirmado'].includes(r[0].estado)) return r[0];
   } catch {}
   return null;
