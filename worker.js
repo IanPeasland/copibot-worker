@@ -94,7 +94,6 @@ export default {
         // ==== REANUDACIÓN / BYPASS SI PIDE ALGO DIRECTO ====
         if (session.stage === 'await_resume') {
           const looksInv = RX_INV_Q.test(ntext);
-          // >>> CAMBIO: detección semántica de soporte
           const hardSupport = isSupportish(ntext) || RX_SUPPORT.test(ntext);
 
           if (looksInv) {
@@ -167,7 +166,6 @@ export default {
         }
 
         // === Detecta intención ANTES del autogreeting ===
-        // >>> CAMBIO: detección semántica de soporte
         const hardSupport = isSupportish(ntext) || RX_SUPPORT.test(ntext);
         const looksInv = RX_INV_Q.test(ntext);
 
@@ -287,12 +285,13 @@ export default {
 /* ============================ Regex ============================ */
 const RX_GREET = /^(hola+|buen[oa]s|qué onda|que tal|saludos|hey|buen dia|buenas|holi+)\b/i;
 const RX_INV_Q  = /(toner|tóner|cartucho|developer|refacci[oó]n|precio|docucolor|versant|versalink|altalink|apeos|c\d{2,4}|b\d{2,4}|magenta|amarillo|cyan|negro)/i;
-/* Ampliado para captar “fallando”, “problema”, no enciende/escanea/copia + no funciona/sirve, descompuesto/a */
+/* Ampliado para captar más sinónimos de falla */
 const RX_SUPPORT = /(soporte|servicio|visita|no imprime|atasc(a|o)|atasco|falla(?:ndo)?|fall[oa]|problema|error|mantenimiento|se atora|se traba|atasca el papel|saca el papel|mancha|l[ií]ne?a|no escanea|no copia|no prende|no enciende|se apaga|no funciona|no sirve|descompuest[oa]|descompuso)/i;
-/* Detección semántica sencilla: equipo + síntoma en cualquier orden */
+
+/* NUEVO: Detección semántica (equipo + síntoma en cualquier orden) */
 function isSupportish(t){
-  const equipo = /(impresor(a)?|equipo|xerox|fujifilm|fuji\s?film|versant|versalink|altalink|docucolor)/i;
-  const sintoma = /(fall(a|ando)|problema|no\s+(funciona|imprime|prende|enciende|copia|escanea|sirve)|descompuest[oa]|descompuso|se\s+apaga|atasc|mancha|l[ii]nea|error)/i;
+  const equipo = /(impresor\w*|equipo|xerox|fujifilm|fuji\s?film|versant|versalink|altalink|docucolor|c\d{2,4}|b\d{2,4})/i;
+  const sintoma = /(fall\w*|problema|no\s+(funciona|imprime|prende|enciende|copia|escanea|sirve)|descompuest\w*|se\s+apaga|atasc\w*|mancha|l[ií]ne?a|error)/i;
   return equipo.test(t) && sintoma.test(t);
 }
 
@@ -334,7 +333,7 @@ function promptedRecently(session, key, ms=5*60*1000){
 }
 
 /* ============================ IA ============================ */
-async function aiCall(env, messages, {json=false}={}){
+async function aiCall(env, messages, {json=false}={}) {
   const OPENAI_KEY = env.OPENAI_API_KEY || env.OPENAI_KEY;
   const MODEL = env.LLM_MODEL || env.OPENAI_NLU_MODEL || env.OPENAI_FALLBACK_MODEL || 'gpt-4o-mini';
   if (!OPENAI_KEY) return null;
@@ -549,7 +548,6 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
 }
 
 async function handleAwaitInvoice(env, session, toE164, lowered, now, originalText='') {
-  // Prioriza la negación para que "sin factura" no se tome como "sí"
   const saysNo  = /\b(sin(\s+factura)?|sin|no)\b/i.test(lowered);
   const saysYes = !saysNo && /\b(s[ií]|sí|si|con(\s+factura)?|con|factura)\b/i.test(lowered);
 
@@ -569,7 +567,6 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now, originalTe
 
   if (saysYes || saysNo) {
     session.data.requires_invoice = !!saysYes;
-    // Precarga datos del cliente existentes y sólo pide lo que falte
     await preloadCustomerIfAny(env, session);
     const list = session.data.requires_invoice ? FLOW_FACT : FLOW_SHIP;
     const need = firstMissing(list, session.data.customer);
@@ -579,7 +576,6 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now, originalTe
       await sendWhatsAppText(env, toE164, `¿${LABEL[need]}?`);
       return ok('EVENT_RECEIVED');
     }
-    // Si no falta nada → generar pedido directo
     const res = await createOrderFromSession(env, session, toE164);
     if (res?.ok) {
       await sendWhatsAppText(env, toE164, `¡Listo! Generé tu solicitud 🙌\n*Total estimado:* ${formatMoneyMXN(res.total)} + IVA\nUn asesor te confirmará entrega y forma de pago.`);
@@ -686,14 +682,8 @@ async function handleCollectSequential(env, session, toE164, text, now){
   return ok('EVENT_RECEIVED');
 }
 
-function summaryCart(cart = []) {
-  return cart.map(i => `${i.product?.nombre} x ${i.qty}${i.backorder ? ' (sobre pedido)' : ''}`).join('; ');
-}
-function splitCart(cart = []){
-  const inStockList = cart.filter(i => !i.backorder);
-  const backOrderList = cart.filter(i => i.backorder);
-  return { inStockList, backOrderList };
-}
+function summaryCart(cart = []) { return cart.map(i => `${i.product?.nombre} x ${i.qty}${i.backorder ? ' (sobre pedido)' : ''}`).join('; '); }
+function splitCart(cart = []){ const inStockList = cart.filter(i => !i.backorder); const backOrderList = cart.filter(i => i.backorder); return { inStockList, backOrderList }; }
 
 /* =============== Inventario & Pedido =============== */
 function extractModelHints(text='') {
@@ -734,7 +724,6 @@ function productMatchesFamily(p, family){
   return s.includes(family);
 }
 
-/* === findBestProduct robusto === */
 async function findBestProduct(env, queryText, opts = {}) {
   const hints = extractModelHints(queryText);
   const color = extractColor(queryText);
@@ -1377,7 +1366,7 @@ async function loadSession(env, from){
 async function saveSession(env, session, at=new Date()){
   const days = Number(env.SESSION_TTL_DAYS || 90);
   const exp = new Date(at.getTime()+days*24*60*60*1000).toISOString();
-  const body=[{ from:session.from, stage:session.stage||'idle', data:session.data||{}, updated_at:new Date().toISOString(), expires_at: exp }];
+  const body=[{ from:session.from, stage:session.stage||'idle', data:session.data||{}, updated_at:new Date().toISOString(), expires_at: exp } ];
   await sbUpsert(env, 'wa_session', body, { onConflict:'from', returning:'minimal' });
 }
 
@@ -1466,7 +1455,7 @@ function buildResumePrompt(session){
   if (st && st.startsWith('collect_')) {
     const k = st.replace('collect_','');
     return `¿${displayField(k)}?`;
-  }
+    }
   if (st === 'sv_collect') {
     const need = session?.data?.sv_need_next || 'modelo';
     const q = {
