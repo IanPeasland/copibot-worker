@@ -7,7 +7,7 @@
  * - Reutiliza datos del cliente: al elegir factura/sin factura, precarga desde DB
  *   y sólo pide lo que falte; si nada falta, genera el pedido directo.
  * - Evita saludo inmediato tras cerrar (“no”) en post_order.
- * - NUEVO: Detección semántica de soporte (equipo + síntoma) con isSupportish().
+ * - NUEVO: Manejo de soporte **antes** de FAQs/IO (early short-circuit) + sbGet con try/catch.
  */
 
 export default {
@@ -124,47 +124,6 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // Compatibles: confirmar búsqueda relajada
-        if (session.stage === 'await_compatibles') {
-          const baseQ = session.data?.pending_query || ntext || text;
-          if (isYesish(lowered)) {
-            const best = await findBestProduct(env, baseQ, { ignoreFamily: true });
-            if (best) {
-              session.stage = 'cart_open';
-              session.data.cart = session.data.cart || [];
-              session.data.last_candidate = best;
-              await saveSession(env, session, now);
-              await sendWhatsAppText(env, fromE164, `${renderProducto(best)}\n\n¿Lo agrego o busco otra opción?`);
-            } else {
-              await sendWhatsAppText(env, fromE164, `No encontré opción compatible clara 😕. Te conecto con un asesor.`);
-              await notifySupport(env, `Compatibles sin match +${from}: ${baseQ}`);
-              session.stage = 'idle';
-              await saveSession(env, session, now);
-            }
-            return ok('EVENT_RECEIVED');
-          }
-          if (isNoish(lowered)) {
-            session.stage = 'idle';
-            await saveSession(env, session, now);
-            await sendWhatsAppText(env, fromE164, `Perfecto. ¿En qué más te ayudo?`);
-            return ok('EVENT_RECEIVED');
-          }
-          const best = await findBestProduct(env, ntext || text, { ignoreFamily: true });
-          if (best) {
-            session.stage = 'cart_open';
-            session.data.cart = session.data.cart || [];
-            session.data.last_candidate = best;
-            await saveSession(env, session, now);
-            await sendWhatsAppText(env, fromE164, `${renderProducto(best)}\n\n¿Lo agrego o busco otra opción?`);
-          } else {
-            await sendWhatsAppText(env, fromE164, `Sigo sin ver opción clara. Te conecto con un asesor 👍`);
-            await notifySupport(env, `Compatibles sin match (texto nuevo) +${from}: ${text}`);
-            session.stage = 'idle';
-            await saveSession(env, session, now);
-          }
-          return ok('EVENT_RECEIVED');
-        }
-
         // === Detecta intención ANTES del autogreeting ===
         const hardSupport = isSupportish(ntext) || RX_SUPPORT.test(ntext);
         const looksInv = RX_INV_Q.test(ntext);
@@ -185,6 +144,15 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
+        /* ================== EARLY SHORT-CIRCUIT ==================
+           Si el usuario reporta una falla, atendemos soporte de inmediato,
+           antes de FAQs / OpenAI / Supabase, para evitar silencios. */
+        if (hardSupport) {
+          const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent:'support' });
+          return handled;
+        }
+        /* ======================================================== */
+
         // FAQs
         const faqAns = await maybeFAQ(env, ntext);
         if (faqAns) {
@@ -204,7 +172,7 @@ export default {
             await sendWhatsAppText(env, fromE164, '¡Gracias! Quedo al pendiente para cualquier otra cosa. 🙌');
             return ok('EVENT_RECEIVED');
           }
-          if (isYesish(lowered) && !looksInv && !hardSupport) {
+          if (isYesish(lowered) && !looksInv) {
             await sendWhatsAppText(env, fromE164, 'Perfecto, dime qué necesitas y lo reviso. 😊');
             return ok('EVENT_RECEIVED');
           }
@@ -212,7 +180,7 @@ export default {
             const handled = await startSalesFromQuery(env, session, fromE164, text, ntext, now);
             return handled;
           }
-          if (hardSupport || intent.intent === 'support') {
+          if (intent.intent === 'support') {
             const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, intent);
             return handled;
           }
@@ -220,8 +188,8 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // SOPORTE
-        if (hardSupport || intent.intent === 'support' || session.stage?.startsWith('sv_')) {
+        // SOPORTE (por intent)
+        if (intent.intent === 'support' || session.stage?.startsWith('sv_')) {
           const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, intent);
           return handled;
         }
@@ -1031,7 +999,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     ciudad: sv.ciudad || null,
     cp: sv.cp || null,
     created_at: new Date().toISOString()
-  }];
+  }]];
   const os = await sbUpsert(env, 'orden_servicio', osBody, { returning: 'representation' });
   const osId = os?.data?.[0]?.id;
 
@@ -1262,7 +1230,7 @@ function renderOsDescription(phone, sv) {
 }
 async function getLastOpenOS(env, phone) {
   try {
-    const r = await sbGet(env, 'orden_servicio', { query: `select=id,estado,ventana_inicio,ventana_fin,calendar_id,gcal_event_id,cliente_id&cliente_id=in.(select id from cliente where telefono=eq.${phone})&order=ventana_inicio.desc&limit=1` });
+    const r = await sbGet(env, 'orden_servicio', { query: `select=id,estado,ventana_inicio,ventana_fin,calendar_id,gcal_event_id,cliente_id&cliente_id=in.(select id from cliente donde telefono=eq.${phone})&order=ventana_inicio.desc&limit=1` });
     if (r && r[0] && ['agendado','reprogramado','confirmado'].includes(r[0].estado)) return r[0];
   } catch {}
   return null;
@@ -1312,10 +1280,15 @@ function sb(env){
 async function sbGet(env, table, { query='', headers={} }={}){
   const b = sb(env);
   const url = `${b.url}/${table}${query?`?${query}`:''}`;
-  const r = await fetch(url, { headers:{ apikey:b.key, Authorization:`Bearer ${b.key}`, ...headers } });
-  if (r.status===204) return [];
-  if (!r.ok){ console.warn('sbGet', table, r.status, await r.text()); return null; }
-  try { return await r.json(); } catch { return null; }
+  try {
+    const r = await fetch(url, { headers:{ apikey:b.key, Authorization:`Bearer ${b.key}`, ...headers } });
+    if (r.status===204) return [];
+    if (!r.ok){ console.warn('sbGet', table, r.status, await r.text()); return null; }
+    try { return await r.json(); } catch { return null; }
+  } catch(e){
+    console.warn('sbGet err', table, e?.message||e);
+    return null;
+  }
 }
 async function sbUpsert(env, table, body, { onConflict='', returning='representation', headers={} }={}){
   const b = sb(env);
@@ -1455,7 +1428,7 @@ function buildResumePrompt(session){
   if (st && st.startsWith('collect_')) {
     const k = st.replace('collect_','');
     return `¿${displayField(k)}?`;
-    }
+  }
   if (st === 'sv_collect') {
     const need = session?.data?.sv_need_next || 'modelo';
     const q = {
