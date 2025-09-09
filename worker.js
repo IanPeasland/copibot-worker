@@ -2,7 +2,7 @@
  * CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
  * Mejoras (sep 2025):
  * - “¿Puedo ayudarte con algo más?” entiende respuestas naturales (sí/no libres).
- * - Detección de fallas ampliada (“mi impresora está fallando”, “problema”, etc.)
+ * - Detección de fallas ampliada (“mi impresora está fallando”, “se atora”, “atorando”, etc.)
  *   → FAQs rápidas si aplican, si no flujo de calendar.
  * - Reutiliza datos del cliente: al elegir factura/sin factura, precarga desde DB
  *   y sólo pide lo que falte; si nada falta, genera el pedido directo.
@@ -253,13 +253,14 @@ export default {
 /* ============================ Regex ============================ */
 const RX_GREET = /^(hola+|buen[oa]s|qué onda|que tal|saludos|hey|buen dia|buenas|holi+)\b/i;
 const RX_INV_Q  = /(toner|tóner|cartucho|developer|refacci[oó]n|precio|docucolor|versant|versalink|altalink|apeos|c\d{2,4}|b\d{2,4}|magenta|amarillo|cyan|negro)/i;
-/* Ampliado para captar más sinónimos de falla */
-const RX_SUPPORT = /(soporte|servicio|visita|no imprime|atasc(a|o)|atasco|falla(?:ndo)?|fall[oa]|problema|error|mantenimiento|se atora|se traba|atasca el papel|saca el papel|mancha|l[ií]ne?a|no escanea|no copia|no prende|no enciende|se apaga|no funciona|no sirve|descompuest[oa]|descompuso)/i;
 
-/* NUEVO: Detección semántica (equipo + síntoma en cualquier orden) */
+/* Soporte ampliado: incluye “atorando/atorada/atorado/atorarse” y más sinónimos. */
+const RX_SUPPORT = /(soporte|servicio|visita|no imprime|atasc(a|o)|atasco|ator\w+|falla(?:ndo)?|fall[oa]|problema|error|mantenimiento|se atora|se traba|atasca el papel|saca el papel|mancha|l[ií]ne?a|no escanea|no copia|no prende|no enciende|se apaga|no funciona|no sirve|descompuest[oa]|descompuso)/i;
+
+/* Detección semántica (equipo + síntoma en cualquier orden) */
 function isSupportish(t){
-  const equipo = /(impresor\w*|equipo|xerox|fujifilm|fuji\s?film|versant|versalink|altalink|docucolor|c\d{2,4}|b\d{2,4})/i;
-  const sintoma = /(fall\w*|problema|no\s+(funciona|imprime|prende|enciende|copia|escanea|sirve)|descompuest\w*|se\s+apaga|atasc\w*|mancha|l[ií]ne?a|error)/i;
+  const equipo = /(impresor\w*|impresora|equipo|xerox|fujifilm|fuji\s?film|versant|versalink|altalink|docucolor|c\d{2,4}|b\d{2,4})/i;
+  const sintoma = /(fall\w*|problema|no\s+(funciona|imprime|prende|enciende|copia|escanea|sirve)|descompuest\w*|se\s+(atora|traba|apaga)|ator\w*|atasc\w*|mancha|l[ií]ne?a|rayas?)/i;
   return equipo.test(t) && sintoma.test(t);
 }
 
@@ -338,7 +339,7 @@ async function aiClassifyIntent(env, text){
   const sys = `Clasifica texto del usuario en JSON.
 Campos: intent in ["support","sales","faq","smalltalk"], severity in ["alta","media","baja"] (si intent="support").
 Reglas:
-- "atasco", "no imprime", "error", "servicio", "visita", "fallando", "problema" => support
+- "atasco", "se atora", "atorando", "no imprime", "error", "servicio", "visita", "fallando", "problema" => support
 - "toner", "precio", "SKU", colores => sales
 - "quiénes son", "horarios", "dónde están" => faq
 - otro => smalltalk
@@ -891,7 +892,7 @@ function extractSvInfo(text) {
   const err = text.match(/\berror\s*([0-9\-]+)\b/i);
   if (err) out.error_code = err[1];
   if (/no imprime/i.test(text)) out.falla = 'No imprime';
-  if (/atasc(a|o)|se atora|se traba|arrugad(i|o)|saca el papel/i.test(text)) out.falla = 'Atasco/arrugado de papel';
+  if (/atasc(a|o)|se atora|se traba|arrugad(i|o)|saca el papel|ator\w+/i.test(text)) out.falla = 'Atasco/atorado de papel';
   if (/mancha|calidad|linea|l[ií]nea/i.test(text)) out.falla = 'Calidad de impresión';
 
   if (/\b(parado|urgente|producci[oó]n detenida|parada)\b/i.test(text)) out.prioridad = 'alta';
@@ -1022,7 +1023,7 @@ Si necesitas reprogramar o cancelar, dímelo con confianza.`
 }
 
 function quickHelp(ntext){
-  if (/\batasc(a|o)|se atora|se traba|arrugad/i.test(ntext)){
+  if (/\batasc(a|o)|se atora|ator\w+|se traba|arrugad/i.test(ntext)){
     return `Veamos rápido 🧰
 1) Apaga y enciende el equipo.
 2) Revisa bandejas y retira papel atorado.
@@ -1428,7 +1429,7 @@ function buildResumePrompt(session){
   if (st && st.startsWith('collect_')) {
     const k = st.replace('collect_','');
     return `¿${displayField(k)}?`;
-  }
+    }
   if (st === 'sv_collect') {
     const need = session?.data?.sv_need_next || 'modelo';
     const q = {
