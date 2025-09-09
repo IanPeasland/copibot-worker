@@ -7,6 +7,7 @@
  * - Reutiliza datos del cliente: al elegir factura/sin factura, precarga desde DB
  *   y sólo pide lo que falte; si nada falta, genera el pedido directo.
  * - Evita saludo inmediato tras cerrar (“no”) en post_order.
+ * - NUEVO: Detección semántica de soporte (equipo + síntoma) con isSupportish().
  */
 
 export default {
@@ -93,7 +94,8 @@ export default {
         // ==== REANUDACIÓN / BYPASS SI PIDE ALGO DIRECTO ====
         if (session.stage === 'await_resume') {
           const looksInv = RX_INV_Q.test(ntext);
-          const hardSupport = RX_SUPPORT.test(ntext);
+          // >>> CAMBIO: detección semántica de soporte
+          const hardSupport = isSupportish(ntext) || RX_SUPPORT.test(ntext);
 
           if (looksInv) {
             const handled = await startSalesFromQuery(env, session, fromE164, text, ntext, now);
@@ -165,7 +167,8 @@ export default {
         }
 
         // === Detecta intención ANTES del autogreeting ===
-        const hardSupport = RX_SUPPORT.test(ntext);
+        // >>> CAMBIO: detección semántica de soporte
+        const hardSupport = isSupportish(ntext) || RX_SUPPORT.test(ntext);
         const looksInv = RX_INV_Q.test(ntext);
 
         // Saludo automático SOLO si no hay intención clara de ventas/soporte
@@ -284,8 +287,14 @@ export default {
 /* ============================ Regex ============================ */
 const RX_GREET = /^(hola+|buen[oa]s|qué onda|que tal|saludos|hey|buen dia|buenas|holi+)\b/i;
 const RX_INV_Q  = /(toner|tóner|cartucho|developer|refacci[oó]n|precio|docucolor|versant|versalink|altalink|apeos|c\d{2,4}|b\d{2,4}|magenta|amarillo|cyan|negro)/i;
-/* Ampliado para captar “fallando”, “problema”, no enciende/escanea/copia */
-const RX_SUPPORT = /(soporte|servicio|visita|no imprime|atasc(a|o)|atasco|falla(?:ndo)?|fall[oa]|problema|error|mantenimiento|se atora|se traba|atasca el papel|saca el papel|mancha|l[ií]ne?a|no escanea|no copia|no prende|no enciende|se apaga)/i;
+/* Ampliado para captar “fallando”, “problema”, no enciende/escanea/copia + no funciona/sirve, descompuesto/a */
+const RX_SUPPORT = /(soporte|servicio|visita|no imprime|atasc(a|o)|atasco|falla(?:ndo)?|fall[oa]|problema|error|mantenimiento|se atora|se traba|atasca el papel|saca el papel|mancha|l[ií]ne?a|no escanea|no copia|no prende|no enciende|se apaga|no funciona|no sirve|descompuest[oa]|descompuso)/i;
+/* Detección semántica sencilla: equipo + síntoma en cualquier orden */
+function isSupportish(t){
+  const equipo = /(impresor(a)?|equipo|xerox|fujifilm|fuji\s?film|versant|versalink|altalink|docucolor)/i;
+  const sintoma = /(fall(a|ando)|problema|no\s+(funciona|imprime|prende|enciende|copia|escanea|sirve)|descompuest[oa]|descompuso|se\s+apaga|atasc|mancha|l[ii]nea|error)/i;
+  return equipo.test(t) && sintoma.test(t);
+}
 
 const RX_ADD_ITEM = /\b(agrega(?:me)?|añade|mete|pon|suma|incluye)\b/i;
 const RX_DONE = /\b(es(ta)? (todo|suficiente)|ser[ií]a todo|nada m[aá]s|con eso|as[ií] est[aá] bien|ya qued[oó]|listo|est[aá] listo)\b/i;
