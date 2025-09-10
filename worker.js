@@ -1,13 +1,9 @@
 /**
  * CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
- * Mejoras (sep 2025):
- * - “¿Puedo ayudarte con algo más?” entiende respuestas naturales (sí/no libres).
- * - Detección de fallas ampliada (“mi impresora está fallando”, “se atora”, “atorando”, etc.)
- *   → FAQs rápidas si aplican, si no flujo de calendar.
- * - Reutiliza datos del cliente: al elegir factura/sin factura, precarga desde DB
- *   y sólo pide lo que falte; si nada falta, genera el pedido directo.
- * - Evita saludo inmediato tras cerrar (“no”) en post_order.
- * - EARLY SUPPORT: si detecta falla, entra a soporte *antes* de FAQs o llamadas externas.
+ * Sep/2025: intentos robustos + fix de compilación
+ * - Detector determinista de soporte: isSupportIntent(ntext)
+ * - Soporte se evalúa ANTES de saludo/FAQ (y también en await_resume/post_order)
+ * - Mantiene: ventas, carrito, split stock, reuso de cliente, FAQs, Calendar, etc.
  */
 
 export default {
@@ -15,7 +11,7 @@ export default {
     try {
       const url = new URL(req.url);
 
-      // Webhook verify
+      // --- Webhook verify (GET) ---
       if (req.method === 'GET' && url.pathname === '/') {
         const mode = url.searchParams.get('hub.mode');
         const token = url.searchParams.get('hub.verify_token');
@@ -26,7 +22,7 @@ export default {
         return new Response('Forbidden', { status: 403 });
       }
 
-      // Cron endpoint (opcional)
+      // --- Cron opcional ---
       if (req.method === 'POST' && url.pathname === '/cron') {
         const sec = req.headers.get('x-cron-secret') || url.searchParams.get('secret');
         if (!sec || sec !== env.CRON_SECRET) return new Response('Forbidden', { status: 403 });
@@ -34,7 +30,7 @@ export default {
         return ok(`cron ok ${JSON.stringify(out)}`);
       }
 
-      // Webhook mensajes
+      // --- Webhook mensajes ---
       if (req.method === 'POST' && url.pathname === '/') {
         const payload = await safeJson(req);
         const ctx = extractWhatsAppContext(payload);
@@ -56,11 +52,11 @@ export default {
           session.data.customer.nombre = toTitleCase(firstWord(profileName));
         }
 
-        // idempotencia
+        // Idempotencia simple
         if (session?.data?.last_mid && session.data.last_mid === mid) return ok('EVENT_RECEIVED');
         session.data.last_mid = mid;
 
-        // Comandos universales
+        // --- Comandos universales de servicio técnico ---
         if (/\b(cancel(a|ar).*(cita|visita|servicio))\b/i.test(lowered)) {
           await svCancel(env, session, fromE164);
           await saveSession(env, session, now);
@@ -80,8 +76,9 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // Saludo mientras hay flujo activo → pausar y preguntar
         const isGreet = RX_GREET.test(lowered);
+
+        // Si hay flujo activo y el usuario saluda: pausar y ofrecer reanudar
         if (isGreet && session.stage !== 'idle' && session.stage !== 'post_order') {
           const friendly = await aiSmallTalk(env, session, 'general', text);
           await sendWhatsAppText(env, fromE164, `${friendly}\n¿Deseas continuar con tu trámite?`);
@@ -91,21 +88,21 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // ==== REANUDACIÓN / BYPASS SI PIDE ALGO DIRECTO ====
-        if (session.stage === 'await_resume') {
-          const looksInv = RX_INV_Q.test(ntext);
-          const hardSupport = isSupportish(ntext) || RX_SUPPORT.test(ntext);
+        // ==== Detectores base ====
+        const looksInv  = RX_INV_Q.test(ntext);
+        const hardSupp  = isSupportIntent(ntext); // robusto y determinista
 
-          if (looksInv) {
-            const handled = await startSalesFromQuery(env, session, fromE164, text, ntext, now);
-            return handled;
-          }
-          if (hardSupport) {
+        // ==== REANUDACIÓN ====
+        if (session.stage === 'await_resume') {
+          if (hardSupp) {
             const intent = { intent: 'support', severity: 'media' };
             const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, intent);
             return handled;
           }
-
+          if (looksInv) {
+            const handled = await startSalesFromQuery(env, session, fromE164, text, ntext, now);
+            return handled;
+          }
           if (isYesish(lowered)) {
             session.stage = session?.data?.last_stage || 'idle';
             await saveSession(env, session, now);
@@ -124,17 +121,19 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // === Detecta intención ANTES del autogreeting ===
-        const hardSupport = isSupportish(ntext) || RX_SUPPORT.test(ntext);
-        const looksInv = RX_INV_Q.test(ntext);
+        // ==== PRIORIDAD: SOPORTE antes de saludo/FAQ ====
+        if (hardSupp || session.stage?.startsWith('sv_')) {
+          const intent = hardSupp ? { intent: 'support', severity: 'media' } : { intent: 'support' };
+          const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, intent);
+          return handled;
+        }
 
-        // Saludo automático SOLO si no hay intención clara de ventas/soporte
+        // Saludo automático SOLO si no hay ventas/soporte
         const mayGreet =
           isGreet &&
           shouldAutogreet(session, now) &&
           session.stage === 'idle' &&
-          !looksInv &&
-          !hardSupport;
+          !looksInv;
 
         if (mayGreet) {
           const g = await aiSmallTalk(env, session, 'greeting');
@@ -144,16 +143,7 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        /* ================== EARLY SHORT-CIRCUIT ==================
-           Si el usuario reporta una falla, atendemos soporte de inmediato,
-           antes de FAQs / OpenAI / Supabase. */
-        if (hardSupport) {
-          const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent:'support' });
-          return handled;
-        }
-        /* ======================================================== */
-
-        // FAQs
+        // ==== FAQs rápidas ====
         const faqAns = await maybeFAQ(env, ntext);
         if (faqAns) {
           await sendWhatsAppText(env, fromE164, faqAns);
@@ -161,9 +151,7 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        const intent = await aiClassifyIntent(env, text);
-
-        // POST-ORDER: ¿algo más?
+        // ==== POST-ORDER ====
         if (session.stage === 'post_order') {
           if (isNoish(lowered)) {
             session.stage = 'idle';
@@ -172,29 +160,23 @@ export default {
             await sendWhatsAppText(env, fromE164, '¡Gracias! Quedo al pendiente para cualquier otra cosa. 🙌');
             return ok('EVENT_RECEIVED');
           }
-          if (isYesish(lowered) && !looksInv) {
-            await sendWhatsAppText(env, fromE164, 'Perfecto, dime qué necesitas y lo reviso. 😊');
-            return ok('EVENT_RECEIVED');
+          if (hardSupp) {
+            const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support' });
+            return handled;
           }
           if (looksInv) {
             const handled = await startSalesFromQuery(env, session, fromE164, text, ntext, now);
             return handled;
           }
-          if (intent.intent === 'support') {
-            const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, intent);
-            return handled;
+          if (isYesish(lowered)) {
+            await sendWhatsAppText(env, fromE164, 'Perfecto, dime qué necesitas y lo reviso. 😊');
+            return ok('EVENT_RECEIVED');
           }
           await sendWhatsAppText(env, fromE164, '¿Puedo ayudarte con algo más? (Sí / No)');
           return ok('EVENT_RECEIVED');
         }
 
-        // SOPORTE (por intent)
-        if (intent.intent === 'support' || session.stage?.startsWith('sv_')) {
-          const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, intent);
-          return handled;
-        }
-
-        // VENTAS
+        // ==== VENTAS (stages) ====
         if (session.stage === 'ask_qty') {
           const handled = await handleAskQty(env, session, fromE164, text, lowered, ntext, now);
           return handled;
@@ -212,21 +194,13 @@ export default {
           return handled;
         }
 
-        // Inicio ventas (idle)
+        // ==== VENTAS (inicio desde idle) ====
         if (session.stage === 'idle' && looksInv) {
           const handled = await startSalesFromQuery(env, session, fromE164, text, ntext, now);
           return handled;
         }
 
-        // Small talk
-        if (intent.intent === 'smalltalk') {
-          const reply = await aiSmallTalk(env, session, 'general', text);
-          await sendWhatsAppText(env, fromE164, `${reply}`);
-          await saveSession(env, session, now);
-          return ok('EVENT_RECEIVED');
-        }
-
-        // Fallback
+        // ==== Small talk / fallback breve ====
         const reply = await aiSmallTalk(env, session, 'fallback', text);
         await sendWhatsAppText(env, fromE164, reply);
         await saveSession(env, session, now);
@@ -250,18 +224,26 @@ export default {
   }
 };
 
-/* ============================ Regex ============================ */
+/* ============================ Regex / Intents ============================ */
 const RX_GREET = /^(hola+|buen[oa]s|qué onda|que tal|saludos|hey|buen dia|buenas|holi+)\b/i;
 const RX_INV_Q  = /(toner|tóner|cartucho|developer|refacci[oó]n|precio|docucolor|versant|versalink|altalink|apeos|c\d{2,4}|b\d{2,4}|magenta|amarillo|cyan|negro)/i;
 
-/* Soporte ampliado: incluye “atorando/atorada/atorado/atorarse” y más sinónimos. */
-const RX_SUPPORT = /(soporte|servicio|visita|no imprime|atasc(a|o)|atasco|ator\w+|falla(?:ndo)?|fall[oa]|problema|error|mantenimiento|se atora|se traba|atasca el papel|saca el papel|mancha|l[ií]ne?a|no escanea|no copia|no prende|no enciende|se apaga|no funciona|no sirve|descompuest[oa]|descompuso)/i;
+/** Detector robusto y determinista de intención de soporte.
+ *  Trabaja sobre el texto normalizado (sin acentos).
+ */
+function isSupportIntent(ntext='') {
+  const t = ` ${ntext} `; // centinelas
+  // Palabras clave de problemas
+  const hasProblem =
+    /\b(falla(?:ndo)?|fallo|problema|descompuesto|descompuesta|no imprime|no escanea|no copia|no prende|no enciende|se apaga|error|atasc|ator(a|o|e)|atorando|atorada|atorado|atasco|se traba|mancha|linea|l?inea|calidad)\b/.test(t);
+  // Menciones de equipo
+  const hasDevice =
+    /\b(impresora|equipo|xerox|fujifilm|fuji\s?film|versant|versalink|altalink|docucolor|c\d{2,4}|b\d{2,4})\b/.test(t);
+  // Frases típicas
+  const phrase =
+    /\b(mi|la|nuestra)\s+(impresora|equipo)\s+(esta|est[aá]|anda|se)\s+(fallando|atorando|atorada|atorado|atascada|atascado|descompuesta|descompuesto)\b/.test(t);
 
-/* Detección semántica (equipo + síntoma en cualquier orden) */
-function isSupportish(t){
-  const equipo = /(impresor\w*|impresora|equipo|xerox|fujifilm|fuji\s?film|versant|versalink|altalink|docucolor|c\d{2,4}|b\d{2,4})/i;
-  const sintoma = /(fall\w*|problema|no\s+(funciona|imprime|prende|enciende|copia|escanea|sirve)|descompuest\w*|se\s+(atora|traba|apaga)|ator\w*|atasc\w*|mancha|l[ií]ne?a|rayas?)/i;
-  return equipo.test(t) && sintoma.test(t);
+  return phrase || (hasProblem && hasDevice) || /\b(soporte|servicio|visita)\b/.test(t);
 }
 
 const RX_ADD_ITEM = /\b(agrega(?:me)?|añade|mete|pon|suma|incluye)\b/i;
@@ -269,7 +251,6 @@ const RX_DONE = /\b(es(ta)? (todo|suficiente)|ser[ií]a todo|nada m[aá]s|con es
 const RX_NEG_NO = /\bno\b/i;
 const RX_WANT_QTY = /\b(quiero|ocupo|me llevo|pon|agrega|añade|mete|dame|manda|env[ií]ame|p[oó]n)\s+(\d+)\b/i;
 
-/* === Natural yes/no helpers === */
 const RX_YES = /\b(s[ií]|sí|si|claro|va|dale|sale|correcto|ok|seguim(?:os)?|contin[uú]a(?:r)?|adelante|afirmativo|de acuerdo|me sirve)\b/i;
 const RX_NO  = /\b(no|nel|luego|despu[eé]s|pausa|ahorita no|cancelar|det[eé]n|mejor no)\b/i;
 function isYesish(t){ return RX_YES.test(t); }
@@ -296,12 +277,12 @@ function shouldAutogreet(session, now){
 function promptedRecently(session, key, ms=5*60*1000){
   session.data.prompts = session.data.prompts || {};
   const last = session.data.prompts[key] ? Date.parse(session.data.prompts[key]) : 0;
-  const ok = (Date.now() - last) < ms;
+  const okk = (Date.now() - last) < ms;
   session.data.prompts[key] = new Date().toISOString();
-  return ok;
+  return okk;
 }
 
-/* ============================ IA ============================ */
+/* ============================ IA (breve) ============================ */
 async function aiCall(env, messages, {json=false}={}) {
   const OPENAI_KEY = env.OPENAI_API_KEY || env.OPENAI_KEY;
   const MODEL = env.LLM_MODEL || env.OPENAI_NLU_MODEL || env.OPENAI_FALLBACK_MODEL || 'gpt-4o-mini';
@@ -316,7 +297,6 @@ async function aiCall(env, messages, {json=false}={}) {
   const j = await r.json();
   return j?.choices?.[0]?.message?.content || '';
 }
-
 async function aiSmallTalk(env, session, mode='general', userText=''){
   const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
   const sys = `Eres CopiBot, asistente cálido, claro y breve de CP Digital (es-MX).
@@ -333,19 +313,6 @@ Contesta breve, útil y amable. Si no hay contexto, ofrece inventario o soporte.
   }
   const out = await aiCall(env, [{role:'system', content: sys}, {role:'user', content: prompt}], {});
   return out || (`Hola${nombre?`, ${nombre}`:''} 🙌 ¿En qué te ayudo hoy?`);
-}
-
-async function aiClassifyIntent(env, text){
-  const sys = `Clasifica texto del usuario en JSON.
-Campos: intent in ["support","sales","faq","smalltalk"], severity in ["alta","media","baja"] (si intent="support").
-Reglas:
-- "atasco", "se atora", "atorando", "no imprime", "error", "servicio", "visita", "fallando", "problema" => support
-- "toner", "precio", "SKU", colores => sales
-- "quiénes son", "horarios", "dónde están" => faq
-- otro => smalltalk
-Responde sólo JSON.`;
-  const out = await aiCall(env, [{role:'system', content: sys},{role:'user', content: text}], {json:true});
-  try{ return JSON.parse(out||'{}'); }catch{ return { intent:'smalltalk' }; }
 }
 
 /* ============================ WhatsApp ============================ */
@@ -517,6 +484,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
 }
 
 async function handleAwaitInvoice(env, session, toE164, lowered, now, originalText='') {
+  // "sin factura" no debe contar como "sí"
   const saysNo  = /\b(sin(\s+factura)?|sin|no)\b/i.test(lowered);
   const saysYes = !saysNo && /\b(s[ií]|sí|si|con(\s+factura)?|con|factura)\b/i.test(lowered);
 
@@ -651,8 +619,14 @@ async function handleCollectSequential(env, session, toE164, text, now){
   return ok('EVENT_RECEIVED');
 }
 
-function summaryCart(cart = []) { return cart.map(i => `${i.product?.nombre} x ${i.qty}${i.backorder ? ' (sobre pedido)' : ''}`).join('; '); }
-function splitCart(cart = []){ const inStockList = cart.filter(i => !i.backorder); const backOrderList = cart.filter(i => i.backorder); return { inStockList, backOrderList }; }
+function summaryCart(cart = []) {
+  return cart.map(i => `${i.product?.nombre} x ${i.qty}${i.backorder ? ' (sobre pedido)' : ''}`).join('; ');
+}
+function splitCart(cart = []){
+  const inStockList = cart.filter(i => !i.backorder);
+  const backOrderList = cart.filter(i => i.backorder);
+  return { inStockList, backOrderList };
+}
 
 /* =============== Inventario & Pedido =============== */
 function extractModelHints(text='') {
@@ -693,6 +667,7 @@ function productMatchesFamily(p, family){
   return s.includes(family);
 }
 
+/* === findBestProduct robusto === */
 async function findBestProduct(env, queryText, opts = {}) {
   const hints = extractModelHints(queryText);
   const color = extractColor(queryText);
@@ -744,7 +719,7 @@ async function findBestProduct(env, queryText, opts = {}) {
     } catch {}
   }
 
-  // 3) Pool amplio de TONERS y filtrado en memoria
+  // 3) Pool amplio de TONERS
   try {
     const r = await sbGet(env, 'producto_stock_v', {
       query: `select=id,nombre,marca,sku,precio,stock,tipo&tipo=eq.toner&order=stock.desc.nullslast,precio.asc&limit=120`
@@ -753,7 +728,7 @@ async function findBestProduct(env, queryText, opts = {}) {
     if (best) return best;
   } catch {}
 
-  // 4) fallback final: búsqueda simple por “toner” en nombre/sku
+  // 4) fallback “toner”
   try {
     const like = encodeURIComponent(`%toner%`);
     const r = await sbGet(env, 'producto_stock_v', {
@@ -802,7 +777,7 @@ async function startSalesFromQuery(env, session, toE164, text, ntext, now){
   }
 }
 
-/* ====== Precarga de cliente ====== */
+/* ====== Cliente ====== */
 async function preloadCustomerIfAny(env, session){
   try{
     const r = await sbGet(env, 'cliente', { query: `select=nombre,rfc,email,calle,numero,colonia,ciudad,cp&telefono=eq.${session.from}&limit=1` });
@@ -859,7 +834,7 @@ async function createOrderFromSession(env, session, toE164) {
     }));
     await sbUpsert(env, 'pedido_item', items, { returning: 'minimal' });
 
-    // decremento de stock simple
+    // decremento de stock (si existe RPC)
     for (const it of cart) {
       const sku = it.product?.sku;
       if (!sku) continue;
@@ -892,7 +867,7 @@ function extractSvInfo(text) {
   const err = text.match(/\berror\s*([0-9\-]+)\b/i);
   if (err) out.error_code = err[1];
   if (/no imprime/i.test(text)) out.falla = 'No imprime';
-  if (/atasc(a|o)|se atora|se traba|arrugad(i|o)|saca el papel|ator\w+/i.test(text)) out.falla = 'Atasco/atorado de papel';
+  if (/atasc(a|o)|se atora|se traba|arrugad(i|o)|saca el papel/i.test(text)) out.falla = 'Atasco/arrugado de papel';
   if (/mancha|calidad|linea|l[ií]nea/i.test(text)) out.falla = 'Calidad de impresión';
 
   if (/\b(parado|urgente|producci[oó]n detenida|parada)\b/i.test(text)) out.prioridad = 'alta';
@@ -1023,7 +998,7 @@ Si necesitas reprogramar o cancelar, dímelo con confianza.`
 }
 
 function quickHelp(ntext){
-  if (/\batasc(a|o)|se atora|ator\w+|se traba|arrugad/i.test(ntext)){
+  if (/\batasc(a|o)|se atora|se traba|arrugad/i.test(ntext)){
     return `Veamos rápido 🧰
 1) Apaga y enciende el equipo.
 2) Revisa bandejas y retira papel atorado.
@@ -1278,20 +1253,15 @@ function sb(env){
   const key = env.SUPABASE_SERVICE_ROLE || env.SUPABASE_KEY;
   return { url:`${env.SUPABASE_URL}/rest/v1`, key };
 }
-async function sbGet(env, table, { query='', headers={} }={}){
+async function sbGet(env, table, { query='', headers={} }={}) {
   const b = sb(env);
   const url = `${b.url}/${table}${query?`?${query}`:''}`;
-  try {
-    const r = await fetch(url, { headers:{ apikey:b.key, Authorization:`Bearer ${b.key}`, ...headers } });
-    if (r.status===204) return [];
-    if (!r.ok){ console.warn('sbGet', table, r.status, await r.text()); return null; }
-    try { return await r.json(); } catch { return null; }
-  } catch(e){
-    console.warn('sbGet err', table, e?.message||e);
-    return null;
-  }
+  const r = await fetch(url, { headers:{ apikey:b.key, Authorization:`Bearer ${b.key}`, ...headers } });
+  if (r.status===204) return [];
+  if (!r.ok){ console.warn('sbGet', table, r.status, await r.text()); return null; }
+  try { return await r.json(); } catch { return null; }
 }
-async function sbUpsert(env, table, body, { onConflict='', returning='representation', headers={} }={}){
+async function sbUpsert(env, table, body, { onConflict='', returning='representation', headers={} }={}) {
   const b = sb(env);
   const url = `${b.url}/${table}`;
   const h = {
@@ -1340,7 +1310,7 @@ async function loadSession(env, from){
 async function saveSession(env, session, at=new Date()){
   const days = Number(env.SESSION_TTL_DAYS || 90);
   const exp = new Date(at.getTime()+days*24*60*60*1000).toISOString();
-  const body=[{ from:session.from, stage:session.stage||'idle', data:session.data||{}, updated_at:new Date().toISOString(), expires_at: exp } ];
+  const body=[{ from:session.from, stage:session.stage||'idle', data:session.data||{}, updated_at:new Date().toISOString(), expires_at: exp }];
   await sbUpsert(env, 'wa_session', body, { onConflict:'from', returning:'minimal' });
 }
 
@@ -1376,14 +1346,6 @@ async function phoneForCliente(env, id) {
   if (!id) return null;
   const r = await sbGet(env, 'cliente', { query: `select=telefono&id=eq.${id}&limit=1` });
   return r?.[0]?.telefono || null;
-}
-
-/* ============================ Logger opcional ============================ */
-async function logDecision(env, payload){
-  try{
-    if ((env.DEBUG_LOG||'0') !== '1') return;
-    await sbUpsert(env, 'wa_debug', [{ data: payload, created_at: new Date().toISOString() }], { returning: 'minimal' });
-  }catch{}
 }
 
 /* ============================ Util ============================ */
@@ -1429,7 +1391,7 @@ function buildResumePrompt(session){
   if (st && st.startsWith('collect_')) {
     const k = st.replace('collect_','');
     return `¿${displayField(k)}?`;
-    }
+  }
   if (st === 'sv_collect') {
     const need = session?.data?.sv_need_next || 'modelo';
     const q = {
