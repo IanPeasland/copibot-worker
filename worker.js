@@ -3,6 +3,7 @@
  * Sep/2025:
  * - Soporte se evalúa PRIMERO con detector determinista + IA opcional.
  * - Responde de inmediato al reportar falla, incluso si hay un flujo previo.
+ * - Reutiliza datos del cliente en pedidos (precarga y sólo pide faltantes).
  * - Mantiene flujos existentes (ventas, carrito, factura, cliente, FAQs, Calendar).
  */
 
@@ -52,11 +53,11 @@ export default {
           session.data.customer.nombre = toTitleCase(firstWord(profileName));
         }
 
-        // idempotencia
+        // idempotencia (evita dobles envíos por el mismo mensaje)
         if (session?.data?.last_mid && session.data.last_mid === mid) return ok('EVENT_RECEIVED');
         session.data.last_mid = mid;
 
-        // Comandos universales soporte
+        // Comandos universales de soporte
         if (/\b(cancel(a|ar).*(cita|visita|servicio))\b/i.test(lowered)) {
           await svCancel(env, session, fromE164);
           await saveSession(env, session, now);
@@ -81,7 +82,7 @@ export default {
         // ====== 1) DETECCIÓN SOPORTE — SIEMPRE PRIMERO ======
         // a) Reglas deterministas
         let supportFlag = isSupportIntent(ntext);
-        // b) IA opcional
+        // b) IA opcional (si hay clave)
         if (!supportFlag) {
           const clf = await aiClassifyIntent(env, text);
           if (clf && clf.intent === 'support') supportFlag = true;
@@ -91,7 +92,7 @@ export default {
           return handled;
         }
 
-        // Saludo durante flujo activo → pausar
+        // Saludo durante flujo activo → pausar y preguntar si desea continuar
         if (isGreet && session.stage !== 'idle' && session.stage !== 'post_order') {
           const friendly = await aiSmallTalk(env, session, 'general', text);
           await sendWhatsAppText(env, fromE164, `${friendly}\n¿Deseas continuar con tu trámite?`);
@@ -103,7 +104,7 @@ export default {
 
         // ==== REANUDACIÓN ====
         if (session.stage === 'await_resume') {
-          // Re-evaluamos soporte aquí también
+          // Re-evaluamos soporte también aquí
           if (isSupportIntent(ntext)) {
             const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support' });
             return handled;
@@ -139,7 +140,7 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // ==== FAQs (si no hay soporte) ====
+        // ==== FAQs ====
         const faqAns = await maybeFAQ(env, ntext);
         if (faqAns) {
           await sendWhatsAppText(env, fromE164, faqAns);
@@ -195,8 +196,6 @@ export default {
       return new Response('Not found', { status: 404 });
     } catch (e) {
       console.error('Worker error', e);
-      // Nunca dejamos al usuario sin respuesta
-      try { await sendWhatsAppText(env, '+', ''); } catch {}
       return ok('EVENT_RECEIVED');
     }
   },
@@ -259,9 +258,9 @@ function shouldAutogreet(session, now){
 function promptedRecently(session, key, ms=5*60*1000){
   session.data.prompts = session.data.prompts || {};
   const last = session.data.prompts[key] ? Date.parse(session.data.prompts[key]) : 0;
-  const okk = (Date.now() - last) < ms;
+  const within = (Date.now() - last) < ms;
   session.data.prompts[key] = new Date().toISOString();
-  return okk;
+  return within;
 }
 
 /* ============================ IA ============================ */
@@ -279,11 +278,12 @@ async function aiCall(env, messages, {json=false}={}) {
   const j = await r.json();
   return j?.choices?.[0]?.message?.content || '';
 }
+
 async function aiSmallTalk(env, session, mode='general', userText=''){
   const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
   const sys = `Eres CopiBot, asistente cálido, claro y breve de CP Digital (es-MX).
 - Responde con tono humano (máximo 1 emoji).
-- Evita listas innecesarias; conversa como persona.`; 
+- Evita listas innecesarias; conversa como persona.`;
   let prompt = '';
   if (mode === 'greeting') {
     prompt = `Saluda de forma breve y cálida. Incluye el nombre si lo tienes (“${nombre}”). Cierra con: "¿Qué necesitas hoy?"`;
@@ -302,7 +302,7 @@ async function aiClassifyIntent(env, text){
   if (!env.OPENAI_API_KEY && !env.OPENAI_KEY) return null;
   const sys = `Clasifica el texto del usuario (es-MX) en JSON:
 { "intent": "support|sales|faq|smalltalk" }
-Reglas guía:
+Guía:
 - fallando, falla, problema, no imprime/escanea/copia, atascado/atorado, error, no prende/enciende → support
 - toner, cartucho, precio, SKU, colores, modelos → sales
 - quiénes son, horarios, ubicación, contacto → faq
@@ -531,7 +531,7 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now, originalTe
   return ok('EVENT_RECEIVED');
 }
 
-/* Captura UNO A UNO */
+/* Captura UNO A UNO (pedidos) */
 const FLOW_FACT = ['nombre','rfc','email','calle','numero','colonia','cp'];
 const FLOW_SHIP = ['nombre','email','calle','numero','colonia','cp'];
 const LABEL = {
@@ -773,7 +773,7 @@ async function startSalesFromQuery(env, session, toE164, text, ntext, now){
   }
 }
 
-/* ====== Cliente ====== */
+/* ====== Cliente / ERP ====== */
 async function preloadCustomerIfAny(env, session){
   try{
     const r = await sbGet(env, 'cliente', { query: `select=nombre,rfc,email,calle,numero,colonia,ciudad,cp&telefono=eq.${session.from}&limit=1` });
@@ -887,25 +887,30 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     session.data.sv = session.data.sv || {};
     const sv = session.data.sv;
 
+    // Ingiere nueva info del mensaje actual
     Object.assign(sv, extractSvInfo(text));
     if (!sv.when) {
       const dt = parseNaturalDateTime(lowered, env);
       if (dt?.start) sv.when = dt;
     }
 
+    // Primera respuesta amistosa (una sola vez)
     if (!sv._welcomed) {
       sv._welcomed = true;
       await sendWhatsAppText(env, toE164, `Lamento la falla 😕. Vamos a ayudarte. ¿Me confirmas *marca/modelo* y una breve *descripción* del problema?`);
     }
 
+    // Tips rápidos (una sola vez)
     const quick = quickHelp(ntext);
     if (quick && !sv.quick_advice_sent) {
       sv.quick_advice_sent = true;
       await sendWhatsAppText(env, toE164, quick);
     }
 
+    // Severidad estimada
     sv.prioridad = sv.prioridad || (intent?.severity || (quick ? 'baja' : 'media'));
 
+    // ¿Qué datos faltan?
     const needed = [];
     if (!truthy(sv.marca) && !truthy(sv.modelo)) needed.push('modelo');
     if (!truthy(sv.falla)) needed.push('falla');
@@ -932,6 +937,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       return ok('EVENT_RECEIVED');
     }
 
+    // Si ya tenemos todo → calendar
     const pool = await getCalendarPool(env);
     const cal = pickCalendarFromPool(pool);
     if (!cal) {
@@ -951,7 +957,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       description: renderOsDescription(session.from, sv),
       start: slot.start,
       end: slot.end,
-      timezone: tz,
+      timezone: tz
     });
 
     const cliente_id = await upsertClienteByPhone(env, session.from);
@@ -973,8 +979,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       cp: sv.cp || null,
       created_at: new Date().toISOString()
     }];
-    const os = await sbUpsert(env, 'orden_servicio', osBody, { returning: 'representation' });
-    const osId = os?.data?.[0]?.id;
+    await sbUpsert(env, 'orden_servicio', osBody, { returning: 'representation' });
 
     await sendWhatsAppText(
       env,
@@ -988,8 +993,6 @@ Si necesitas reprogramar o cancelar, dímelo con confianza.`
     );
 
     session.stage = 'sv_scheduled';
-    session.data.sv.os_id = osId;
-    session.data.sv.gcal_event_id = event?.id || null;
     await saveSession(env, session, now);
     return ok('EVENT_RECEIVED');
   } catch (e) {
@@ -1209,7 +1212,7 @@ function renderOsDescription(phone, sv) {
 }
 async function getLastOpenOS(env, phone) {
   try {
-    const r = await sbGet(env, 'orden_servicio', { query: `select=id,estado,ventana_inicio,ventana_fin,calendar_id,gcal_event_id,cliente_id&cliente_id=in.(select id from cliente donde telefono=eq.${phone})&order=ventana_inicio.desc&limit=1` });
+    const r = await sbGet(env, 'orden_servicio', { query: `select=id,estado,ventana_inicio,ventana_fin,calendar_id,gcal_event_id,cliente_id&cliente_id=in.(select id from cliente where telefono=eq.${phone})&order=ventana_inicio.desc&limit=1` });
     if (r && r[0] && ['agendado','reprogramado','confirmado'].includes(r[0].estado)) return r[0];
   } catch {}
   return null;
@@ -1386,7 +1389,7 @@ function parseCustomerText(text) {
 
   return out;
 }
-function displayField(k){ const map={ nombre:'Nombre / Razón Social', rfc:'RFC', email:'Email', calle:'Calle', numero:'Número', colonia:'Colonia', ciudad:'Ciudad', cp:'CP' }; return map[k]||k; } 
+function displayField(k){ const map={ nombre:'Nombre / Razón Social', rfc:'RFC', email:'Email', calle:'Calle', numero:'Número', colonia:'Colonia', ciudad:'Ciudad', cp:'CP' }; return map[k]||k; }
 function buildResumePrompt(session){
   const st = session?.stage || 'idle';
   if (st === 'await_invoice') return '¿La cotizamos con factura o sin factura?';
