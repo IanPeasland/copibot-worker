@@ -1,10 +1,13 @@
 /**
  * CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
- * Sep/2025:
- * - Soporte se evalúa PRIMERO con detector determinista + IA opcional.
- * - Pregunta de inmediato modelo + falla y luego completa dirección/horario.
- * - FAQs rápidas si encaja; si no, agenda visita y guarda OS en DB.
- * - Mantiene flujos existentes (ventas, carrito, factura, cliente, FAQs, Calendar).
+ * Sep/2025 (rev. bugfix support flow, robust scheduling/DB):
+ * - Soporte se evalúa PRIMERO (determinista + IA opcional).
+ * - Captura por turnos con sv_need_next y stage='sv_collect' (siempre salva antes de salir).
+ * - Agenda solo cuando needed.length===0; todo GCal/Supabase va en try/catch.
+ * - Si falta GCal o falla cualquier llamada externa: crea OS "pendiente" (si DB disponible);
+ *   si DB también falla: acuse humano y se mantiene sv_collect con flag os_pending.
+ * - Nunca se lanza throw hacia arriba desde handleSupport; jamás se deja al usuario sin respuesta.
+ * - Instrumentación con prefijos: [SUPPORT], [GCal], [Supabase], [FAQ], [STATE].
  */
 
 export default {
@@ -270,7 +273,7 @@ async function aiCall(env, messages, {json=false}={}) {
     headers:{ 'Authorization':`Bearer ${OPENAI_KEY}`, 'Content-Type':'application/json' },
     body: JSON.stringify(body)
   });
-  if (!r.ok) { console.warn('aiCall', r.status, await r.text()); return null; }
+  if (!r.ok) { console.warn('[AI] aiCall', r.status, await r.text()); return null; }
   const j = await r.json();
   return j?.choices?.[0]?.message?.content || '';
 }
@@ -309,7 +312,7 @@ Responde SOLO JSON.`;
 
 /* ============================ WhatsApp ============================ */
 async function sendWhatsAppText(env, toE164, body) {
-  if (!env.WA_TOKEN || !env.PHONE_ID) { console.warn('WA env missing'); return; }
+  if (!env.WA_TOKEN || !env.PHONE_ID) { console.warn('[WA] env missing'); return; }
   const url = `https://graph.facebook.com/v20.0/${env.PHONE_ID}/messages`;
   const payload = { messaging_product: 'whatsapp', to: toE164.replace(/\D/g, ''), text: { body } };
   const r = await fetch(url, {
@@ -317,7 +320,7 @@ async function sendWhatsAppText(env, toE164, body) {
     headers: { Authorization: `Bearer ${env.WA_TOKEN}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   });
-  if (!r.ok) console.warn('sendWhatsAppText', r.status, await r.text());
+  if (!r.ok) console.warn('[WA] sendWhatsAppText', r.status, await r.text());
 }
 async function notifySupport(env, body) {
   const to = env.SUPPORT_WHATSAPP || env.SUPPORT_PHONE_E164;
@@ -328,7 +331,7 @@ function extractWhatsAppContext(payload) {
   try {
     const value = payload?.entry?.[0]?.changes?.[0]?.value;
     const msg = value?.messages?.[0];
-    if (!msg || msg.type !== 'text') return null;
+    if (!msg || msg.type !== 'text') return null; // ignoramos no-text (audio/imagen) para mantener simplicidad del flujo
     const from = msg.from;
     const fromE164 = `+${from}`;
     const mid = msg.id || `${Date.now()}_${Math.random()}`;
@@ -764,7 +767,7 @@ async function preloadCustomerIfAny(env, session){
     if (r && r[0]) {
       session.data.customer = { ...(session.data.customer||{}), ...r[0] };
     }
-  }catch(e){ console.warn('preloadCustomerIfAny', e); }
+  }catch(e){ console.warn('[Supabase] preloadCustomerIfAny', e); }
 }
 
 async function ensureClienteFields(env, cliente_id, c){
@@ -772,7 +775,7 @@ async function ensureClienteFields(env, cliente_id, c){
     const patch = {};
     ['nombre','rfc','email','calle','numero','colonia','ciudad','cp'].forEach(k=>{ if (truthy(c[k])) patch[k]=c[k]; });
     if (Object.keys(patch).length>0) await sbPatch(env, 'cliente', patch, `id=eq.${cliente_id}`);
-  }catch(e){ console.warn('ensureClienteFields', e); }
+  }catch(e){ console.warn('[Supabase] ensureClienteFields', e); }
 }
 
 async function createOrderFromSession(env, session, toE164) {
@@ -823,17 +826,19 @@ async function createOrderFromSession(env, session, toE164) {
         const current = numberOrZero(row?.[0]?.stock);
         const toDec = Math.min(current, Number(it.qty||0));
         if (toDec > 0) await sbRpc(env, 'decrement_stock', { in_sku: sku, in_by: toDec });
-      } catch(e){ console.warn('stock dec', e); }
+      } catch(e){ console.warn('[Supabase] stock dec', e); }
     }
 
     return { ok: true, pedido_id, total };
   } catch (e) {
-    console.warn('createOrderFromSession', e);
+    console.warn('[Supabase] createOrderFromSession', e);
     return { ok: false, error: String(e) };
   }
 }
 
 /* ============================ SOPORTE ============================ */
+
+/** Intenta completar datos a partir de texto libre del usuario */
 function extractSvInfo(text) {
   const out = {};
   if (/xerox/i.test(text)) out.marca = 'Xerox';
@@ -863,6 +868,7 @@ function extractSvInfo(text) {
   return out;
 }
 
+/** Escribe un campo en sv acorde al dato solicitado */
 function svFillFromAnswer(sv, field, text, env){
   const t = text.trim();
   if (field === 'modelo') {
@@ -871,14 +877,11 @@ function svFillFromAnswer(sv, field, text, env){
       if (m[1]) sv.marca = /fuji/i.test(m[1]) ? 'Fujifilm' : 'Xerox';
       sv.modelo = m[2].toUpperCase();
     } else {
-      sv.modelo = t; // guarda texto libre si no hay patrón
+      sv.modelo = t; // texto libre si no hay patrón
     }
     return;
   }
-  if (field === 'falla') {
-    sv.falla = t;
-    return;
-  }
+  if (field === 'falla') { sv.falla = t; return; }
   if (field === 'calle') { sv.calle = clean(t); return; }
   if (field === 'numero') { const m = t.match(/\b(\d+[A-Z]?)\b/); sv.numero = m?m[1]:clean(t); return; }
   if (field === 'colonia') { sv.colonia = clean(t); return; }
@@ -888,6 +891,11 @@ function svFillFromAnswer(sv, field, text, env){
     if (dt?.start) sv.when = dt;
     return;
   }
+}
+
+/** NUEVO: detecta si hay credenciales de GCal configuradas */
+function hasGcalCreds(env){
+  return !!(env.GCAL_CLIENT_ID && env.GCAL_CLIENT_SECRET && env.GCAL_REFRESH_TOKEN);
 }
 
 async function handleSupport(env, session, toE164, text, lowered, ntext, now, intent){
@@ -901,20 +909,28 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       svFillFromAnswer(sv, session.data.sv_need_next, text, env);
     }
 
-    // En cada turno intenta extraer algo adicional del texto libre
+    // Completa con extracción libre (marca/modelo/falla/dirección/CP/ciudad/when)
     Object.assign(sv, extractSvInfo(text));
     if (!sv.when) {
       const dt = parseNaturalDateTime(lowered, env);
       if (dt?.start) sv.when = dt;
     }
+    if (sv.cp && !sv.ciudad) {
+      const info = await cityFromCP(env, sv.cp);
+      if (info) {
+        sv.ciudad = info.ciudad || info.municipio || sv.ciudad;
+        sv.estado = info.estado || sv.estado;
+      }
+    }
 
-    // Mensaje de bienvenida (único)
+    // Bienvenida (solo una vez)
     if (!sv._welcomed) {
       sv._welcomed = true;
+      await saveSession(env, session, now); // persistimos el flag antes de interactuar más
       await sendWhatsAppText(env, toE164, `Lamento la falla 😕. Vamos a ayudarte. ¿Me confirmas *marca/modelo* y una breve *descripción* del problema?`);
     }
 
-    // Consejos rápidos (FAQs express) si aplica
+    // Consejos rápidos (FAQs express) si aplica (enviarlos una sola vez)
     const quick = quickHelp(ntext);
     if (quick && !sv.quick_advice_sent) {
       sv.quick_advice_sent = true;
@@ -923,7 +939,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
 
     sv.prioridad = sv.prioridad || (intent?.severity || (quick ? 'baja' : 'media'));
 
-    // Campos que necesitamos para agendar
+    // Campos necesarios para agendar (orden estricto)
     const needed = [];
     if (!truthy(sv.marca) && !truthy(sv.modelo)) needed.push('modelo');
     if (!truthy(sv.falla)) needed.push('falla');
@@ -933,7 +949,10 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     if (!truthy(sv.cp)) needed.push('cp');
     if (!sv.when?.start) needed.push('horario');
 
+    console.log('[SUPPORT]', session.from, 'stage:', session.stage, 'needed:', needed.join(',') || 'none');
+
     if (needed.length) {
+      // Guardamos la intención de la siguiente pregunta ANTES de responder (idempotencia del flujo)
       session.stage = 'sv_collect';
       session.data.sv_need_next = needed[0];
       await saveSession(env, session, now);
@@ -950,71 +969,133 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       return ok('EVENT_RECEIVED');
     }
 
-    // Si ya tenemos todo → agenda automáticamente
-    const pool = await getCalendarPool(env);
-    const cal = pickCalendarFromPool(pool);
-    if (!cal) {
-      await sendWhatsAppText(env, toE164, `Ahora mismo no veo disponibilidad automática. Te contacto para ofrecer opciones. 🙏`);
-      await notifySupport(env, `Sin calendar activo para OS. ${toE164}`);
-      session.stage = 'idle';
+    // Persistimos la sesión "completa" antes de intentar externos
+    await saveSession(env, session, now);
+
+    // Ya tenemos todo → intentar agenda/OS con tolerancia a fallos
+    const tz = env.TZ || 'America/Mexico_City';
+    const credsOk = hasGcalCreds(env);
+    let cal = null, slot = null, event = null;
+
+    // 1) Pool de calendarios
+    if (credsOk) {
+      try {
+        const pool = await getCalendarPool(env);
+        cal = pickCalendarFromPool(pool);
+        if (!cal) console.warn('[GCal] No active calendar in pool');
+      } catch (e) {
+        console.warn('[GCal] getCalendarPool error', e);
+      }
+    } else {
+      console.warn('[GCal] Missing credentials; will queue OS as pendiente');
+    }
+
+    // 2) Slot más cercano dentro de ventana 10–15h
+    const chosen = clampToWindow(sv.when, tz);
+    if (credsOk && cal) {
+      try {
+        slot = await findNearestFreeSlot(env, cal.gcal_id, chosen, tz);
+      } catch (e) {
+        console.warn('[GCal] findNearestFreeSlot error', e);
+      }
+    }
+
+    // 3) Crear/confirmar cliente
+    let cliente_id = null;
+    try {
+      cliente_id = await upsertClienteByPhone(env, session.from);
+    } catch (e) {
+      console.warn('[Supabase] upsertClienteByPhone error', e);
+    }
+
+    // 4) Crear evento de Calendar (si procede)
+    if (credsOk && cal && slot) {
+      try {
+        event = await gcalCreateEvent(env, cal.gcal_id, {
+          summary: `Visita técnica: ${sv.marca || ''} ${sv.modelo || ''}`.trim(),
+          description: renderOsDescription(session.from, sv),
+          start: slot.start,
+          end: slot.end,
+          timezone: tz,
+        });
+      } catch (e) {
+        console.warn('[GCal] gcalCreateEvent error', e);
+      }
+    }
+
+    // 5) Crear OS en Supabase (agendado si hubo evento; si no, pendiente)
+    let osId = null;
+    try {
+      const estado = (event && event.id) ? 'agendado' : 'pendiente';
+      const osBody = [{
+        cliente_id: cliente_id || null,
+        marca: sv.marca || null,
+        modelo: sv.modelo || null,
+        falla_descripcion: sv.falla || null,
+        prioridad: sv.prioridad || 'media',
+        estado,
+        ventana_inicio: new Date((slot?.start || chosen.start)).toISOString(),
+        ventana_fin: new Date((slot?.end || chosen.end)).toISOString(),
+        gcal_event_id: event?.id || null,
+        calendar_id: cal?.gcal_id || null,
+        calle: sv.calle || null,
+        numero: sv.numero || null,
+        colonia: sv.colonia || null,
+        ciudad: sv.ciudad || null,
+        cp: sv.cp || null,
+        created_at: new Date().toISOString()
+      }];
+      const os = await sbUpsert(env, 'orden_servicio', osBody, { returning: 'representation' });
+      osId = os?.data?.[0]?.id || null;
+      console.log('[Supabase] OS upsert estado=', (event?.id ? 'agendado' : 'pendiente'), 'id=', osId || '—');
+    } catch (e) {
+      console.warn('[Supabase] orden_servicio upsert error', e);
+    }
+
+    // 6) Confirmación al usuario (dos caminos)
+    if (event?.id && osId) {
+      await sendWhatsAppText(
+        env,
+        toE164,
+        `¡Listo! Agendé tu visita 🙌
+*${fmtDate(slot.start, tz)}*, de *${fmtTime(slot.start, tz)}* a *${fmtTime(slot.end, tz)}*
+Dirección: ${sv.calle} ${sv.numero}, ${sv.colonia}, ${sv.cp} ${sv.ciudad || ''}
+Técnico asignado: ${cal?.name || 'por confirmar'}.
+
+Si necesitas reprogramar o cancelar, dímelo con confianza.`
+      );
+      session.stage = 'sv_scheduled';
+      session.data.sv.os_id = osId;
+      session.data.sv.gcal_event_id = event.id;
       await saveSession(env, session, now);
       return ok('EVENT_RECEIVED');
     }
 
-    const tz = env.TZ || 'America/Mexico_City';
-    const chosen = clampToWindow(sv.when, tz);
-    const slot = await findNearestFreeSlot(env, cal.gcal_id, chosen, tz);
+    // Sin evento confirmado (sin GCal o error) → OS pendiente si se pudo; de lo contrario acuse humano
+    if (osId) {
+      await sendWhatsAppText(env, toE164, `Tengo tus datos ✅. En breve te *confirmo el horario exacto* por este medio.`);
+      await notifySupport(env, `OS pendiente/agendar para ${toE164}\nEquipo: ${sv.marca||''} ${sv.modelo||''}\nFalla: ${sv.falla||'N/D'}\nDirección: ${sv.calle||''} ${sv.numero||''}, ${sv.colonia||''}, ${sv.cp||''} ${sv.ciudad||''}`);
+      session.stage = 'sv_scheduled'; // marcamos como atendido a la espera de confirmación manual
+      session.data.sv.os_id = osId;
+      session.data.sv.gcal_event_id = null;
+      await saveSession(env, session, now);
+      return ok('EVENT_RECEIVED');
+    }
 
-    const event = await gcalCreateEvent(env, cal.gcal_id, {
-      summary: `Visita técnica: ${sv.marca || ''} ${sv.modelo || ''}`.trim(),
-      description: renderOsDescription(session.from, sv),
-      start: slot.start,
-      end: slot.end,
-      timezone: tz,
-    });
-
-    const cliente_id = await upsertClienteByPhone(env, session.from);
-    const osBody = [{
-      cliente_id,
-      marca: sv.marca || null,
-      modelo: sv.modelo || null,
-      falla_descripcion: sv.falla || null,
-      prioridad: sv.prioridad || 'media',
-      estado: 'agendado',
-      ventana_inicio: new Date(slot.start).toISOString(),
-      ventana_fin: new Date(slot.end).toISOString(),
-      gcal_event_id: event?.id || null,
-      calendar_id: cal.gcal_id || null,
-      calle: sv.calle || null,
-      numero: sv.numero || null,
-      colonia: sv.colonia || null,
-      ciudad: sv.ciudad || null,
-      cp: sv.cp || null,
-      created_at: new Date().toISOString()
-    }];
-    const os = await sbUpsert(env, 'orden_servicio', osBody, { returning: 'representation' });
-    const osId = os?.data?.[0]?.id;
-
-    await sendWhatsAppText(
-      env,
-      toE164,
-      `¡Listo! Agendé tu visita 🙌
-*${fmtDate(slot.start, tz)}*, de *${fmtTime(slot.start, tz)}* a *${fmtTime(slot.end, tz)}*
-Dirección: ${sv.calle} ${sv.numero}, ${sv.colonia}, ${sv.cp} ${sv.ciudad || ''}
-Técnico asignado: ${cal.name || 'por confirmar'}.
-
-Si necesitas reprogramar o cancelar, dímelo con confianza.`
-    );
-
-    session.stage = 'sv_scheduled';
-    session.data.sv.os_id = osId;
-    session.data.sv.gcal_event_id = event?.id || null;
+    // Ni evento ni OS pudieron crearse → no fallar, acuse humano y seguir en captura (sv_collect) para no perder estado
+    await sendWhatsAppText(env, toE164, `Tomé tus datos de soporte 🙌. Un asesor te *confirmará el horario* enseguida.`);
+    await notifySupport(env, `⚠️ No se pudo crear OS para ${toE164}. Revisar credenciales de DB/Calendar.\nEquipo: ${sv.marca||''} ${sv.modelo||''}\nFalla: ${sv.falla||'N/D'}`);
+    session.stage = 'sv_collect';
+    session.data.sv.os_pending = true;
+    session.data.sv_need_next = null;
     await saveSession(env, session, now);
     return ok('EVENT_RECEIVED');
+
   } catch (e) {
-    console.error('handleSupport error', e);
-    // Fallback amable si algo truena
+    console.error('[SUPPORT] handleSupport error', e);
+    // Fallback amable si algo truena (nunca sin respuesta)
     await sendWhatsAppText(env, toE164, 'Recibí tu mensaje de *soporte*. Te contacto enseguida para ayudarte 🙌');
+    // Mantener estado actual (no resetear); no lanzamos throw
     return ok('EVENT_RECEIVED');
   }
 }
@@ -1087,7 +1168,9 @@ async function maybeFAQ(env, ntext) {
       query: `select=key,content,tags&or=(key.ilike.${like},content.ilike.${like})&limit=1`
     });
     if (r && r[0]?.content) return r[0].content;
-  } catch {}
+  } catch (e) {
+    console.warn('[FAQ] maybeFAQ error', e);
+  }
   if (/\b(qu[ié]nes?\s+son|sobre\s+ustedes|qu[eé]\s+es\s+cp(\s+digital)?|h[aá]blame\s+de\s+ustedes)\b/i.test(ntext)) {
     return '¡Hola! Somos *CP Digital*. Ayudamos a empresas con consumibles y refacciones para impresoras Xerox y Fujifilm, y brindamos visitas de soporte técnico. Cotizamos, vendemos con o sin factura y agendamos servicio en tu horario.';
   }
@@ -1156,46 +1239,48 @@ function clampToWindow(when, tz) {
 
 /* ============================ Google Calendar ============================ */
 async function gcalToken(env) {
-  const r = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      client_id: env.GCAL_CLIENT_ID,
-      client_secret: env.GCAL_CLIENT_SECRET,
-      refresh_token: env.GCAL_REFRESH_TOKEN,
-      grant_type: 'refresh_token'
-    })
-  });
-  if (!r.ok) { console.warn('gcal token', await r.text()); return null; }
-  const j = await r.json();
-  return j.access_token;
+  try{
+    const r = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: env.GCAL_CLIENT_ID,
+        client_secret: env.GCAL_CLIENT_SECRET,
+        refresh_token: env.GCAL_REFRESH_TOKEN,
+        grant_type: 'refresh_token'
+      })
+    });
+    if (!r.ok) { console.warn('[GCal] token', await r.text()); return null; }
+    const j = await r.json();
+    return j.access_token;
+  } catch(e){ console.warn('[GCal] token error', e); return null; }
 }
 async function gcalCreateEvent(env, calendarId, { summary, description, start, end, timezone }) {
   const token = await gcalToken(env); if (!token) return null;
   const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`;
   const body = { summary, description, start: { dateTime: start, timeZone: timezone }, end: { dateTime: end, timeZone: timezone } };
   const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  if (!r.ok) { console.warn('gcal create', await r.text()); return null; }
+  if (!r.ok) { console.warn('[GCal] create', await r.text()); return null; }
   return await r.json();
 }
 async function gcalPatchEvent(env, calendarId, eventId, patch) {
   const token = await gcalToken(env); if (!token) return null;
   const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`;
   const r = await fetch(url, { method: 'PATCH', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
-  if (!r.ok) { console.warn('gcal patch', await r.text()); return null; }
+  if (!r.ok) { console.warn('[GCal] patch', await r.text()); return null; }
   return await r.json();
 }
 async function gcalDeleteEvent(env, calendarId, eventId) {
   const token = await gcalToken(env); if (!token) return null;
   const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`;
   const r = await fetch(url, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
-  if (!r.ok) console.warn('gcal delete', await r.text());
+  if (!r.ok) console.warn('[GCal] delete', await r.text());
 }
 async function isBusy(env, calendarId, startISO, endISO) {
   const token = await gcalToken(env); if (!token) return false;
   const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?timeMin=${encodeURIComponent(startISO)}&timeMax=${encodeURIComponent(endISO)}&singleEvents=true&orderBy=startTime`;
   const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-  if (!r.ok) { console.warn('gcal list', await r.text()); return false; }
+  if (!r.ok) { console.warn('[GCal] list', await r.text()); return false; }
   const j = await r.json();
   return Array.isArray(j.items) && j.items.length > 0;
 }
@@ -1258,7 +1343,8 @@ function parseAddressLoose(text=''){
     const parts = pre.split(',').map(s=>s.trim()).filter(Boolean);
     if (parts.length >= 1) out.colonia = parts[parts.length-1];
   }
-  const mcalle = text.match(/([A-Za-zÁÉÍÓÚÜÑ0-9 .\-']+)\s+(\d+[A-Z]?)/i);
+  // "Prol. Reforma 123", "Av. Universidad 500B"
+  const mcalle = text.match(/([A-Za-zÁÉÍÓÚÜÑ0-9 .\-']+?)\s+(\d+[A-Z]?)(?!\w)/i);
   if (mcalle) out.calle = clean(mcalle[1]);
   return out;
 }
@@ -1284,7 +1370,7 @@ async function sbGet(env, table, { query='', headers={} }={}) {
   const url = `${b.url}/${table}${query?`?${query}`:''}`;
   const r = await fetch(url, { headers:{ apikey:b.key, Authorization:`Bearer ${b.key}`, ...headers } });
   if (r.status===204) return [];
-  if (!r.ok){ console.warn('sbGet', table, r.status, await r.text()); return null; }
+  if (!r.ok){ console.warn('[Supabase] sbGet', table, r.status, await r.text()); return null; }
   try { return await r.json(); } catch { return null; }
 }
 async function sbUpsert(env, table, body, { onConflict='', returning='representation', headers={} }={}) {
@@ -1299,9 +1385,9 @@ async function sbUpsert(env, table, body, { onConflict='', returning='representa
   try{
     const r = await fetch(url, { method:'POST', headers:h, body: JSON.stringify(body) });
     const text = await r.text(); let data=null; try{ data = text ? JSON.parse(text) : null; }catch{}
-    if(!r.ok) console.warn('sbUpsert', table, r.status, text);
+    if(!r.ok) console.warn('[Supabase] sbUpsert', table, r.status, text);
     return { data, status:r.status };
-  }catch(e){ console.warn('sbUpsert error', table, e); return { data:null, status:500 }; }
+  }catch(e){ console.warn('[Supabase] sbUpsert error', table, e); return { data:null, status:500 }; }
 }
 async function sbPatch(env, table, body, filter){
   const b = sb(env);
@@ -1310,8 +1396,8 @@ async function sbPatch(env, table, body, filter){
     const r = await fetch(url, { method:'PATCH', headers:{
       apikey:b.key, Authorization:`Bearer ${b.key}`, 'Content-Type':'application/json'
     }, body: JSON.stringify(body) });
-    if(!r.ok) console.warn('sbPatch', table, r.status, await r.text());
-  }catch(e){ console.warn('sbPatch err', table, e); }
+    if(!r.ok) console.warn('[Supabase] sbPatch', table, r.status, await r.text());
+  }catch(e){ console.warn('[Supabase] sbPatch err', table, e); }
 }
 async function sbRpc(env, fn, args){
   const b = sb(env);
@@ -1320,9 +1406,9 @@ async function sbRpc(env, fn, args){
     const r = await fetch(url, { method:'POST', headers:{
       apikey:b.key, Authorization:`Bearer ${b.key}`, 'Content-Type':'application/json'
     }, body: JSON.stringify(args || {}) });
-    if (!r.ok) { console.warn('sbRpc', fn, r.status, await r.text()); return null; }
+    if (!r.ok) { console.warn('[Supabase] sbRpc', fn, r.status, await r.text()); return null; }
     const text = await r.text(); try{ return text ? JSON.parse(text) : null; }catch{ return null; }
-  }catch(e){ console.warn('sbRpc err', fn, e); return null; }
+  }catch(e){ console.warn('[Supabase] sbRpc err', fn, e); return null; }
 }
 
 /* ============================ Sesiones ============================ */
@@ -1330,7 +1416,7 @@ async function loadSession(env, from){
   try{
     const r = await sbGet(env, 'wa_session', { query:`select=from,stage,data,updated_at,expires_at&from=eq.${from}` });
     if (r && r[0]) return r[0];
-  }catch(e){ console.warn('loadSession', e); }
+  }catch(e){ console.warn('[STATE] loadSession', e); }
   return { from, stage:'idle', data:{} };
 }
 async function saveSession(env, session, at=new Date()){
