@@ -1,9 +1,11 @@
 /**
  * CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
- * Oct/2025 (fix soporte):
- * - Captura de respuestas por sv_need_next ANTES de bienvenida.
- * - Parser de horario entiende "mañana a las 3 de la tarde", "13 hrs", etc.
- * - Fallbacks: nunca throws visibles; OS pendiente si GCal/DB no responden.
+ * Oct/2025
+ * - "Seguro" saludo/reanudación por encima de soporte.
+ * - Pivot a ventas aunque haya flujo pendiente (inventario, precio, SKU).
+ * - Soporte robusto: captura por turnos, quick triage, agenda tolerante a fallos (GCal/DB).
+ * - Recolección de cliente si no existe (nombre/email/dirección).
+ * - Parser de horario en español ("mañana 3 pm" / "mañana 14:00" / "3 de la tarde").
  */
 
 export default {
@@ -11,7 +13,7 @@ export default {
     try {
       const url = new URL(req.url);
 
-      // Webhook verify (Meta/WhatsApp)
+      // Verificación webhook Meta/WhatsApp
       if (req.method === 'GET' && url.pathname === '/') {
         const mode = url.searchParams.get('hub.mode');
         const token = url.searchParams.get('hub.verify_token');
@@ -22,7 +24,7 @@ export default {
         return new Response('Forbidden', { status: 403 });
       }
 
-      // Cron endpoint
+      // Cron endpoint (recordatorios)
       if (req.method === 'POST' && url.pathname === '/cron') {
         const sec = req.headers.get('x-cron-secret') || url.searchParams.get('secret');
         if (!sec || sec !== env.CRON_SECRET) return new Response('Forbidden', { status: 403 });
@@ -30,7 +32,7 @@ export default {
         return ok(`cron ok ${JSON.stringify(out)}`);
       }
 
-      // Webhook mensajes
+      // Webhook de mensajes
       if (req.method === 'POST' && url.pathname === '/') {
         const payload = await safeJson(req);
         const ctx = extractWhatsAppContext(payload);
@@ -52,7 +54,7 @@ export default {
           session.data.customer.nombre = toTitleCase(firstWord(profileName));
         }
 
-        // idempotencia
+        // Idempotencia por message id
         if (session?.data?.last_mid && session.data.last_mid === mid) return ok('EVENT_RECEIVED');
         session.data.last_mid = mid;
 
@@ -77,8 +79,29 @@ export default {
         }
 
         const isGreet = RX_GREET.test(lowered);
+        const looksInv = RX_INV_Q.test(ntext);
 
-        // ===== SOPORTE: SIEMPRE PRIMERO =====
+        /* ==================== SEGURO: REANUDACIÓN / PIVOT ==================== */
+        if (session.stage !== 'idle') {
+          // Saludo → pasar a await_resume
+          if (isGreet) {
+            const friendly = await aiSmallTalk(env, session, 'general', text);
+            await sendWhatsAppText(env, fromE164, `${friendly}\n¿Deseas *continuar* con tu trámite pendiente o prefieres *empezar otro*?`);
+            session.data.last_stage = session.stage;
+            session.stage = 'await_resume';
+            await saveSession(env, session, now);
+            return ok('EVENT_RECEIVED');
+          }
+          // Consulta de inventario clara → pivot inmediato a ventas
+          if (looksInv) {
+            session.data.last_stage = session.stage;
+            const handled = await startSalesFromQuery(env, session, fromE164, text, ntext, now);
+            return handled;
+          }
+        }
+        /* ===================================================================== */
+
+        // Detección soporte primero (determinista + IA)
         let supportFlag = isSupportIntent(ntext);
         if (!supportFlag) {
           const clf = await aiClassifyIntent(env, text);
@@ -89,20 +112,14 @@ export default {
           return handled;
         }
 
-        // Saludo durante flujo activo → pausar
-        if (isGreet && session.stage !== 'idle' && session.stage !== 'post_order') {
-          const friendly = await aiSmallTalk(env, session, 'general', text);
-          await sendWhatsAppText(env, fromE164, `${friendly}\n¿Deseas continuar con tu trámite?`);
-          session.data.last_stage = session.stage;
-          session.stage = 'await_resume';
-          await saveSession(env, session, now);
-          return ok('EVENT_RECEIVED');
-        }
-
-        // Reanudación
+        // REANUDACIÓN
         if (session.stage === 'await_resume') {
           if (isSupportIntent(ntext)) {
             const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support' });
+            return handled;
+          }
+          if (looksInv) {
+            const handled = await startSalesFromQuery(env, session, fromE164, text, ntext, now);
             return handled;
           }
           if (isYesish(lowered)) {
@@ -123,8 +140,7 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // Saludo automático
-        const looksInv = RX_INV_Q.test(ntext);
+        // Saludo automático si procede
         const mayGreet = isGreet && shouldAutogreet(session, now) && session.stage === 'idle' && !looksInv;
         if (mayGreet) {
           const g = await aiSmallTalk(env, session, 'greeting');
@@ -173,7 +189,7 @@ export default {
         if (session.stage === 'await_invoice') return await handleAwaitInvoice(env, session, fromE164, lowered, now, text);
         if (session.stage?.startsWith('collect_')) return await handleCollectSequential(env, session, fromE164, text, now);
 
-        // VENTAS (inicio idle)
+        // VENTAS (inicio)
         if (session.stage === 'idle' && looksInv) {
           const handled = await startSalesFromQuery(env, session, fromE164, text, ntext, now);
           return handled;
@@ -207,7 +223,7 @@ export default {
 const RX_GREET = /^(hola+|buen[oa]s|qué onda|que tal|saludos|hey|buen dia|buenas|holi+)\b/i;
 const RX_INV_Q  = /(toner|tóner|cartucho|developer|refacci[oó]n|precio|docucolor|versant|versalink|altalink|apeos|c\d{2,4}|b\d{2,4}|magenta|amarillo|cyan|negro)/i;
 
-/** Detector determinista de intención de soporte (trabaja con ntext = normalize(text)) */
+/** Detector determinista de intención de soporte (ntext normalizado) */
 function isSupportIntent(ntext='') {
   const t = ` ${ntext} `;
   const hasProblem =
@@ -518,7 +534,7 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now, originalTe
   return ok('EVENT_RECEIVED');
 }
 
-/* Captura UNO A UNO */
+/* Captura UNO A UNO (ventas) */
 const FLOW_FACT = ['nombre','rfc','email','calle','numero','colonia','cp'];
 const FLOW_SHIP = ['nombre','email','calle','numero','colonia','cp'];
 const LABEL = {
@@ -752,7 +768,7 @@ async function startSalesFromQuery(env, session, toE164, text, ntext, now){
 /* ====== Cliente ====== */
 async function preloadCustomerIfAny(env, session){
   try{
-    const r = await sbGet(env, 'cliente', { query: `select=nombre,rfc,email,calle,numero,colonia,ciudad,cp&telefono=eq.${session.from}&limit=1` });
+    const r = await sbGet(env, 'cliente', { query: `select=nombre,rfc,email,calle,numero,colonia,ciudad,estado,cp&telefono=eq.${session.from}&limit=1` });
     if (r && r[0]) {
       session.data.customer = { ...(session.data.customer||{}), ...r[0] };
     }
@@ -762,7 +778,7 @@ async function preloadCustomerIfAny(env, session){
 async function ensureClienteFields(env, cliente_id, c){
   try{
     const patch = {};
-    ['nombre','rfc','email','calle','numero','colonia','ciudad','cp','estado'].forEach(k=>{ if (truthy(c[k])) patch[k]=c[k]; });
+    ['nombre','rfc','email','calle','numero','colonia','ciudad','estado','cp'].forEach(k=>{ if (truthy(c[k])) patch[k]=c[k]; });
     if (Object.keys(patch).length>0) await sbPatch(env, 'cliente', patch, `id=eq.${cliente_id}`);
   }catch(e){ console.warn('ensureClienteFields', e); }
 }
@@ -781,7 +797,7 @@ async function createOrderFromSession(env, session, toE164) {
     if (!cliente_id) {
       const ins = await sbUpsert(env, 'cliente', [{
         nombre: c.nombre || null, rfc: c.rfc || null, email: c.email || null, telefono: session.from || null,
-        calle: c.calle || null, numero: c.numero || null, colonia: c.colonia || null, ciudad: c.ciudad || null, cp: c.cp || null, estado: c.estado || null
+        calle: c.calle || null, numero: c.numero || null, colonia: c.colonia || null, ciudad: c.ciudad || null, estado: c.estado || null, cp: c.cp || null
       }], { onConflict: 'telefono', returning: 'representation' });
       cliente_id = ins?.data?.[0]?.id || null;
     } else {
@@ -815,7 +831,7 @@ async function createOrderFromSession(env, session, toE164) {
         const current = numberOrZero(row?.[0]?.stock);
         const toDec = Math.min(current, Number(it.qty||0));
         if (toDec > 0) await sbRpc(env, 'decrement_stock', { in_sku: sku, in_by: toDec });
-      } catch(e){ console.warn('stock dec', e); }
+      } catch(e){ console.warn('[Supabase] stock dec', e); }
     }
 
     return { ok: true, pedido_id, total };
@@ -849,11 +865,9 @@ function extractSvInfo(text) {
   if (d.calle) out.calle = d.calle;
   if (d.numero) out.numero = d.numero;
   if (d.colonia) out.colonia = d.colonia;
+  if (d.cp) out.cp = d.cp;
   if (d.ciudad) out.ciudad = d.ciudad;
   if (d.estado) out.estado = d.estado;
-  if (d.cp) out.cp = d.cp;
-  if (d.email) out.c_email = d.email;
-  if (d.nombre) out.c_nombre = d.nombre;
 
   return out;
 }
@@ -870,83 +884,23 @@ function svFillFromAnswer(sv, field, text, env){
     }
     return;
   }
-  if (field === 'falla') { sv.falla = t; return; }
+  if (field === 'falla') {
+    sv.falla = t;
+    return;
+  }
   if (field === 'calle') { sv.calle = clean(t); return; }
   if (field === 'numero') { const m = t.match(/\b(\d+[A-Z]?)\b/); sv.numero = m?m[1]:clean(t); return; }
   if (field === 'colonia') { sv.colonia = clean(t); return; }
+  if (field === 'cp') { const m = t.match(/\b(\d{5})\b/); sv.cp = m?m[1]:clean(t); return; }
   if (field === 'ciudad') { sv.ciudad = clean(t); return; }
   if (field === 'estado') { sv.estado = clean(t); return; }
-  if (field === 'cp') { const m = t.match(/\b(\d{5})\b/); sv.cp = m?m[1]:clean(t); return; }
+  if (field === 'cust_nombre') { sv.cust_nombre = clean(t); return; }
+  if (field === 'cust_email') { const m = t.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i); sv.cust_email = m?m[0].toLowerCase():clean(t); return; }
   if (field === 'horario') {
     const dt = parseNaturalDateTime(t, env);
-    if (dt?.start) { sv.when = dt; delete sv.when_parse_failed; }
-    else { sv.when_parse_failed = true; }
+    if (dt?.start) sv.when = dt;
     return;
   }
-  if (field === 'c_nombre') { sv.c_nombre = clean(t); return; }
-  if (field === 'c_email') {
-    const m = t.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
-    sv.c_email = m ? m[0].toLowerCase() : clean(t).toLowerCase();
-    return;
-  }
-}
-
-async function faqForFailure(env, fallaText=''){
-  const key = normalize(fallaText||'').slice(0, 80);
-  if (!key) return null;
-  try {
-    const like = encodeURIComponent(`%${key}%`);
-    const r = await sbGet(env, 'company_info', { query: `select=content,tags&or=(key.ilike.${like},content.ilike.${like},tags.ilike.${like})&limit=1` });
-    return r?.[0]?.content || null;
-  } catch(e){ console.warn('[FAQ] faqForFailure error', e); return null; }
-}
-function hasGcalCreds(env){ return !!(env.GCAL_CLIENT_ID && env.GCAL_CLIENT_SECRET && env.GCAL_REFRESH_TOKEN); }
-
-function getSvNeeded(sv={}, session, customerExists=false){
-  const needed = [];
-  if (!truthy(sv.marca) && !truthy(sv.modelo)) needed.push('modelo');
-  if (!truthy(sv.falla))  needed.push('falla');
-  if (!truthy(sv.calle))  needed.push('calle');
-  if (!truthy(sv.numero)) needed.push('numero');
-  if (!truthy(sv.colonia))needed.push('colonia');
-  if (!truthy(sv.ciudad)) needed.push('ciudad');
-  if (!truthy(sv.estado)) needed.push('estado');
-  if (!truthy(sv.cp))     needed.push('cp');
-  if (!customerExists) {
-    const c = session?.data?.customer || {};
-    if (!truthy(sv.c_nombre) && !truthy(c.nombre)) needed.push('c_nombre');
-    if (!truthy(sv.c_email)  && !truthy(c.email))  needed.push('c_email');
-  }
-  if (!sv.when?.start) needed.push('horario');
-  return needed;
-}
-
-async function askNextSvQuestion(env, session, toE164, needed, now){
-  const next = needed[0];
-  const map = {
-    modelo:  '¿Qué *marca y modelo* es tu impresora? (p.ej., *Xerox Versant 180*)',
-    falla:   'Describe brevemente la falla (p.ej., “*atasco en fusor*”, “*no imprime*”).',
-    calle:   '¿Cuál es la *calle* donde estará el equipo?',
-    numero:  '¿Qué *número* es?',
-    colonia: '¿*Colonia*?',
-    ciudad:  '¿*Ciudad o municipio*?',
-    estado:  '¿De qué *estado*?',
-    cp:      '¿*Código Postal* (5 dígitos)?',
-    c_nombre:'¿*Nombre o Razón social* del cliente?',
-    c_email: '¿*Correo electrónico* de contacto?',
-    horario: '¿Qué día y hora te viene bien entre *10:00 y 15:00*? (ej.: “*mañana 12:30*” o “*mañana 1 pm*”)'
-  };
-
-  if (next === 'horario' && session?.data?.sv?.when_parse_failed) {
-    await sendWhatsAppText(env, toE164, 'No alcancé a leer la hora 😅. Dímela así: *mañana 12:30*, *mañana 1 pm* o *hoy 14:00*.');
-  } else {
-    await sendWhatsAppText(env, toE164, map[next] || '¿Podrías compartir el dato pendiente para continuar?');
-  }
-
-  session.stage = 'sv_collect';
-  session.data.sv_need_next = next;
-  await saveSession(env, session, now);
-  return ok('EVENT_RECEIVED');
 }
 
 async function handleSupport(env, session, toE164, text, lowered, ntext, now, intent){
@@ -955,147 +909,146 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     session.data.sv = session.data.sv || {};
     const sv = session.data.sv;
 
-    // 1) Captura por sv_need_next (ANTES de todo) → evita loops
-    if (session.data.sv_need_next) {
+    // Si estamos capturando, escribe el campo pendiente primero (idempotente)
+    if (session.stage === 'sv_collect' && session.data.sv_need_next) {
       svFillFromAnswer(sv, session.data.sv_need_next, text, env);
-      session.data.sv_need_next = null;
-      await saveSession(env, session, now);
     }
 
-    // 2) Extracción ligera del texto libre
+    // En cada turno intenta extraer info libre
     Object.assign(sv, extractSvInfo(text));
     if (!sv.when) {
       const dt = parseNaturalDateTime(lowered, env);
-      if (dt?.start) { sv.when = dt; delete sv.when_parse_failed; }
-    }
-    if (sv.cp && !sv.ciudad) {
-      const info = await cityFromCP(env, sv.cp);
-      if (info) {
-        sv.ciudad = info.ciudad || info.municipio || sv.ciudad;
-        sv.estado = info.estado || sv.estado;
-      }
+      if (dt?.start) sv.when = dt;
     }
 
-    // 3) Bienvenida (una sola vez)
+    // Precargar cliente (si no está)
+    if (!session?.data?.customer?.nombre || !session?.data?.customer?.email) {
+      await preloadCustomerIfAny(env, session);
+    }
+
+    // Bienvenida (una vez)
     if (!sv._welcomed) {
       sv._welcomed = true;
-      session.stage = 'sv_collect';
-      if (!truthy(sv.modelo) || !truthy(sv.falla)) session.data.sv_need_next = 'modelo';
-      await saveSession(env, session, now);
       await sendWhatsAppText(env, toE164, `Lamento la falla 😕. Vamos a ayudarte. ¿Me confirmas *marca/modelo* y una breve *descripción* del problema?`);
-      if (!truthy(sv.modelo) || !truthy(sv.falla)) {
-        await sendWhatsAppText(env, toE164, '¿Qué *marca y modelo* es tu impresora? (p.ej., *Xerox Versant 180*)');
-        return ok('EVENT_RECEIVED');
-      }
+      await saveSession(env, session, now); // guardamos _welcomed
     }
 
-    // 4) Consejos rápidos + FAQ
+    // FAQs rápidas
     const quick = quickHelp(ntext);
     if (quick && !sv.quick_advice_sent) {
       sv.quick_advice_sent = true;
-      await sendWhatsAppText(env, toE164, quick + `\n\nSi no mejora, *agendamos visita técnica*.`);
+      await sendWhatsAppText(env, toE164, quick);
     }
-    if (truthy(sv.falla) && !sv.faq_sent) {
-      const kb = await faqForFailure(env, sv.falla);
-      if (kb) {
-        sv.faq_sent = true;
-        await sendWhatsAppText(env, toE164, `Posible solución 🤓\n${kb}\n\n¿Agendamos visita para revisarlo?`);
-      }
-    }
+
     sv.prioridad = sv.prioridad || (intent?.severity || (quick ? 'baja' : 'media'));
 
-    // 5) ¿Cliente ya existe?
-    let customerExists = false;
-    try {
-      const ex = await sbGet(env, 'cliente', { query: `select=id,nombre,email&telefono=eq.${session.from}&limit=1` });
-      if (ex && ex[0]) {
-        customerExists = true;
-        session.data.customer = session.data.customer || {};
-        session.data.customer.nombre = session.data.customer.nombre || ex[0].nombre || '';
-        session.data.customer.email  = session.data.customer.email  || ex[0].email  || '';
-      }
-    } catch(e){ console.warn('[Supabase] find cliente', e); }
+    // ¿Qué necesitamos?
+    const needed = [];
+    if (!truthy(sv.marca) && !truthy(sv.modelo)) needed.push('modelo');
+    if (!truthy(sv.falla)) needed.push('falla');
 
-    // 6) Campos pendientes
-    const needed = getSvNeeded(sv, session, customerExists);
-    console.log('[STATE]', session.from, session.stage, 'need:', needed.join(',') || '—');
+    // Datos del cliente (si no existe)
+    const c = session.data.customer || {};
+    if (!truthy(c.nombre) && !truthy(sv.cust_nombre)) needed.push('cust_nombre');
+    if (!truthy(c.email) && !truthy(sv.cust_email)) needed.push('cust_email');
+
+    // Dirección
+    if (!truthy(sv.calle)) needed.push('calle');
+    if (!truthy(sv.numero)) needed.push('numero');
+    if (!truthy(sv.colonia)) needed.push('colonia');
+    if (!truthy(sv.cp)) needed.push('cp');
+    if (!truthy(sv.ciudad)) needed.push('ciudad'); // puede venir por CP
+    if (!truthy(sv.estado)) needed.push('estado'); // opcional pero útil
+
+    // Horario
+    if (!sv.when?.start) needed.push('horario');
+
+    console.log('[STATE] support needed:', session.from, session.stage, needed);
 
     if (needed.length) {
-      return await askNextSvQuestion(env, session, toE164, needed, now);
-    }
-
-    // 7) Agenda/OS con fallbacks
-    await saveSession(env, session, now);
-    const tz = env.TZ || 'America/Mexico_City';
-    const credsOk = hasGcalCreds(env);
-    let cal = null, slot = null, event = null;
-
-    if (credsOk) {
-      try {
-        const pool = await getCalendarPool(env);
-        cal = pickCalendarFromPool(pool);
-        if (!cal) console.warn('[GCal] No active calendar');
-      } catch (e) { console.warn('[GCal] pool error', e); }
-    } else {
-      console.warn('[GCal] Missing creds; OS irá pendiente');
-    }
-
-    const chosen = clampToWindow(sv.when, tz);
-    if (credsOk && cal) {
-      try { slot = await findNearestFreeSlot(env, cal.gcal_id, chosen, tz); }
-      catch (e) { console.warn('[GCal] slot error', e); slot = { start: chosen.start, end: chosen.end }; }
-    } else {
-      slot = { start: chosen.start, end: chosen.end };
-    }
-
-    // Cliente (upsert mínimo)
-    let cliente_id = null;
-    try {
-      session.data.customer = session.data.customer || {};
-      const c = session.data.customer;
-      if (!c.nombre && sv.c_nombre) c.nombre = sv.c_nombre;
-      if (!c.email  && sv.c_email)  c.email  = sv.c_email;
-      ['calle','numero','colonia','ciudad','cp','estado'].forEach(k => { if (!c[k] && truthy(sv[k])) c[k] = sv[k]; });
-
-      const ex = await sbGet(env, 'cliente', { query: `select=id&telefono=eq.${session.from}&limit=1` });
-      if (ex && ex[0]?.id) { cliente_id = ex[0].id; await ensureClienteFields(env, cliente_id, c); }
-      else {
-        const ins = await sbUpsert(env, 'cliente', [{
-          telefono: session.from,
-          nombre: c.nombre || null, email: c.email || null,
-          calle: c.calle || null, numero: c.numero || null, colonia: c.colonia || null, ciudad: c.ciudad || null, cp: c.cp || null, estado: c.estado || null
-        }], { onConflict: 'telefono', returning: 'representation' });
-        cliente_id = ins?.data?.[0]?.id || null;
+      // Resolver ciudad/estado por CP si es lo único faltante
+      if (sv.cp && (!sv.ciudad || !sv.estado)) {
+        const info = await cityFromCP(env, sv.cp);
+        if (info) {
+          sv.ciudad = sv.ciudad || info.ciudad || info.municipio;
+          sv.estado = sv.estado || info.estado;
+        }
       }
-    } catch (e) { console.warn('[Supabase] cliente upsert', e); }
-
-    // Crear evento (si se puede)
-    if (credsOk && cal && slot) {
-      try {
-        event = await gcalCreateEvent(env, cal.gcal_id, {
-          summary: `Visita técnica: ${sv.marca || ''} ${sv.modelo || ''}`.trim(),
-          description: renderOsDescription(session.from, sv),
-          start: slot.start,
-          end: slot.end,
-          timezone: tz,
-        });
-      } catch (e) { console.warn('[GCal] create error', e); }
     }
 
-    // Orden de servicio
-    let osId = null;
+    // Si aún faltan campos, preguntamos el siguiente
+    if (needed.length) {
+      session.stage = 'sv_collect';
+      session.data.sv_need_next = needed[0];
+      await saveSession(env, session, now);
+      const qmap = {
+        modelo: '¿Qué *marca y modelo* es tu impresora? (p.ej., *Xerox Versant 180*)',
+        falla: 'Describe brevemente la falla (p.ej., “*atasco en fusor*”, “*no imprime*”).',
+        cust_nombre: '¿Nombre o *Razón Social* del cliente?',
+        cust_email: '¿Correo *electrónico* de contacto?',
+        calle: '¿Cuál es la *calle* donde estará el equipo?',
+        numero: '¿Qué *número* es?',
+        colonia: '¿*Colonia*?',
+        cp: '¿*Código Postal* (5 dígitos)?',
+        ciudad: '¿*Ciudad o municipio*?',
+        estado: '¿De qué *estado*?',
+        horario: '¿Qué día y hora te viene bien entre *10:00 y 15:00*? (ej: “*mañana 12:30*” o “*mañana 1 pm*”)'
+      };
+      await sendWhatsAppText(env, toE164, qmap[needed[0]]);
+      return ok('EVENT_RECEIVED');
+    }
+
+    /* =================== AGENDA / ORDEN DE SERVICIO =================== */
+    // Cliente en DB
+    let cliente_id = await upsertClienteByPhone(env, session.from);
+    // Si juntamos nombre/email en sv, súbelos a customer para persistir
+    session.data.customer = session.data.customer || {};
+    if (sv.cust_nombre && !session.data.customer.nombre) session.data.customer.nombre = sv.cust_nombre;
+    if (sv.cust_email && !session.data.customer.email) session.data.customer.email = sv.cust_email;
+
+    // Asegura datos del cliente
+    await ensureClienteFields(env, cliente_id, {
+      nombre: session.data.customer?.nombre || sv.cust_nombre,
+      email: session.data.customer?.email || sv.cust_email,
+      calle: sv.calle, numero: sv.numero, colonia: sv.colonia, ciudad: sv.ciudad, estado: sv.estado, cp: sv.cp
+    });
+
+    const tz = env.TZ || 'America/Mexico_City';
+    const chosen = clampToWindow(sv.when, tz);
+
+    let cal = null, slot = chosen, gEvent = null, osId = null;
+
     try {
-      const estado = (event && event.id) ? 'agendado' : 'pendiente';
-      const osBody = [{
-        cliente_id: cliente_id || null,
+      const pool = await getCalendarPool(env);
+      cal = pickCalendarFromPool(pool);
+
+      if (!cal) throw new Error('No active calendar');
+
+      slot = await findNearestFreeSlot(env, cal.gcal_id, chosen, tz);
+
+      gEvent = await gcalCreateEvent(env, cal.gcal_id, {
+        summary: `Visita técnica: ${sv.marca || ''} ${sv.modelo || ''}`.trim(),
+        description: renderOsDescription(session.from, sv),
+        start: slot.start,
+        end: slot.end,
+        timezone: tz,
+      });
+    } catch (e) {
+      console.warn('[GCal] scheduling error', String(e));
+    }
+
+    // Inserta OS (agendado si hay evento, pendiente si no)
+    try {
+      const body = [{
+        cliente_id,
         marca: sv.marca || null,
         modelo: sv.modelo || null,
         falla_descripcion: sv.falla || null,
         prioridad: sv.prioridad || 'media',
-        estado,
-        ventana_inicio: new Date((slot?.start || chosen.start)).toISOString(),
-        ventana_fin: new Date((slot?.end || chosen.end)).toISOString(),
-        gcal_event_id: event?.id || null,
+        estado: gEvent ? 'agendado' : 'pendiente',
+        ventana_inicio: new Date(slot.start).toISOString(),
+        ventana_fin: new Date(slot.end).toISOString(),
+        gcal_event_id: gEvent?.id || null,
         calendar_id: cal?.gcal_id || null,
         calle: sv.calle || null,
         numero: sv.numero || null,
@@ -1104,60 +1057,77 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
         cp: sv.cp || null,
         created_at: new Date().toISOString()
       }];
-      const os = await sbUpsert(env, 'orden_servicio', osBody, { returning: 'representation' });
+      const os = await sbUpsert(env, 'orden_servicio', body, { returning: 'representation' });
       osId = os?.data?.[0]?.id || null;
-    } catch (e) { console.warn('[Supabase] OS upsert', e); }
+    } catch (e) {
+      console.warn('[Supabase] OS insert', e);
+    }
 
-    if (event?.id && osId) {
+    // Mensaje al usuario
+    if (gEvent && cal) {
       await sendWhatsAppText(
         env,
         toE164,
         `¡Listo! Agendé tu visita 🙌
 *${fmtDate(slot.start, tz)}*, de *${fmtTime(slot.start, tz)}* a *${fmtTime(slot.end, tz)}*
-Dirección: ${sv.calle} ${sv.numero}, ${sv.colonia}, ${sv.cp} ${sv.ciudad || ''}${sv.estado ? ', '+sv.estado : ''}
-Técnico asignado: ${cal?.name || 'por confirmar'}.
+Dirección: ${sv.calle} ${sv.numero}, ${sv.colonia}, ${sv.cp} ${sv.ciudad || ''}
+Técnico asignado: ${cal.name || 'por confirmar'}.
 
 Si necesitas reprogramar o cancelar, dímelo con confianza.`
       );
-
       session.stage = 'sv_scheduled';
-      session.data.sv.os_id = osId;
-      session.data.sv.gcal_event_id = event.id;
-      await saveSession(env, session, now);
-      return ok('EVENT_RECEIVED');
+    } else if (osId) {
+      await sendWhatsAppText(env, toE164, `Tengo tus datos ✅. Te confirmo el horario en breve (estamos validando disponibilidad).`);
+      await notifySupport(env, `OS pendiente/agendar para ${toE164}\nEquipo: ${sv.marca||''} ${sv.modelo||''}\nFalla: ${sv.falla||''}\nDir: ${sv.calle||''} ${sv.numero||''}, ${sv.colonia||''}, CP ${sv.cp||''} ${sv.ciudad||''}`);
+      session.stage = 'sv_scheduled'; // ya hay OS
+    } else {
+      await sendWhatsAppText(env, toE164, `Tomé tus datos y pasé el caso a un asesor para confirmar agenda. 🙏`);
+      await notifySupport(env, `No se pudo crear OS automáticamente (GCal/DB). Cliente ${toE164}`);
+      session.stage = 'sv_collect'; // mantenemos datos por si falta algo
     }
 
-    if (osId) {
-      await sendWhatsAppText(env, toE164, `Tengo tus datos ✅. En breve te *confirmo el horario exacto* por este medio.`);
-      await notifySupport(env, `OS pendiente/agendar para ${toE164}\nEquipo: ${sv.marca||''} ${sv.modelo||''}\nFalla: ${sv.falla||'N/D'}\nDirección: ${sv.calle||''} ${sv.numero||''}, ${sv.colonia||''}, ${sv.cp||''} ${sv.ciudad||''} ${sv.estado||''}`);
-      session.stage = 'sv_scheduled';
-      session.data.sv.os_id = osId;
-      session.data.sv.gcal_event_id = null;
-      await saveSession(env, session, now);
-      return ok('EVENT_RECEIVED');
-    }
-
-    // Ni evento ni OS → acuse humano; mantenemos sv_collect
-    await sendWhatsAppText(env, toE164, `Tomé tus datos de soporte 🙌. Un asesor te *confirmará el horario* enseguida.`);
-    await notifySupport(env, `⚠️ No se pudo crear OS para ${toE164}. Revisar credenciales de DB/Calendar.\nEquipo: ${sv.marca||''} ${sv.modelo||''}\nFalla: ${sv.falla||'N/D'}`);
-    session.stage = 'sv_collect';
-    session.data.sv.os_pending = true;
-    session.data.sv_need_next = null;
+    session.data.sv.os_id = osId || session.data.sv.os_id || null;
+    session.data.sv.gcal_event_id = gEvent?.id || null;
     await saveSession(env, session, now);
     return ok('EVENT_RECEIVED');
-
   } catch (e) {
     console.error('[SUPPORT] handleSupport error', e);
+    // No dejamos al usuario sin respuesta: pedimos el siguiente dato pendiente si podemos
     try {
-      session.data = session.data || {}; session.data.sv = session.data.sv || {};
-      const sv = session.data.sv;
-      const needed = getSvNeeded(sv, session, false);
-      return await askNextSvQuestion(env, session, toE164, needed.length?needed:['modelo'], new Date());
-    } catch (e2) {
-      console.error('[SUPPORT] secondary error', e2);
-      await sendWhatsAppText(env, toE164, 'Sigamos con tu servicio: ¿*marca/modelo* y breve *descripción* de la falla?');
-      return ok('EVENT_RECEIVED');
-    }
+      const sv = session?.data?.sv || {};
+      const tz = env.TZ || 'America/Mexico_City';
+      const needed = [];
+      if (!truthy(sv.marca) && !truthy(sv.modelo)) needed.push('modelo');
+      if (!truthy(sv.falla)) needed.push('falla');
+      if (!truthy(sv.calle)) needed.push('calle');
+      if (!truthy(sv.numero)) needed.push('numero');
+      if (!truthy(sv.colonia)) needed.push('colonia');
+      if (!truthy(sv.cp)) needed.push('cp');
+      if (!truthy(sv.ciudad)) needed.push('ciudad');
+      if (!truthy(sv.estado)) needed.push('estado');
+      if (!sv.when?.start) needed.push('horario');
+
+      if (needed.length) {
+        session.stage = 'sv_collect';
+        session.data.sv_need_next = needed[0];
+        await saveSession(env, session, new Date());
+        const q = {
+          modelo: '¿Qué *marca y modelo* es tu impresora?',
+          falla: '¿Breve descripción de la falla?',
+          calle: '¿Calle?',
+          numero: '¿Número?',
+          colonia: '¿Colonia?',
+          cp: '¿Código Postal?',
+          ciudad: '¿Ciudad o municipio?',
+          estado: '¿Estado?',
+          horario: '¿Qué día y hora te viene bien entre *10:00 y 15:00*? (ej: “mañana 12:30”)'
+        }[needed[0]];
+        await sendWhatsAppText(env, toE164, q);
+      } else {
+        await sendWhatsAppText(env, toE164, `Recibí tu mensaje y continúo con tu solicitud. Te confirmo enseguida. 🙌`);
+      }
+    } catch {}
+    return ok('EVENT_RECEIVED');
   }
 }
 
@@ -1188,12 +1158,10 @@ Si no mejora, te agendo visita para revisión.`;
 
 async function svCancel(env, session, toE164) {
   const os = await getLastOpenOS(env, session.from);
-  if (!os) { await sendWhatsAppText(env, toE164, `No encuentro una visita activa para cancelar.`); session.stage='idle'; session.data.sv_need_next=null; return; }
+  if (!os) { await sendWhatsAppText(env, toE164, `No encuentro una visita activa para cancelar.`); return; }
   if (os.gcal_event_id && os.calendar_id) await gcalDeleteEvent(env, os.calendar_id, os.gcal_event_id);
   await sbUpsert(env, 'orden_servicio', [{ id: os.id, estado: 'cancelada', cancel_reason: 'cliente' }], { returning: 'minimal' });
   await sendWhatsAppText(env, toE164, `He *cancelado* tu visita. Si necesitas agendar otra, aquí estoy. 😊`);
-  session.stage = 'idle';
-  session.data.sv_need_next = null;
 }
 async function svReschedule(env, session, toE164, when) {
   const os = await getLastOpenOS(env, session.from);
@@ -1249,74 +1217,51 @@ async function maybeFAQ(env, ntext) {
 
 /* ============================ Fechas ============================ */
 function parseNaturalDateTime(text, env) {
-  // Parser robusto es-MX: “mañana 12:30”, “mañana a las 3 de la tarde”, “3pm”, “13 hrs”, “14:00”, “mediodía”
+  // Soporta: "hoy", "mañana", "pasado mañana", "lunes/martes...", "mañana 3 pm", "mañana 14:00", "3 de la tarde"
   const tz = env.TZ || 'America/Mexico_City';
   const now = new Date();
   const base = new Date(now.toLocaleString('en-US', { timeZone: tz }));
   let d = new Date(base);
   let targetDay = null;
 
-  const t = (text || '').toLowerCase().replace(/\s+/g,' ').trim();
+  const t = (text||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'');
 
-  // Día
   if (/\bhoy\b/.test(t)) targetDay = 0;
-  else if (/\bma[ñn]ana\b/.test(t)) targetDay = 1;
+  else if (/\bman(ana)\b/.test(t)) targetDay = 1;
+  else if (/\bpasado\s+man(ana)\b/.test(t)) targetDay = 2;
   else {
-    const days = ['domingo','lunes','martes','miércoles','miercoles','jueves','viernes','sábado','sabado'];
+    const days = ['domingo','lunes','martes','miercoles','jueves','viernes','sabado'];
     for (let i=0;i<days.length;i++) {
       if (new RegExp(`\\b${days[i]}\\b`).test(t)) {
         const today = base.getDay();
         const want = i%7;
         let delta = (want - today + 7) % 7;
-        if (delta===0) delta = 7; // próximo
+        if (delta===0) delta = 7;
         targetDay = delta; break;
       }
     }
   }
   if (targetDay!==null) d.setDate(d.getDate()+targetDay);
 
-  // Marcadores de periodo
-  const isTarde  = /\b(de la )?tarde\b/.test(t);
-  const isNoche  = /\b(de la )?noche\b/.test(t);
-  const isManianaPeriodo = /\b(por la|de la) ma[ñn]ana\b/.test(t);
-
+  // Hora: 14:00 / 14.00 / 2 pm / 2 de la tarde
   let hour = null, minute = 0;
-  let hasAmPm = false;
 
-  // 24h “14:00”
-  let m = t.match(/\b([01]?\d|2[0-3])[:\.](\d{2})\b/);
-  if (m) { hour = Number(m[1]); minute = Number(m[2]); }
+  const m24 = t.match(/\b(\d{1,2})[:\.](\d{2})\b/);
+  const m12 = t.match(/\b(\d{1,2})(?:[:\.](\d{2}))?\s*(am|pm)\b/);
+  const mSpan = t.match(/\b(\d{1,2})(?:[:\.](\d{2}))?\s*(de la\s+)?(tarde|noche|manana)\b/);
 
-  // “a las 3 pm”, “3pm”, “3”
-  if (hour===null) {
-    m = t.match(/\b(?:a\s+las\s+)?(\d{1,2})\s*(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?|am|pm)?\b/);
-    if (m) {
-      hour = Number(m[1]);
-      minute = m[2]?Number(m[2]):0;
-      const ampm = (m[3]||'').replace(/\./g,'').toLowerCase();
-      hasAmPm = !!ampm;
-      if (ampm==='pm' && hour<12) hour+=12;
-      if (ampm==='am' && hour===12) hour=0;
-    }
-  }
-
-  // “13 hrs”
-  if (hour===null) {
-    m = t.match(/\b([01]?\d|2[0-3])\s*h(?:rs?)?\b/);
-    if (m) { hour = Number(m[1]); minute = 0; }
-  }
-
-  // Si no hay am/pm explícito, usar contexto de texto
-  if (hour!==null && !hasAmPm) {
-    if (isTarde || isNoche) {
-      if (hour < 12) hour += 12;
-    } else if (isManianaPeriodo) {
-      if (hour === 12) hour = 8; // “12 de la mañana” → 08:00 (heurística suave)
-    } else if (hour >= 1 && hour <= 7) {
-      // Heurística general: números 1–7 sin am/pm → tarde (PM) porque ventana es 10–15
-      hour += 12;
-    }
-  }
+  if (m12) {
+    hour = Number(m12[1]); minute = m12[2]?Number(m12[2]):0;
+    const ampm = m12[3];
+    if (ampm==='pm' && hour<12) hour+=12;
+    if (ampm==='am' && hour===12) hour=0;
+  } else if (mSpan) {
+    hour = Number(mSpan[1]); minute = mSpan[2]?Number(mSpan[2]):0;
+    const span = mSpan[4]; // tarde/noche/manana
+    if ((span==='tarde' || span==='noche') && hour<12) hour+=12;
+  } else if (m24) {
+    hour = Number(m24[1]); minute = Number(m24[2]);
+  } else if (/\bmediodia\b/.test(t)) { hour = 12; minute=0; }
 
   if (targetDay===null && hour===null) return null;
   if (hour===null) hour = 12;
@@ -1339,46 +1284,48 @@ function clampToWindow(when, tz) {
 
 /* ============================ Google Calendar ============================ */
 async function gcalToken(env) {
-  const r = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      client_id: env.GCAL_CLIENT_ID,
-      client_secret: env.GCAL_CLIENT_SECRET,
-      refresh_token: env.GCAL_REFRESH_TOKEN,
-      grant_type: 'refresh_token'
-    })
-  });
-  if (!r.ok) { console.warn('gcal token', await r.text()); return null; }
-  const j = await r.json();
-  return j.access_token;
+  try{
+    const r = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        client_id: env.GCAL_CLIENT_ID,
+        client_secret: env.GCAL_CLIENT_SECRET,
+        refresh_token: env.GCAL_REFRESH_TOKEN,
+        grant_type: 'refresh_token'
+      })
+    });
+    if (!r.ok) { console.warn('[GCal] token', await r.text()); return null; }
+    const j = await r.json();
+    return j.access_token;
+  }catch(e){ console.warn('[GCal] token err', e); return null; }
 }
 async function gcalCreateEvent(env, calendarId, { summary, description, start, end, timezone }) {
   const token = await gcalToken(env); if (!token) return null;
   const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`;
   const body = { summary, description, start: { dateTime: start, timeZone: timezone }, end: { dateTime: end, timeZone: timezone } };
   const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-  if (!r.ok) { console.warn('gcal create', await r.text()); return null; }
+  if (!r.ok) { console.warn('[GCal] create', await r.text()); return null; }
   return await r.json();
 }
 async function gcalPatchEvent(env, calendarId, eventId, patch) {
   const token = await gcalToken(env); if (!token) return null;
   const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`;
   const r = await fetch(url, { method: 'PATCH', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
-  if (!r.ok) { console.warn('gcal patch', await r.text()); return null; }
+  if (!r.ok) { console.warn('[GCal] patch', await r.text()); return null; }
   return await r.json();
 }
 async function gcalDeleteEvent(env, calendarId, eventId) {
   const token = await gcalToken(env); if (!token) return null;
   const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`;
   const r = await fetch(url, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
-  if (!r.ok) console.warn('gcal delete', await r.text());
+  if (!r.ok) console.warn('[GCal] delete', await r.text());
 }
 async function isBusy(env, calendarId, startISO, endISO) {
   const token = await gcalToken(env); if (!token) return false;
   const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events?timeMin=${encodeURIComponent(startISO)}&timeMax=${encodeURIComponent(endISO)}&singleEvents=true&orderBy=startTime`;
   const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-  if (!r.ok) { console.warn('gcal list', await r.text()); return false; }
+  if (!r.ok) { console.warn('[GCal] list', await r.text()); return false; }
   const j = await r.json();
   return Array.isArray(j.items) && j.items.length > 0;
 }
@@ -1406,12 +1353,11 @@ function renderOsDescription(phone, sv) {
     `Equipo: ${sv.marca || ''} ${sv.modelo || ''}`.trim(),
     `Falla: ${sv.falla || 'N/D'}${sv.error_code ? ' (Error ' + sv.error_code + ')' : ''}`,
     `Prioridad: ${sv.prioridad || 'media'}`,
-    `Dirección: ${sv.calle || ''} ${sv.numero || ''}, ${sv.colonia || ''}, CP ${sv.cp || ''} ${sv.ciudad || ''}${sv.estado ? ', '+sv.estado : ''}`
+    `Dirección: ${sv.calle || ''} ${sv.numero || ''}, ${sv.colonia || ''}, CP ${sv.cp || ''} ${sv.ciudad || ''} ${sv.estado || ''}`.trim()
   ].join('\n');
 }
 async function getLastOpenOS(env, phone) {
   try {
-    // Primero obtenemos el cliente por teléfono
     const c = await sbGet(env, 'cliente', { query: `select=id&telefono=eq.${phone}&limit=1` });
     const cid = c?.[0]?.id;
     if (!cid) return null;
@@ -1441,7 +1387,7 @@ function parseAddressLoose(text=''){
     const parts = pre.split(',').map(s=>s.trim()).filter(Boolean);
     if (parts.length >= 1) out.colonia = parts[parts.length-1];
   }
-  const mcalle = text.match(/([A-Za-zÁÉÍÓÚÜÑ0-9 .\-']+?)\s+(\d+[A-Z]?)(?!\w)/i);
+  const mcalle = text.match(/([A-Za-zÁÉÍÓÚÜÑ0-9 .\-']+)\s+(\d+[A-Z]?)/i);
   if (mcalle) out.calle = clean(mcalle[1]);
   return out;
 }
@@ -1467,7 +1413,7 @@ async function sbGet(env, table, { query='', headers={} }={}) {
   const url = `${b.url}/${table}${query?`?${query}`:''}`;
   const r = await fetch(url, { headers:{ apikey:b.key, Authorization:`Bearer ${b.key}`, ...headers } });
   if (r.status===204) return [];
-  if (!r.ok){ console.warn('sbGet', table, r.status, await r.text()); return null; }
+  if (!r.ok){ console.warn('[Supabase] GET', table, r.status, await r.text()); return null; }
   try { return await r.json(); } catch { return null; }
 }
 async function sbUpsert(env, table, body, { onConflict='', returning='representation', headers={} }={}) {
@@ -1482,9 +1428,9 @@ async function sbUpsert(env, table, body, { onConflict='', returning='representa
   try{
     const r = await fetch(url, { method:'POST', headers:h, body: JSON.stringify(body) });
     const text = await r.text(); let data=null; try{ data = text ? JSON.parse(text) : null; }catch{}
-    if(!r.ok) console.warn('sbUpsert', table, r.status, text);
+    if(!r.ok) console.warn('[Supabase] UPSERT', table, r.status, text);
     return { data, status:r.status };
-  }catch(e){ console.warn('sbUpsert error', table, e); return { data:null, status:500 }; }
+  }catch(e){ console.warn('[Supabase] UPSERT error', table, e); return { data:null, status:500 }; }
 }
 async function sbPatch(env, table, body, filter){
   const b = sb(env);
@@ -1493,8 +1439,8 @@ async function sbPatch(env, table, body, filter){
     const r = await fetch(url, { method:'PATCH', headers:{
       apikey:b.key, Authorization:`Bearer ${b.key}`, 'Content-Type':'application/json'
     }, body: JSON.stringify(body) });
-    if(!r.ok) console.warn('sbPatch', table, r.status, await r.text());
-  }catch(e){ console.warn('sbPatch err', table, e); }
+    if(!r.ok) console.warn('[Supabase] PATCH', table, r.status, await r.text());
+  }catch(e){ console.warn('[Supabase] PATCH err', table, e); }
 }
 async function sbRpc(env, fn, args){
   const b = sb(env);
@@ -1503,9 +1449,9 @@ async function sbRpc(env, fn, args){
     const r = await fetch(url, { method:'POST', headers:{
       apikey:b.key, Authorization:`Bearer ${b.key}`, 'Content-Type':'application/json'
     }, body: JSON.stringify(args || {}) });
-    if (!r.ok) { console.warn('sbRpc', fn, r.status, await r.text()); return null; }
+    if (!r.ok) { console.warn('[Supabase] RPC', fn, r.status, await r.text()); return null; }
     const text = await r.text(); try{ return text ? JSON.parse(text) : null; }catch{ return null; }
-  }catch(e){ console.warn('sbRpc err', fn, e); return null; }
+  }catch(e){ console.warn('[Supabase] RPC err', fn, e); return null; }
 }
 
 /* ============================ Sesiones ============================ */
@@ -1603,16 +1549,20 @@ function buildResumePrompt(session){
   if (st && st.startsWith('collect_')) {
     const k = st.replace('collect_','');
     return `¿${displayField(k)}?`;
-  }
+    }
   if (st === 'sv_collect') {
     const need = session?.data?.sv_need_next || 'modelo';
     const q = {
       modelo: '¿Qué marca y modelo es tu impresora (p.ej., Xerox Versant 180)?',
       falla: 'Cuéntame brevemente la falla (p.ej., “atasco en fusor”, “no imprime”).',
+      cust_nombre: '¿Nombre o Razón Social?',
+      cust_email: '¿Correo electrónico?',
       calle: '¿Cuál es la *calle* donde estará el equipo?',
       numero: '¿Qué *número* es?',
       colonia: '¿*Colonia*?',
       cp: '¿*Código Postal* (5 dígitos)?',
+      ciudad: '¿Ciudad o municipio?',
+      estado: '¿Estado?',
       horario: '¿Qué día y hora te viene bien entre *10:00 y 15:00*? (puedes decir “mañana 12:30”)'
     };
     return q[need] || '¿Podrías compartirme el dato pendiente para continuar?';
