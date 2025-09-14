@@ -1,14 +1,10 @@
 /**
  * CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
- * Oct/2025 (rev2: soporte guiado e idempotente):
- * - Pregunta por *modelo* y *falla* si faltan (determinista + IA opcional).
- * - Ofrece FAQ/triage simple (DB + reglas) con enfoque a *agendar visita*.
- * - Recolecta datos mínimos de cliente si NO existe en DB: nombre/razón social y email.
- * - Recolecta dirección completa: calle, número, colonia, *ciudad*, *estado* y CP.
- * - Busca hueco en pool de calendarios (10:00–15:00, con clamp + desplazamientos).
- * - Crea OS en Supabase ligada al cliente (por teléfono). Si GCal/DB fallan, no truena:
- *   crea OS "pendiente" o levanta acuse humano y mantiene estado.
- * - Mantiene firmas de funciones y nombres existentes. Todo con try/catch y logs.
+ * Oct/2025 (rev3):
+ * - Nunca cae al fallback en soporte; siempre pregunta y persiste estado.
+ * - sbGet con try/catch para no romper el flujo si Supabase no responde/mal config.
+ * - Cuestionario soporte robusto: modelo/falla → dirección → horario → agenda/OS.
+ * - Si GCal/DB no están disponibles: OS "pendiente" + aviso a soporte (sin throw).
  */
 
 export default {
@@ -332,7 +328,7 @@ function extractWhatsAppContext(payload) {
   try {
     const value = payload?.entry?.[0]?.changes?.[0]?.value;
     const msg = value?.messages?.[0];
-    if (!msg || msg.type !== 'text') return null; // ignoramos adjuntos; pedimos texto en la conversación
+    if (!msg || msg.type !== 'text') return null;
     const from = msg.from;
     const fromE164 = `+${from}`;
     const mid = msg.id || `${Date.now()}_${Math.random()}`;
@@ -343,6 +339,7 @@ function extractWhatsAppContext(payload) {
 }
 
 /* ============================ Ventas / Carrito ============================ */
+// (sin cambios funcionales relevantes, omitidos por brevedad en este comentario)
 function parseQty(text, fallback = 1) {
   const m = text.match(RX_WANT_QTY);
   const q = m ? Number(m[2]) : null;
@@ -373,7 +370,6 @@ function renderProducto(p) {
   const stockLine = s > 0 ? `${s} pzas en stock` : `0 pzas — *sobre pedido* (lo pedimos para ti)`;
   return `1. ${p.nombre}${marca}${sku}\n${precio}\n${stockLine}\n\nEste suele ser el indicado para tu equipo.`;
 }
-
 async function handleAskQty(env, session, toE164, text, lowered, ntext, now){
   const cand = session.data?.last_candidate;
   if (!cand) {
@@ -392,7 +388,6 @@ async function handleAskQty(env, session, toE164, text, lowered, ntext, now){
   await sendWhatsAppText(env, toE164, `Añadí 🛒\n• ${cand.nombre} x ${qty} ${priceWithIVA(cand.precio)}${nota}\n\n¿Deseas agregar algo más o finalizamos?`);
   return ok('EVENT_RECEIVED');
 }
-
 async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
   session.data = session.data || {};
   const cart = session.data.cart || [];
@@ -838,8 +833,6 @@ async function createOrderFromSession(env, session, toE164) {
 }
 
 /* ============================ SOPORTE ============================ */
-
-/** Intenta completar datos a partir de texto libre del usuario */
 function extractSvInfo(text) {
   const out = {};
   if (/xerox/i.test(text)) out.marca = 'Xerox';
@@ -865,11 +858,11 @@ function extractSvInfo(text) {
   if (d.colonia) out.colonia = d.colonia;
   if (d.cp) out.cp = d.cp;
   if (d.ciudad) out.ciudad = d.ciudad;
+  if (d.estado) out.estado = d.estado;
 
   return out;
 }
 
-/** Escribe un campo en sv acorde al dato solicitado */
 function svFillFromAnswer(sv, field, text, env){
   const t = text.trim();
   if (field === 'modelo') {
@@ -878,7 +871,7 @@ function svFillFromAnswer(sv, field, text, env){
       if (m[1]) sv.marca = /fuji/i.test(m[1]) ? 'Fujifilm' : 'Xerox';
       sv.modelo = m[2].toUpperCase();
     } else {
-      sv.modelo = t; // texto libre si no hay patrón
+      sv.modelo = t; // guarda texto libre si no hay patrón
     }
     return;
   }
@@ -894,7 +887,6 @@ function svFillFromAnswer(sv, field, text, env){
     if (dt?.start) sv.when = dt;
     return;
   }
-  // Campos de cliente (si no existe en DB)
   if (field === 'c_nombre') { sv.c_nombre = clean(t); return; }
   if (field === 'c_email')  {
     const m = t.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
@@ -903,16 +895,13 @@ function svFillFromAnswer(sv, field, text, env){
   }
 }
 
-/** NUEVO: detecta si hay credenciales de GCal configuradas */
 function hasGcalCreds(env){
   return !!(env.GCAL_CLIENT_ID && env.GCAL_CLIENT_SECRET && env.GCAL_REFRESH_TOKEN);
 }
 
-/** FAQ por falla (usa tabla company_info como KB) */
 async function faqForFailure(env, fallaText=''){
   const key = normalize(fallaText||'').slice(0, 80);
   if (!key) return null;
-  // reutiliza motor de FAQ genérico
   try {
     const like = encodeURIComponent(`%${key}%`);
     const r = await sbGet(env, 'company_info', {
@@ -928,12 +917,10 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     session.data.sv = session.data.sv || {};
     const sv = session.data.sv;
 
-    // Si estamos en modo de captura, guarda lo que pidió y continúa
     if (session.stage === 'sv_collect' && session.data.sv_need_next) {
       svFillFromAnswer(sv, session.data.sv_need_next, text, env);
     }
 
-    // Completa con extracción libre (marca/modelo/falla/dirección/CP/ciudad/when)
     Object.assign(sv, extractSvInfo(text));
     if (!sv.when) {
       const dt = parseNaturalDateTime(lowered, env);
@@ -947,21 +934,18 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       }
     }
 
-    // Bienvenida (solo una vez)
     if (!sv._welcomed) {
       sv._welcomed = true;
-      await saveSession(env, session, now); // persistimos el flag antes de interactuar más
+      await saveSession(env, session, now);
       await sendWhatsAppText(env, toE164, `Lamento la falla 😕. Vamos a ayudarte. ¿Me confirmas *marca/modelo* y una breve *descripción* del problema?`);
     }
 
-    // Consejos rápidos (FAQs express por reglas)
     const quick = quickHelp(ntext);
     if (quick && !sv.quick_advice_sent) {
       sv.quick_advice_sent = true;
       await sendWhatsAppText(env, toE164, quick + `\n\nSi no mejora, *agendamos visita técnica*.`);
     }
 
-    // FAQ por coincidencia en KB (si ya hay descripción de falla)
     if (truthy(sv.falla) && !sv.faq_sent) {
       const kb = await faqForFailure(env, sv.falla);
       if (kb) {
@@ -984,31 +968,25 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       }
     } catch(e){ console.warn('[Supabase] find cliente', e); }
 
-    // Campos necesarios para agendar (orden estricto)
+    // Campos necesarios
     const needed = [];
-    // 1) Equipo
     if (!truthy(sv.marca) && !truthy(sv.modelo)) needed.push('modelo');
     if (!truthy(sv.falla)) needed.push('falla');
-    // 2) Dirección
     if (!truthy(sv.calle)) needed.push('calle');
     if (!truthy(sv.numero)) needed.push('numero');
     if (!truthy(sv.colonia)) needed.push('colonia');
     if (!truthy(sv.ciudad)) needed.push('ciudad');
     if (!truthy(sv.cp)) needed.push('cp');
-    // estado es deseable; si CP lo trae lo poblamos; si no, lo pedimos al final
     if (!truthy(sv.estado)) needed.push('estado');
-    // 3) Cliente si no existe en DB
     if (!customerExists) {
       if (!truthy(sv.c_nombre) && !truthy(session?.data?.customer?.nombre)) needed.push('c_nombre');
       if (!truthy(sv.c_email)  && !truthy(session?.data?.customer?.email))  needed.push('c_email');
     }
-    // 4) Horario
     if (!sv.when?.start) needed.push('horario');
 
     console.log('[SUPPORT]', session.from, 'stage:', session.stage, 'needed:', needed.join(',') || 'none');
 
     if (needed.length) {
-      // Guardamos la intención de la siguiente pregunta ANTES de responder (idempotencia del flujo)
       session.stage = 'sv_collect';
       session.data.sv_need_next = needed[0];
       await saveSession(env, session, now);
@@ -1029,51 +1007,38 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       return ok('EVENT_RECEIVED');
     }
 
-    // Persistimos la sesión "completa" antes de intentar externos
     await saveSession(env, session, now);
 
-    // Ya tenemos TODO → intentar agenda/OS con tolerancia a fallos
     const tz = env.TZ || 'America/Mexico_City';
     const credsOk = hasGcalCreds(env);
     let cal = null, slot = null, event = null;
 
-    // 1) Pool de calendarios
     if (credsOk) {
       try {
         const pool = await getCalendarPool(env);
         cal = pickCalendarFromPool(pool);
         if (!cal) console.warn('[GCal] No active calendar in pool');
-      } catch (e) {
-        console.warn('[GCal] getCalendarPool error', e);
-      }
+      } catch (e) { console.warn('[GCal] getCalendarPool error', e); }
     } else {
-      console.warn('[GCal] Missing credentials; will queue OS as pendiente');
+      console.warn('[GCal] Missing credentials; queue OS as pendiente');
     }
 
-    // 2) Slot más cercano dentro de ventana 10–15h
     const chosen = clampToWindow(sv.when, tz);
     if (credsOk && cal) {
-      try {
-        slot = await findNearestFreeSlot(env, cal.gcal_id, chosen, tz);
-      } catch (e) {
-        console.warn('[GCal] findNearestFreeSlot error', e);
-      }
+      try { slot = await findNearestFreeSlot(env, cal.gcal_id, chosen, tz); }
+      catch (e) { console.warn('[GCal] findNearestFreeSlot error', e); }
     } else {
-      slot = { start: chosen.start, end: chosen.end }; // para OS pendiente
+      slot = { start: chosen.start, end: chosen.end };
     }
 
-    // 3) Cliente: upsert por teléfono y completar campos faltantes
+    // Cliente → upsert
     let cliente_id = null;
     try {
-      // merge datos recolectados
       session.data.customer = session.data.customer || {};
       const c = session.data.customer;
       if (!c.nombre && sv.c_nombre) c.nombre = sv.c_nombre;
       if (!c.email  && sv.c_email)  c.email  = sv.c_email;
-      // dirección a ficha cliente
       ['calle','numero','colonia','ciudad','cp','estado'].forEach(k => { if (!c[k] && truthy(sv[k])) c[k] = sv[k]; });
-
-      // localizar/crear
       const ex = await sbGet(env, 'cliente', { query: `select=id&telefono=eq.${session.from}&limit=1` });
       if (ex && ex[0]?.id) {
         cliente_id = ex[0].id;
@@ -1090,7 +1055,6 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       }
     } catch (e) { console.warn('[Supabase] upsert/find cliente', e); }
 
-    // 4) Crear evento de Calendar (si procede)
     if (credsOk && cal && slot) {
       try {
         event = await gcalCreateEvent(env, cal.gcal_id, {
@@ -1100,12 +1064,9 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
           end: slot.end,
           timezone: tz,
         });
-      } catch (e) {
-        console.warn('[GCal] gcalCreateEvent error', e);
-      }
+      } catch (e) { console.warn('[GCal] gcalCreateEvent error', e); }
     }
 
-    // 5) Crear OS en Supabase (agendado si hubo evento; si no, pendiente)
     let osId = null;
     try {
       const estado = (event && event.id) ? 'agendado' : 'pendiente';
@@ -1129,12 +1090,9 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       }];
       const os = await sbUpsert(env, 'orden_servicio', osBody, { returning: 'representation' });
       osId = os?.data?.[0]?.id || null;
-      console.log('[Supabase] OS upsert estado=', (event?.id ? 'agendado' : 'pendiente'), 'id=', osId || '—');
-    } catch (e) {
-      console.warn('[Supabase] orden_servicio upsert error', e);
-    }
+      console.log('[Supabase] OS upsert', { estado: (event?.id?'agendado':'pendiente'), id: osId || '—' });
+    } catch (e) { console.warn('[Supabase] orden_servicio upsert error', e); }
 
-    // 6) Confirmación al usuario (dos caminos)
     if (event?.id && osId) {
       await sendWhatsAppText(
         env,
@@ -1153,18 +1111,16 @@ Si necesitas reprogramar o cancelar, dímelo con confianza.`
       return ok('EVENT_RECEIVED');
     }
 
-    // Sin evento confirmado (sin GCal o error) → OS pendiente si se pudo; de lo contrario acuse humano
     if (osId) {
       await sendWhatsAppText(env, toE164, `Tengo tus datos ✅. En breve te *confirmo el horario exacto* por este medio.`);
       await notifySupport(env, `OS pendiente/agendar para ${toE164}\nEquipo: ${sv.marca||''} ${sv.modelo||''}\nFalla: ${sv.falla||'N/D'}\nDirección: ${sv.calle||''} ${sv.numero||''}, ${sv.colonia||''}, ${sv.cp||''} ${sv.ciudad||''} ${sv.estado||''}`);
-      session.stage = 'sv_scheduled'; // marcamos como atendido a la espera de confirmación manual
+      session.stage = 'sv_scheduled';
       session.data.sv.os_id = osId;
       session.data.sv.gcal_event_id = null;
       await saveSession(env, session, now);
       return ok('EVENT_RECEIVED');
     }
 
-    // Ni evento ni OS pudieron crearse → no fallar, acuse humano y seguir en captura (sv_collect) para no perder estado
     await sendWhatsAppText(env, toE164, `Tomé tus datos de soporte 🙌. Un asesor te *confirmará el horario* enseguida.`);
     await notifySupport(env, `⚠️ No se pudo crear OS para ${toE164}. Revisar credenciales de DB/Calendar.\nEquipo: ${sv.marca||''} ${sv.modelo||''}\nFalla: ${sv.falla||'N/D'}`);
     session.stage = 'sv_collect';
@@ -1175,9 +1131,21 @@ Si necesitas reprogramar o cancelar, dímelo con confianza.`
 
   } catch (e) {
     console.error('[SUPPORT] handleSupport error', e);
-    // Fallback amable si algo truena (nunca sin respuesta)
-    await sendWhatsAppText(env, toE164, 'Recibí tu mensaje de *soporte*. Te contacto enseguida para ayudarte 🙌');
-    // Mantener estado actual (no resetear); no lanzamos throw
+    // En vez del fallback genérico: continuar cuestionario siempre
+    try {
+      session.data = session.data || {};
+      session.data.sv = session.data.sv || {};
+      const sv = session.data.sv;
+      if (!sv._welcomed) sv._welcomed = true;
+      session.stage = 'sv_collect';
+      // Si no tenemos nada aún, empezamos por modelo/falla
+      session.data.sv_need_next = (!truthy(sv.modelo) ? 'modelo' : (!truthy(sv.falla) ? 'falla' : 'horario'));
+      await saveSession(env, session, new Date());
+      await sendWhatsAppText(env, toE164, `Lamento la falla 😕. Vamos a ayudarte.\n¿Me confirmas *marca/modelo* y una breve *descripción* del problema?`);
+    } catch (e2) {
+      console.error('[SUPPORT] secondary error', e2);
+      await sendWhatsAppText(env, toE164, 'Gracias por tu mensaje. Continuemos: ¿marca/modelo y breve *descripción* de la falla?');
+    }
     return ok('EVENT_RECEIVED');
   }
 }
@@ -1395,7 +1363,6 @@ function renderOsDescription(phone, sv) {
 }
 async function getLastOpenOS(env, phone) {
   try {
-    // Primero obtenemos el cliente por teléfono
     const c = await sbGet(env, 'cliente', { query: `select=id&telefono=eq.${phone}&limit=1` });
     const cid = c?.[0]?.id;
     if (!cid) return null;
@@ -1425,7 +1392,6 @@ function parseAddressLoose(text=''){
     const parts = pre.split(',').map(s=>s.trim()).filter(Boolean);
     if (parts.length >= 1) out.colonia = parts[parts.length-1];
   }
-  // "Prol. Reforma 123", "Av. Universidad 500B"
   const mcalle = text.match(/([A-Za-zÁÉÍÓÚÜÑ0-9 .\-']+?)\s+(\d+[A-Z]?)(?!\w)/i);
   if (mcalle) out.calle = clean(mcalle[1]);
   return out;
@@ -1448,12 +1414,15 @@ function sb(env){
   return { url:`${env.SUPABASE_URL}/rest/v1`, key };
 }
 async function sbGet(env, table, { query='', headers={} }={}) {
-  const b = sb(env);
-  const url = `${b.url}/${table}${query?`?${query}`:''}`;
-  const r = await fetch(url, { headers:{ apikey:b.key, Authorization:`Bearer ${b.key}`, ...headers } });
-  if (r.status===204) return [];
-  if (!r.ok){ console.warn('[Supabase] sbGet', table, r.status, await r.text()); return null; }
-  try { return await r.json(); } catch { return null; }
+  try{
+    const b = sb(env);
+    if (!b.url || !/^https?:\/\//.test(b.url)) { console.warn('[Supabase] sbGet missing/invalid URL'); return null; }
+    const url = `${b.url}/${table}${query?`?${query}`:''}`;
+    const r = await fetch(url, { headers:{ apikey:b.key, Authorization:`Bearer ${b.key}`, ...headers } });
+    if (r.status===204) return [];
+    if (!r.ok){ console.warn('[Supabase] sbGet', table, r.status, await r.text()); return null; }
+    try { return await r.json(); } catch { return null; }
+  }catch(e){ console.warn('[Supabase] sbGet error', table, e); return null; }
 }
 async function sbUpsert(env, table, body, { onConflict='', returning='representation', headers={} }={}) {
   const b = sb(env);
