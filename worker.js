@@ -1,10 +1,11 @@
 /**
  * CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
  * Oct/2025 – Fix soporte:
- * - Parser de fechas español mejorado (3pm, 14:00, “mañana a las 3 pm”, “13 hrs”…)
- * - No repetir “horario” en bucle; clarificación con formato si no se entiende.
- * - Soporte pregunta primero modelo + falla; luego datos y agenda.
- * - Si GCal/DB fallan: OS “pendiente” y aviso a soporte (sin tirar fallback).
+ * - Nunca se queda sin responder (sin silencios).
+ * - El “horario” ya no se queda en loop silencioso; si no se entiende, pide formato claro.
+ * - Heurística: “mañana a las 3” => 15:00 (pm) por defecto.
+ * - Flujo: marca/modelo + falla → FAQs rápidas → datos de cliente/dirección → horario → agenda
+ * - Si GCal/DB no responden: crea OS “pendiente” y avisa a humano, sin lanzar errores al usuario.
  */
 
 export default {
@@ -12,7 +13,7 @@ export default {
     try {
       const url = new URL(req.url);
 
-      // Verificación webhook
+      // Verificación webhook (Meta/WhatsApp)
       if (req.method === 'GET' && url.pathname === '/') {
         const mode = url.searchParams.get('hub.mode');
         const token = url.searchParams.get('hub.verify_token');
@@ -53,13 +54,13 @@ export default {
           session.data.customer.nombre = toTitleCase(firstWord(profileName));
         }
 
-        // Idempotencia
+        // Idempotencia por mid
         if (session?.data?.last_mid && session.data.last_mid === mid) return ok('EVENT_RECEIVED');
         session.data.last_mid = mid;
 
         // Comandos universales soporte
         if (/\b(cancel(a|ar).*(cita|visita|servicio))\b/i.test(lowered)) {
-          await svCancel(env, session, fromE164);            // limpia estado de captura
+          await svCancel(env, session, fromE164);
           await saveSession(env, session, now);
           return ok('EVENT_RECEIVED');
         }
@@ -79,7 +80,7 @@ export default {
 
         const isGreet = RX_GREET.test(lowered);
 
-        // ===== SOPORTE: se evalúa primero =====
+        // ===== SOPORTE: siempre primero =====
         let supportFlag = isSupportIntent(ntext);
         if (!supportFlag) {
           const clf = await aiClassifyIntent(env, text);
@@ -126,7 +127,9 @@ export default {
 
         // Saludo automático
         const looksInv = RX_INV_Q.test(ntext);
-        const mayGreet = isGreet && shouldAutogreet(session, now) && session.stage === 'idle' && !looksInv;
+        const mayGreet =
+          isGreet && shouldAutogreet(session, now) && session.stage === 'idle' && !looksInv;
+
         if (mayGreet) {
           const g = await aiSmallTalk(env, session, 'greeting');
           await sendWhatsAppText(env, fromE164, g);
@@ -168,7 +171,7 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // Stages ventas
+        // Stages de ventas
         if (session.stage === 'ask_qty')  return await handleAskQty(env, session, fromE164, text, lowered, ntext, now);
         if (session.stage === 'cart_open') return await handleCartOpen(env, session, fromE164, text, lowered, ntext, now);
         if (session.stage === 'await_invoice') return await handleAwaitInvoice(env, session, fromE164, lowered, now, text);
@@ -208,7 +211,7 @@ export default {
 const RX_GREET = /^(hola+|buen[oa]s|qué onda|que tal|saludos|hey|buen dia|buenas|holi+)\b/i;
 const RX_INV_Q  = /(toner|tóner|cartucho|developer|refacci[oó]n|precio|docucolor|versant|versalink|altalink|apeos|c\d{2,4}|b\d{2,4}|magenta|amarillo|cyan|negro)/i;
 
-/** Detector determinista de intención de soporte (con ntext normalizado) */
+/** Detector determinista de intención de soporte (ntext normalizado) */
 function isSupportIntent(ntext='') {
   const t = ` ${ntext} `;
   const hasProblem =
@@ -290,7 +293,7 @@ Contesta breve, útil y amable. Si no hay contexto, ofrece inventario o soporte.
   return out || (`Hola${nombre?`, ${nombre}`:''} 🙌 ¿En qué te ayudo hoy?`);
 }
 
-/** Clasificador IA (opcional) – mantiene firma */
+/** Clasificador IA (opcional) – misma firma */
 async function aiClassifyIntent(env, text){
   if (!env.OPENAI_API_KEY && !env.OPENAI_KEY) return null;
   const sys = `Clasifica el texto del usuario (es-MX) en JSON:
@@ -518,7 +521,7 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now, originalTe
   return ok('EVENT_RECEIVED');
 }
 
-/* Captura UNO A UNO */
+/* Captura UNO A UNO (ventas) */
 const FLOW_FACT = ['nombre','rfc','email','calle','numero','colonia','cp'];
 const FLOW_SHIP = ['nombre','email','calle','numero','colonia','cp'];
 const LABEL = {
@@ -866,7 +869,7 @@ function svFillFromAnswer(sv, field, text, env){
       if (m[1]) sv.marca = /fuji/i.test(m[1]) ? 'Fujifilm' : 'Xerox';
       sv.modelo = m[2].toUpperCase();
     } else {
-      sv.modelo = t;
+      sv.modelo = t; // guarda libre si no calza patrón
     }
     return;
   }
@@ -923,11 +926,6 @@ function getSvNeeded(sv={}, session, customerExists=false){
 
 async function askNextSvQuestion(env, session, toE164, needed, now){
   const next = needed[0];
-  // Anti-spam específico para horario
-  if (next === 'horario' && promptedRecently(session, 'ask_horario', 45*1000)) {
-    await saveSession(env, session, now);
-    return ok('EVENT_RECEIVED');
-  }
   const map = {
     modelo:  '¿Qué *marca y modelo* es tu impresora? (p.ej., *Xerox Versant 180*)',
     falla:   'Describe brevemente la falla (p.ej., “*atasco en fusor*”, “*no imprime*”).',
@@ -941,12 +939,14 @@ async function askNextSvQuestion(env, session, toE164, needed, now){
     c_email: '¿*Correo electrónico* de contacto?',
     horario: '¿Qué día y hora te viene bien entre *10:00 y 15:00*? (ej.: “*mañana 12:30*” o “*mañana 1 pm*”)'
   };
-  // Si ya intentamos y no entendimos horario, manda instrucción de formato
+
+  // Si el último intento de horario falló al parsear, manda aclaración explícita
   if (next === 'horario' && session?.data?.sv?.when_parse_failed) {
     await sendWhatsAppText(env, toE164, 'No alcancé a leer la hora 😅. Dímela así: *mañana 12:30* o *mañana 1 pm*.');
   } else {
     await sendWhatsAppText(env, toE164, map[next] || '¿Podrías compartir el dato pendiente para continuar?');
   }
+
   session.stage = 'sv_collect';
   session.data.sv_need_next = next;
   await saveSession(env, session, now);
@@ -959,7 +959,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     session.data.sv = session.data.sv || {};
     const sv = session.data.sv;
 
-    // Inicio fresco de soporte: pide primero modelo + falla
+    // Primer mensaje de soporte → pide modelo+falla
     const freshStart = (!sv._welcomed) && (!truthy(sv.modelo) && !truthy(sv.falla));
     if (freshStart) {
       sv._welcomed = true;
@@ -972,14 +972,14 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       return ok('EVENT_RECEIVED');
     }
 
-    // Capturar solo si estábamos pidiendo un campo
+    // Capturar respuesta del campo pedido
     const shouldCapture = (session.stage === 'sv_collect' && !!session.data.sv_need_next);
     if (shouldCapture) {
       svFillFromAnswer(sv, session.data.sv_need_next, text, env);
       session.data.sv_need_next = null;
     }
 
-    // Extraer información libre adicional
+    // Extraer info adicional
     Object.assign(sv, extractSvInfo(text));
     if (!sv.when) {
       const dt = parseNaturalDateTime(lowered, env);
@@ -993,7 +993,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       }
     }
 
-    // FAQs express y KB por falla
+    // Consejos rápidos y KB
     const quick = quickHelp(ntext);
     if (quick && !sv.quick_advice_sent) {
       sv.quick_advice_sent = true;
@@ -1054,7 +1054,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       slot = { start: chosen.start, end: chosen.end };
     }
 
-    // Cliente → upsert mínimo
+    // Cliente mínimo
     let cliente_id = null;
     try {
       session.data.customer = session.data.customer || {};
@@ -1197,11 +1197,9 @@ async function svCancel(env, session, toE164) {
   if (os.gcal_event_id && os.calendar_id) await gcalDeleteEvent(env, os.calendar_id, os.gcal_event_id);
   await sbUpsert(env, 'orden_servicio', [{ id: os.id, estado: 'cancelada', cancel_reason: 'cliente' }], { returning: 'minimal' });
   await sendWhatsAppText(env, toE164, `He *cancelado* tu visita. Si necesitas agendar otra, aquí estoy. 😊`);
-  // Limpia estado de captura para evitar que siga pidiendo campos
   session.stage = 'idle';
   session.data.sv_need_next = null;
 }
-
 async function svReschedule(env, session, toE164, when) {
   const os = await getLastOpenOS(env, session.from);
   if (!os) { await sendWhatsAppText(env, toE164, `No encuentro una visita activa para reprogramar.`); return; }
@@ -1282,31 +1280,36 @@ function parseNaturalDateTime(text, env) {
   if (targetDay!==null) d.setDate(d.getDate()+targetDay);
 
   let hour = null, minute = 0;
+  let hasAmPm = false;
 
-  // 1) 24h “14:00”, “14.00”
+  // 24h “14:00”
   let m = t.match(/\b([01]?\d|2[0-3])[:\.](\d{2})\b/);
   if (m) { hour = Number(m[1]); minute = Number(m[2]); }
 
-  // 2) “a las 3 pm”, “3 pm”, “3pm”, “3 p.m.”
+  // “a las 3 pm”, “3pm”, “3”
   if (hour===null) {
     m = t.match(/\b(?:a\s+las\s+)?(\d{1,2})\s*(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?|am|pm)?\b/);
     if (m) {
       hour = Number(m[1]);
       minute = m[2]?Number(m[2]):0;
       const ampm = (m[3]||'').replace(/\./g,'').toLowerCase();
+      hasAmPm = !!ampm;
       if (ampm==='pm' && hour<12) hour+=12;
       if (ampm==='am' && hour===12) hour=0;
     }
   }
 
-  // 3) “13 hrs”, “13h”
+  // “13 hrs”
   if (hour===null) {
     m = t.match(/\b([01]?\d|2[0-3])\s*h(?:rs?)?\b/);
     if (m) { hour = Number(m[1]); minute = 0; }
   }
 
+  // Heurística: si no indica am/pm y la hora es 1–7, asumimos PM (tarde)
+  if (hour!==null && !hasAmPm && hour >= 1 && hour <= 7) hour += 12;
+
   if (targetDay===null && hour===null) return null;
-  if (hour===null) hour = 12; // por defecto al medio día
+  if (hour===null) hour = 12;
 
   d.setHours(hour, minute, 0, 0);
   const start = d.toISOString();
@@ -1589,7 +1592,7 @@ function buildResumePrompt(session){
   if (st && st.startsWith('collect_')) {
     const k = st.replace('collect_','');
     return `¿${displayField(k)}?`;
-    }
+  }
   if (st === 'sv_collect') {
     const need = session?.data?.sv_need_next || 'modelo';
     const q = {
