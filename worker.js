@@ -1,11 +1,11 @@
 /**
  * CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
  * Oct/2025 – Fix soporte:
- * - Nunca se queda sin responder (sin silencios).
- * - El “horario” ya no se queda en loop silencioso; si no se entiende, pide formato claro.
- * - Heurística: “mañana a las 3” => 15:00 (pm) por defecto.
- * - Flujo: marca/modelo + falla → FAQs rápidas → datos de cliente/dirección → horario → agenda
- * - Si GCal/DB no responden: crea OS “pendiente” y avisa a humano, sin lanzar errores al usuario.
+ * - Captura de respuestas basada en sv_need_next (independiente de stage) → evita loops.
+ * - “Horario” siempre intenta parsear; si falla, pide formato claro (sin silencios).
+ * - Heurística: “mañana a las 3” => 15:00 si no hay am/pm.
+ * - Flujo soporte robusto: modelo+falla → FAQs/quickHelp → datos cliente/dirección → horario → agenda
+ * - Fallbacks: si GCal/DB fallan, OS “pendiente” y aviso a humano; nunca se deja sin respuesta.
  */
 
 export default {
@@ -86,7 +86,7 @@ export default {
           const clf = await aiClassifyIntent(env, text);
           if (clf && clf.intent === 'support') supportFlag = true;
         }
-        if (supportFlag || session.stage?.startsWith('sv_')) {
+        if (supportFlag || session.stage?.startsWith('sv_') || session?.data?.sv_need_next) {
           const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support' });
           return handled;
         }
@@ -940,7 +940,6 @@ async function askNextSvQuestion(env, session, toE164, needed, now){
     horario: '¿Qué día y hora te viene bien entre *10:00 y 15:00*? (ej.: “*mañana 12:30*” o “*mañana 1 pm*”)'
   };
 
-  // Si el último intento de horario falló al parsear, manda aclaración explícita
   if (next === 'horario' && session?.data?.sv?.when_parse_failed) {
     await sendWhatsAppText(env, toE164, 'No alcancé a leer la hora 😅. Dímela así: *mañana 12:30* o *mañana 1 pm*.');
   } else {
@@ -972,14 +971,14 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       return ok('EVENT_RECEIVED');
     }
 
-    // Capturar respuesta del campo pedido
-    const shouldCapture = (session.stage === 'sv_collect' && !!session.data.sv_need_next);
-    if (shouldCapture) {
+    // ⚠️ Captura basada SOLO en sv_need_next (no depende de stage) → evita loops
+    if (session.data.sv_need_next) {
       svFillFromAnswer(sv, session.data.sv_need_next, text, env);
       session.data.sv_need_next = null;
+      await saveSession(env, session, now);
     }
 
-    // Extraer info adicional
+    // Extraer info adicional por texto libre
     Object.assign(sv, extractSvInfo(text));
     if (!sv.when) {
       const dt = parseNaturalDateTime(lowered, env);
