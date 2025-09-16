@@ -1,17 +1,13 @@
 /**
  * CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
- * Oct/2025 – build “Borbón+ H2”
+ * Oct/2025 – build “Borbón+ H3”
  *
- * Ajustes de UX y conmutador:
- * - Saludo y reanudación naturales (“¿seguimos con lo anterior o vemos otra cosa?”).
- * - En post_order, si el usuario dice “sí”, pregunta tema (soporte o cotización) en lugar de FAQ.
- * - Lock de Soporte: si estamos en sv_* NO saltar a ventas por palabras de familia (versant/docucolor, etc).
- *   Sólo cambia si el usuario pide explícitamente precio/cotizar/toner/cartucho.
- * - Tono más humano (sin “trámite” ni frases robóticas).
- * - maybeFAQ con guardas (no responde a “sí/ok/gracias”).
- * - Quick triage marca quick_advice_sent=true ANTES de enviar para evitar duplicados si WA falla.
- * - needed[] en soporte con orden exacto: modelo, falla, calle, numero, colonia, cp, horario, nombre, email.
- * - Anti-duplicados reforzado: cola last_hashes (3) con {from}:{hash}:{minute}.
+ * Cambios en esta versión (H3):
+ * - Saludo humano: “¿En qué te puedo ayudar? Si quieres, retomamos lo anterior.”
+ * - Preguntas de soporte empáticas (sin “trámite/continuemos”).
+ * - Fallback/catch con tono natural (“Va, para avanzar…”).
+ * - Parser de modelo/marca más tolerante (ej. “xerox docucolor 5560”).
+ * - Se mantiene conmutador ventas⇄soporte, needed[] y todas las firmas/nombres.
  */
 
 export default {
@@ -48,7 +44,7 @@ export default {
 
         // Mensajes no-texto → pedir texto breve
         if (isNonText) {
-          await sendWhatsAppText(env, fromE164, '¿Me lo puedes describir brevemente por escrito? Así te apoyo más rápido 🙂');
+          await sendWhatsAppText(env, fromE164, '¿Me lo describes brevemente por escrito? Así te apoyo más rápido 🙂');
           return ok('EVENT_RECEIVED');
         }
 
@@ -109,11 +105,12 @@ export default {
             session.data.last_stage = session.stage;
             session.stage = 'await_choice';
             await saveSession(env, session, now);
-            await sendWhatsAppText(env, fromE164, '¿Seguimos con lo de antes o vemos otra cosa?');
+            await sendWhatsAppText(env, fromE164, '¿En qué te puedo ayudar? Si quieres, retomamos lo anterior.');
             return ok('EVENT_RECEIVED');
+          } else {
+            await sendWhatsAppText(env, fromE164, '¿En qué te puedo ayudar?');
           }
           await saveSession(env, session, now);
-          // Si estaba idle, seguimos flujo normal abajo (FAQ / intents)
         }
 
         // Si recién cerramos pedido y el usuario dice “sí”, pedir tema en vez de FAQ
@@ -126,8 +123,6 @@ export default {
         // ===== Global intent detection =====
         const supportIntent = isSupportIntent(ntext) || (await intentIs(env, text, 'support'));
         const rawSalesIntent = RX_INV_Q.test(ntext) || (await intentIs(env, text, 'sales'));
-
-        // Señales fuertes de compra (para permitir salto desde sv_*)
         const strongBuyRegex = /\b(precio|cotiza(r|ci[oó]n)?|comprar|venta|vendes|t[óo]ner|toner|cartucho|developer)\b/i;
         const salesIntentStrong = rawSalesIntent && (!session.stage?.startsWith('sv_') || strongBuyRegex.test(ntext));
 
@@ -142,7 +137,7 @@ export default {
             session.data.last_stage = session.stage;
             session.stage = 'idle';
             await saveSession(env, session, now);
-            await sendWhatsAppText(env, fromE164, 'Listo, pauso lo anterior y reviso inventario.'); // tono humano
+            await sendWhatsAppText(env, fromE164, 'Listo, pauso lo anterior y reviso inventario.');
             return await startSalesFromQuery(env, session, fromE164, text, ntext, now);
           }
           if (isContinueish(lowered)) {
@@ -156,11 +151,10 @@ export default {
             session.data.last_stage = 'idle';
             session.stage = 'idle';
             await saveSession(env, session, now);
-            await sendWhatsAppText(env, fromE164, 'De acuerdo. Cuéntame qué necesitas: *soporte* o *cotización*.');
+            await sendWhatsAppText(env, fromE164, 'De acuerdo. Cuéntame, ¿qué necesitas: *soporte* o *cotización*?');
             return ok('EVENT_RECEIVED');
           }
-          // repregunta breve
-          await sendWhatsAppText(env, fromE164, '¿Seguimos con lo de antes o vemos otra cosa?');
+          await sendWhatsAppText(env, fromE164, '¿En qué te puedo ayudar? Puedo retomar lo anterior o ver algo nuevo.');
           return ok('EVENT_RECEIVED');
         }
 
@@ -193,11 +187,11 @@ export default {
           session.data.last_stage = session.stage;
           session.stage = 'await_choice';
           await saveSession(env, session, now);
-          await sendWhatsAppText(env, fromE164, '¿Seguimos con lo de antes o vemos otra cosa?');
+          await sendWhatsAppText(env, fromE164, '¿En qué te puedo ayudar? Si quieres, retomamos lo anterior.');
           return ok('EVENT_RECEIVED');
         }
 
-        // ==== FAQs (con guardas para respuestas cortas) ====
+        // ==== FAQs (con guardas) ====
         const faqAns = await maybeFAQ(env, ntext, session);
         if (faqAns) {
           await sendWhatsAppText(env, fromE164, faqAns);
@@ -216,7 +210,6 @@ export default {
 
     } catch (e) {
       console.error('[STATE] Worker error', e);
-      // Nunca cortamos la conversación
       return ok('EVENT_RECEIVED');
     }
   },
@@ -326,7 +319,7 @@ async function aiSmallTalk(env, session, mode='general', userText=''){
   const sys = 'Eres CopiBot de CP Digital (es-MX). Responde cálido, breve y claro. Máximo 1 emoji. Evita listas salvo necesidad.';
   let prompt = '';
   if (mode === 'greeting') {
-    prompt = `Saluda cálido. Incluye el nombre si lo tienes (“${nombre}”). Cierra con: "¿Seguimos con lo de antes o vemos otra cosa?"`;
+    prompt = `Saluda cálido. Incluye el nombre si lo tienes (“${nombre}”). Cierra con: "¿En qué te puedo ayudar?"`;
   } else if (mode === 'fallback') {
     prompt = `El usuario dijo: """${userText}""". Responde breve, útil y amable. Si no hay contexto, ofrece *soporte* o *cotización*.`;
   } else {
@@ -684,7 +677,6 @@ async function findBestProduct(env, queryText, opts = {}) {
     if (!Array.isArray(arr) || !arr.length) return null;
     let pool = arr.slice();
 
-    // Color obligatorio si está presente en la consulta
     if (colorCode) pool = pool.filter(p => productHasColor(p, colorCode));
 
     if (hints.family && !opts.ignoreFamily) {
@@ -693,7 +685,6 @@ async function findBestProduct(env, queryText, opts = {}) {
       else if (strict) return null;
     }
 
-    // Orden: stock > score > cercanía de familia > precio
     pool.sort((a,b) => {
       const sa = numberOrZero(a.stock) > 0 ? 1 : 0;
       const sb = numberOrZero(b.stock) > 0 ? 1 : 0;
@@ -829,7 +820,6 @@ async function createOrderFromSession(env, session, toE164) {
     }));
     await sbUpsert(env, 'pedido_item', items, { returning: 'minimal' });
 
-    // decremento de stock (si existe RPC)
     for (const it of cart) {
       const sku = it.product?.sku;
       if (!sku) continue;
@@ -851,54 +841,60 @@ async function createOrderFromSession(env, session, toE164) {
 /* ============================ SOPORTE ============================ */
 function extractSvInfo(text) {
   const out = {};
-  if (/xerox/i.test(text)) out.marca = 'Xerox';
-  else if (/fujifilm|fuji\s?film/i.test(text)) out.marca = 'Fujifilm';
-  const m = text.match(/(versant\s*\d+\/\d+|versant\s*\d+|versalink\s*\w+|altalink\s*\w+|docucolor\s*\d+|c\d{2,4}|b\d{2,4})/i);
+  const t = text;
+
+  if (/xerox/i.test(t)) out.marca = 'Xerox';
+  else if (/fujifilm|fuji\s?film/i.test(t)) out.marca = 'Fujifilm';
+
+  // Modelos frecuentes (familia o modelo)
+  const m = t.match(/(versant\s*\d+\/\d+|versant\s*\d+|versalink\s*[\w\-]+|altalink\s*[\w\-]+|docucolor\s*\d+|c\d{2,4}|b\d{2,4})/i);
   if (m) out.modelo = m[1].toUpperCase();
-  const err = text.match(/\berror\s*([0-9\-]+)\b/i);
+
+  const err = t.match(/\berror\s*([0-9\-]+)\b/i);
   if (err) out.error_code = err[1];
-  if (/no imprime/i.test(text)) out.falla = 'No imprime';
-  if (/atasc(a|o)|se atora|se traba|arrugad(i|o)|saca el papel/i.test(text)) out.falla = 'Atasco/arrugado de papel';
-  if (/mancha|calidad|linea|l[ií]nea/i.test(text)) out.falla = 'Calidad de impresión';
-  if (/\b(parado|urgente|producci[oó]n detenida|parada)\b/i.test(text)) out.prioridad = 'alta';
 
-  const loose = parseAddressLoose(text); Object.assign(out, loose);
+  if (/no imprime/i.test(t)) out.falla = 'No imprime';
+  if (/atasc(a|o)|se atora|se traba|arrugad(i|o)|saca el papel/i.test(t)) out.falla = 'Atasco/arrugado de papel';
+  if (/mancha|calidad|linea|l[ií]nea/i.test(t)) out.falla = 'Calidad de impresión';
+  if (/\b(parado|urgente|producci[oó]n detenida|parada)\b/i.test(t)) out.prioridad = 'alta';
 
-  const d = parseCustomerText(text);
-  if (d.calle) out.calle = d.calle;
-  if (d.numero) out.numero = d.numero;
-  if (d.colonia) out.colonia = d.colonia;
-  if (d.cp) out.cp = d.cp;
-  if (d.ciudad) out.ciudad = d.ciudad;
-  if (d.estado) out.estado = d.estado;
+  Object.assign(out, parseAddressLoose(t), parseCustomerText(t));
+
   return out;
 }
 
 function svFillFromAnswer(sv, field, text, env){
   const t = text.trim();
+
   if (field === 'modelo') {
-    const m = t.match(/(xerox|fujifilm|fuji\s?film)?\s*(versant\s*\d+\/\d+|versant\s*\d+|versalink\s*\w+|altalink\s*\w+|docucolor\s*\d+|c\d{2,4}|b\d{2,4})/i);
+    // Tolerante a “marca + familia + número”, o libre
+    const m = t.match(/(xerox|fujifilm|fuji\s?film)?\s*(versant\s*\d+\/\d+|versant\s*\d+|versalink\s*[\w\-]+|altalink\s*[\w\-]+|docucolor\s*\d+|c\d{2,4}|b\d{2,4})/i);
     if (m) {
       if (m[1]) sv.marca = /fuji/i.test(m[1]) ? 'Fujifilm' : 'Xerox';
       sv.modelo = m[2].toUpperCase();
     } else {
-      sv.modelo = clean(t);
+      // Acepta libre para no bloquear
+      sv.modelo = clean(t).toUpperCase();
+      // Marca opcional si viene pegada
+      if (/xerox/i.test(t) && !sv.marca) sv.marca = 'Xerox';
+      if (/fujifilm|fuji\s?film/i.test(t) && !sv.marca) sv.marca = 'Fujifilm';
     }
     return;
   }
+
   if (field === 'falla') { sv.falla = clean(t); return; }
   if (field === 'nombre') { sv.nombre = clean(t); return; }
   if (field === 'email') {
-    const m = t.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
-    sv.email = m ? m[0].toLowerCase() : clean(t).toLowerCase();
+    const m2 = t.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+    sv.email = m2 ? m2[0].toLowerCase() : clean(t).toLowerCase();
     return;
   }
   if (field === 'calle') { sv.calle = clean(t); return; }
-  if (field === 'numero') { const m = t.match(/\b(\d+[A-Z]?)\b/); sv.numero = m?m[1]:clean(t); return; }
+  if (field === 'numero') { const m3 = t.match(/\b(\d+[A-Z]?)\b/); sv.numero = m3?m3[1]:clean(t); return; }
   if (field === 'colonia') { sv.colonia = clean(t); return; }
   if (field === 'ciudad') { sv.ciudad = clean(t); return; }
   if (field === 'estado') { sv.estado = clean(t); return; }
-  if (field === 'cp') { const m = t.match(/\b(\d{5})\b/); sv.cp = m?m[1]:clean(t); return; }
+  if (field === 'cp') { const m4 = t.match(/\b(\d{5})\b/); sv.cp = m4?m4[1]:clean(t); return; }
   if (field === 'horario') { const dt = parseNaturalDateTime(t, env); if (dt?.start) sv.when = dt; return; }
 }
 
@@ -922,10 +918,10 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       if (dt?.start) sv.when = dt;
     }
 
-    // bienvenida única
+    // bienvenida única y empática
     if (!sv._welcomed || intent?.forceWelcome) {
       sv._welcomed = true;
-      await sendWhatsAppText(env, toE164, 'Lamento la falla 😕. Vamos a ayudarte. ¿Me confirmas *marca/modelo* y una breve *descripción* del problema?');
+      await sendWhatsAppText(env, toE164, 'Lamento la falla 😕. Dime por favor *marca y modelo* y una breve *descripción* del problema para ayudarte.');
     }
 
     // quick tips una sola vez (marca flag ANTES de enviar)
@@ -961,7 +957,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
 
       const Q = {
         modelo: '¿Qué *marca y modelo* es tu impresora? (p.ej., *Xerox Versant 180*)',
-        falla: 'Cuéntame brevemente la falla (p.ej., “*atasco en fusor*”, “*no imprime*”).',
+        falla: 'Cuéntame breve la falla (p.ej., “*atasco en fusor*”, “*no imprime*”).',
         calle: '¿En qué *calle* está el equipo?',
         numero: '¿Qué *número* es?',
         colonia: '¿*Colonia*?',
@@ -1049,7 +1045,10 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     console.warn('[SUPPORT] handleSupport catch', e);
     try{
       const need = session?.data?.sv_need_next || 'modelo';
-      await sendWhatsAppText(env, toE164, `Gracias. Sigamos: ¿${displayFieldSupport(need)}?`);
+      const polite = need === 'modelo'
+        ? 'Va, para avanzar ayúdame con *marca y modelo* del equipo, por fa.'
+        : `Va, para avanzar necesito ${displayFieldSupport(need)}.`;
+      await sendWhatsAppText(env, toE164, polite);
     }catch{
       await sendWhatsAppText(env, toE164, 'Tomé tu solicitud de soporte. Si te parece, seguimos con los datos para agendar o te contacto enseguida 🙌');
     }
@@ -1121,7 +1120,6 @@ async function svWhenIsMyVisit(env, session, toE164) {
 
 /* ============================ FAQs ============================ */
 async function maybeFAQ(env, ntext, session=null) {
-  // Guardas: no disparar FAQ con respuestas cortas/positivas o después de cerrar pedido si dijo “sí”
   if (!ntext || ntext.length < 2) return null;
   if (/^(s[ií]|sí|si|ok|vale|va|gracias|thanks|thank you|no|nel)\b/i.test(ntext)) return null;
   if (session?.stage === 'post_order') return null;
@@ -1183,7 +1181,6 @@ function parseNaturalDateTime(text, env) {
   } else if (/\b(mediod[ií]a)\b/i.test(text)) {
     hour = 12; minute=0;
   }
-  // frases “a las 3”, “3 de la tarde”
   if (hour===null){
     const m2 = text.match(/\b(a\s+las\s+)?(\d{1,2})\b/i);
     if (m2){ hour = Number(m2[2]); }
@@ -1192,7 +1189,6 @@ function parseNaturalDateTime(text, env) {
   if (targetDay===null && hour===null) return null;
   if (hour===null) hour = 12;
 
-  // redondeo natural minutos 0/30
   if (minute > 0 && minute <= 15) minute = 0;
   else if (minute > 15 && minute <= 45) minute = 30;
   else if (minute > 45) { hour = hour + 1; minute = 0; }
@@ -1210,11 +1206,9 @@ function clampToWindow(when, tz) {
   const hours = Number(new Intl.DateTimeFormat('es-MX', { hour:'2-digit', hour12:false, timeZone:tz }).format(start));
   const minutes = Number(new Intl.DateTimeFormat('es-MX', { minute:'2-digit', timeZone:tz }).format(start));
 
-  // Ventana 10–15; si 15:xx → 14:00–15:00
   if (hours < 10) newStart.setHours(10,0,0,0);
   if (hours > 15 || (hours === 15 && minutes > 0)) newStart.setHours(14,0,0,0);
 
-  // Forzar :00 o :30
   const m = newStart.getMinutes();
   if (m > 0 && m <= 15) newStart.setMinutes(0);
   else if (m > 15 && m <= 45) newStart.setMinutes(30);
@@ -1270,7 +1264,6 @@ async function findNearestFreeSlot(env, calendarId, when, tz) {
   let curStart = new Date(when.start);
   let curEnd = new Date(when.end);
 
-  // asegurar :00/:30
   const fix = (d) => {
     const m = d.getMinutes();
     if (m>0 && m<=15) d.setMinutes(0,0,0);
@@ -1285,8 +1278,6 @@ async function findNearestFreeSlot(env, calendarId, when, tz) {
     if (!busy) break;
     curStart = new Date(curStart.getTime()+30*60*1000);
     curEnd = new Date(curEnd.getTime()+30*60*1000);
-
-    // si salimos de ventana → siguiente día hábil 10:00
     const hr = curStart.toLocaleString('en-US', { hour: '2-digit', hour12:false, timeZone: tz });
     if (Number(hr) >= 15) {
       curStart.setDate(curStart.getDate()+1);
@@ -1491,7 +1482,7 @@ function buildResumePrompt(session){
     const need = session?.data?.sv_need_next || 'modelo';
     const q = {
       modelo: '¿Qué marca y modelo es tu impresora (p.ej., Xerox Versant 180)?',
-      falla: 'Cuéntame brevemente la falla (p.ej., “atasco en fusor”, “no imprime”).',
+      falla: 'Cuéntame breve la falla (p.ej., “atasco en fusor”, “no imprime”).',
       calle: '¿En qué calle está el equipo?',
       numero: '¿Qué número es?',
       colonia: '¿Colonia?',
