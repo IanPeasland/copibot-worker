@@ -1,13 +1,21 @@
 /**
  * CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
- * Oct/2025 – build “Borbón-R3”
- * Cambios R3:
- * - Saludo humano y seguro: limpia last_candidate/pending_query; no confirma nada en “hola”.
- * - Cierre de conversación: “No” → stage=idle, sin saludo automático.
- * - Matching inventario: color obligatorio si lo piden; scoring pro-familia; penaliza familias distintas.
- * - Para “versant” ya no trae C60/C70/C75/DocuColor/PrimeLink/AltaLink (a menos que el cliente acepte ver compatibles).
- * - Soporte con tono empático y parser de modelo más tolerante.
- * - No “trámite”, ni frases robóticas.
+ * Oct/2025 – build “Borbón-R4”
+ *
+ * R4 (sobre R3):
+ * - Saludo inicial más natural (ya no confirma nada en “hola”).
+ * - Soporte: primer pedido de marca/modelo empático y humano.
+ * - Reconocimiento de modelo mejorado:
+ *     · normalización + alias comunes (verzan→versant, dococolor→docucolor, etc.)
+ *     · regex tolerantes (versant/docucolor/versalink/altalink/primelink/apeos/C/B series)
+ *     · IA opcional: aiExtractTonerQuery() para {familia,color,subfamilia,cantidad}
+ * - Matching inventario:
+ *     · Color = filtro duro
+ *     · Familia = filtro duro (nunca mezcla, salvo que el usuario acepte ver “compatibles”)
+ *     · Versant NUNCA trae DocuColor y viceversa
+ *     · Subfamilia sólo refina; si sin stock → “sobre pedido” y ofrece compatibles
+ * - Compatibles: sólo si el cliente lo aprueba (stage await_compatibles)
+ * - UX: mensajes cálidos, humanos; máx. 1 emoji por mensaje; sin “trámite” ni frases robóticas
  */
 
 export default {
@@ -43,7 +51,7 @@ export default {
         const { mid, from, fromE164, profileName, textRaw } = ctx;
         const text = (textRaw || '').trim();
         const lowered = text.toLowerCase();
-        const ntext = normalize(text);
+        const ntext = normalizeWithAliases(text); // ← alias + normalización
         const now = new Date();
 
         // ===== Session =====
@@ -93,9 +101,9 @@ export default {
           if (session?.data?.last_candidate) delete session.data.last_candidate;
           if (session?.data?.pending_query) delete session.data.pending_query;
 
-          // Saludo humano
+          // Saludo humano y natural
           const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
-          await sendWhatsAppText(env, fromE164, `Hola${nombre ? ' ' + nombre : ''} 👋\n¿En qué te puedo ayudar? Si quieres, retomamos lo anterior.`);
+          await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
           session.data.last_greet_at = now.toISOString();
 
           // Si había algo a medias, ofrece continuar sin sonar robótico
@@ -133,11 +141,41 @@ export default {
             session.data.last_stage = 'idle';
             session.stage = 'idle';
             await saveSession(env, session, now);
-            await sendWhatsAppText(env, fromE164, `Perfecto. Cuéntame qué necesitas (soporte, cotización, etc.). 🙂`);
+            await sendWhatsAppText(env, fromE164, `Perfecto, cuéntame qué necesitas (soporte, cotización, etc.). 🙂`);
             return ok('EVENT_RECEIVED');
           }
           await sendWhatsAppText(env, fromE164, `¿Prefieres continuar con lo pendiente o empezamos algo nuevo?`);
           return ok('EVENT_RECEIVED');
+        }
+
+        // ===== Compatibles (aprobación) =====
+        if (session.stage === 'await_compatibles') {
+          if (isYesish(lowered)) {
+            // Buscar mejores opciones ignorando familia (compatibles)
+            const q = session.data?.pending_query || ntext || lowered;
+            const bestCompat = await findBestProduct(env, q, { ignoreFamily: true });
+            session.stage = 'ask_qty';
+            session.data.last_candidate = bestCompat || null;
+            await saveSession(env, session, now);
+            if (bestCompat) {
+              const s = numberOrZero(bestCompat.stock);
+              await sendWhatsAppText(env, fromE164, `${renderProducto(bestCompat)}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; hay ${s} en stock y el resto sería *sobre pedido*.`);
+            } else {
+              await sendWhatsAppText(env, fromE164, `No veo compatibles claros ahora mismo. Si gustas, lo revisa un asesor.`);
+              await notifySupport(env, `Compatibles sin match. +${session.from}: ${q}`);
+              session.stage = 'idle';
+              await saveSession(env, session, now);
+            }
+            return ok('EVENT_RECEIVED');
+          } else if (isNoish(lowered)) {
+            session.stage = 'idle';
+            await saveSession(env, session, now);
+            await sendWhatsAppText(env, fromE164, `De acuerdo. Si te parece, puedo dejarlo *sobre pedido* o buscamos otro artículo.`);
+            return ok('EVENT_RECEIVED');
+          } else {
+            await sendWhatsAppText(env, fromE164, `¿Quieres que te muestre *compatibles* de otra línea? (Sí/No)`);
+            return ok('EVENT_RECEIVED');
+          }
         }
 
         // ===== Cambio de intención en caliente (prioridad soporte) =====
@@ -149,7 +187,7 @@ export default {
         // ===== A ventas por intención =====
         if (salesIntent) {
           if (session.stage !== 'idle') {
-            await sendWhatsAppText(env, fromE164, `Te ayudo con inventario. Dejo lo anterior en pausa un momento.`);
+            await sendWhatsAppText(env, fromE164, `Te ayudo con inventario. Dejo lo otro en pausa un momento.`);
             session.data.last_stage = session.stage;
             session.stage = 'idle';
             await saveSession(env, session, now);
@@ -222,9 +260,25 @@ function isNoish(t){ return RX_NEG_NO.test(t) || RX_DONE.test(t); }
 /* ============================ Helpers ============================ */
 const firstWord = (s='') => (s||'').trim().split(/\s+/)[0] || '';
 const toTitleCase = (s='') => s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : '';
-function normalize(s=''){ return s.normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/\s+/g,' ').trim().toLowerCase(); }
+function normalizeBase(s=''){ return s.normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/\s+/g,' ').trim().toLowerCase(); }
 function clean(s=''){ return s.replace(/\s+/g,' ').trim(); }
 function truthy(v){ return v!==null && v!==undefined && String(v).trim()!==''; }
+
+function normalizeWithAliases(s=''){
+  const t = normalizeBase(s);
+  const aliases = [
+    ['verzan','versant'], ['verzand','versant'], ['versan','versant'], ['vrsant','versant'],
+    ['dococolor','docucolor'], ['docucolour','docucolor'], ['docu color','docucolor'],
+    ['versalink','versalink'], ['versa link','versalink'], ['altaling','altalink'], ['alta link','altalink'],
+    ['prime link','primelink'], ['prime-link','primelink'], ['prymelink','primelink'],
+    ['fujifilm','fujifilm'], ['fuji film','fujifilm'], ['docucolor 5560','docucolor 550/560/570']
+  ];
+  let out = t;
+  for (const [bad, good] of aliases){
+    out = out.replace(new RegExp(`\\b${bad}\\b`, 'g'), good);
+  }
+  return out;
+}
 
 function fmtDate(d, tz){
   try{ return new Intl.DateTimeFormat('es-MX',{dateStyle:'full',timeZone:tz}).format(new Date(d)); }
@@ -281,6 +335,14 @@ async function intentIs(env, text, expected){
 async function aiClassifyIntent(env, text){
   if (!env.OPENAI_API_KEY && !env.OPENAI_KEY) return null;
   const sys = `Clasifica texto (es-MX) en JSON: { "intent": "support|sales|faq|smalltalk" }`;
+  const out = await aiCall(env, [{role:'system', content: sys},{role:'user', content: text}], {json:true});
+  try { return JSON.parse(out||'{}'); } catch { return null; }
+}
+
+/** IA opcional para reforzar NER de inventario */
+async function aiExtractTonerQuery(env, text){
+  if (!env.OPENAI_API_KEY && !env.OPENAI_KEY) return null;
+  const sys = `Extrae de una consulta (es-MX) sobre tóners los campos { "familia": "versant|docucolor|primelink|versalink|altalink|apeos|c70|", "color": "yellow|magenta|cyan|black|null", "subfamilia": "string|null", "cantidad": "number|null" } en JSON. No inventes.`;
   const out = await aiCall(env, [{role:'system', content: sys},{role:'user', content: text}], {json:true});
   try { return JSON.parse(out||'{}'); } catch { return null; }
 }
@@ -412,7 +474,12 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
 
   if (RX_ADD_ITEM.test(lowered) || RX_INV_Q.test(ntext)) {
     const cleanQ = lowered.replace(RX_ADD_ITEM, '').trim() || ntext;
-    const best = await findBestProduct(env, cleanQ);
+
+    // Intento de NER con IA si ambiguo
+    const extracted = await aiExtractTonerQuery(env, cleanQ).catch(()=>null);
+    const enrichedQ = enrichQueryFromAI(cleanQ, extracted);
+
+    const best = await findBestProduct(env, enrichedQ); // familia+color = duro
     if (best) {
       session.data.last_candidate = best;
       session.stage = 'ask_qty';
@@ -421,6 +488,15 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
       await sendWhatsAppText(env, toE164, `${renderProducto(best)}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; hay ${s} en stock y el resto sería *sobre pedido*.`);
       return ok('EVENT_RECEIVED');
     } else {
+      // Ofrecer compatibles si detectamos familia en la consulta original o vía IA
+      const hints = extractModelHints(enrichedQ);
+      if (hints.family && ((env.STRICT_FAMILY_MATCH||'').toString().toLowerCase() !== 'true')) {
+        session.stage = 'await_compatibles';
+        session.data.pending_query = enrichedQ;
+        await saveSession(env, session, now);
+        await sendWhatsAppText(env, toE164, `Ese modelo está *sobre pedido* o sin disponibilidad. ¿Quieres que te muestre opciones *compatibles* en otra línea?`);
+        return ok('EVENT_RECEIVED');
+      }
       await sendWhatsAppText(env, toE164, `No encontré una coincidencia directa 😕. ¿Busco otra opción o lo revisa un asesor?`);
       await notifySupport(env, `Inventario sin match. ${toE164}: ${text}`);
       await saveSession(env, session, now);
@@ -433,8 +509,21 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
   return ok('EVENT_RECEIVED');
 }
 
+function enrichQueryFromAI(q, ai){
+  if (!ai) return q;
+  let out = q;
+  if (ai.familia && !new RegExp(`\\b${ai.familia}\\b`).test(out)) out += ` ${ai.familia}`;
+  if (ai.color && !new RegExp(`\\b(${ai.color}|amarillo|magenta|cyan|cian|negro|black|bk|k|yellow)\\b`).test(out)) {
+    const map = {yellow:'amarillo', magenta:'magenta', cyan:'cyan', black:'negro'};
+    out += ` ${map[ai.color] || ai.color}`;
+  }
+  if (ai.subfamilia && !out.includes(ai.subfamilia)) out += ` ${ai.subfamilia}`;
+  if (ai.cantidad && !/\b\d+\b/.test(out)) out += ` ${ai.cantidad}`;
+  return out;
+}
+
 async function handleAwaitInvoice(env, session, toE164, lowered, now, originalText='') {
-  // Si el usuario dice "no" y no hay más, cerrar a idle (no disparar saludo)
+  // “No” → cerrar a idle sin saludo automático
   if (/\b(no|gracias|todo bien)\b/i.test(lowered)) {
     session.stage = 'idle';
     await saveSession(env, session, now);
@@ -477,7 +566,7 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now, originalTe
       await sendWhatsAppText(env, toE164, `Creé tu solicitud y la pasé a un asesor para confirmar detalles. 🙌`);
       await notifySupport(env, `Pedido (parcial) ${toE164}. Revisar en Supabase.\nError: ${res?.error || 'N/A'}`);
     }
-    session.stage = 'idle'; // ← pasa a idle, no se queda en post_order para evitar loops de saludo
+    session.stage = 'idle';
     session.data.cart = [];
     await saveSession(env, session, now);
     await sendWhatsAppText(env, toE164, `¿Te ayudo con algo más en este momento? (Sí / No)`);
@@ -549,33 +638,29 @@ function summaryCart(cart = []) { return cart.map(i => `${i.product?.nombre} x $
 function splitCart(cart = []){ return { inStockList: cart.filter(i => !i.backorder), backOrderList: cart.filter(i => i.backorder) }; }
 
 /* =============== Inventario & Pedido =============== */
-/** Detección de familia con mayor cobertura para “versant” */
 function extractModelHints(text='') {
-  const t = normalize(text);
+  const t = normalizeWithAliases(text);
   const out = {};
-  if (/\bversant\b/i.test(t) || /\b(550|560|570|80|180|2100)\b/.test(t)) out.family = 'versant';
-  else if (/\bversa[-\s]?link\b/i.test(t)) out.family = 'versalink';
-  else if (/\balta[-\s]?link\b/i.test(t)) out.family = 'altalink';
-  else if (/\bdocu(color)?\b/i.test(t)) out.family = 'docucolor';
-  else if (/\bprime\s*link\b/i.test(t)) out.family = 'primelink';
-  else if (/\bapeos\b/i.test(t)) out.family = 'apeos';
-  else if (/\bc(60|70|75)\b/i.test(t)) out.family = 'c70';
+  if (/\bversant\b/.test(t) || /\b(550|560|570|80|180|2100)\b/.test(t)) out.family = 'versant';
+  else if (/\bversa[-\s]?link\b/.test(t)) out.family = 'versalink';
+  else if (/\balta[-\s]?link\b/.test(t)) out.family = 'altalink';
+  else if (/\bdocu(color)?\b/.test(t)) out.family = 'docucolor';
+  else if (/\bprime\s*link\b/.test(t) || /\bprimelink\b/.test(t)) out.family = 'primelink';
+  else if (/\bapeos\b/.test(t)) out.family = 'apeos';
+  else if (/\bc(60|70|75)\b/.test(t)) out.family = 'c70';
+
+  // Color
+  if (/\b(amarillo|yellow)\b/.test(t)) out.color = 'yellow';
+  else if (/\bmagenta\b/.test(t)) out.color = 'magenta';
+  else if (/\b(cyan|cian)\b/.test(t)) out.color = 'cyan';
+  else if (/\b(negro|black|bk|k)\b/.test(t)) out.color = 'black';
+
   return out;
 }
 
-function extractColorWord(text=''){
-  const t = normalize(text);
-  if (/\b(amarillo|yellow)\b/i.test(t)) return 'yellow';
-  if (/\bmagenta\b/i.test(t)) return 'magenta';
-  if (/\b(cyan|cian)\b/i.test(t)) return 'cyan';
-  if (/\b(negro|black|bk|k)\b/i.test(t)) return 'black';
-  return null;
-}
-
-/** Color matching robusto: tokens C/M/Y/K como separadores o sufijos de SKU */
 function productHasColor(p, colorCode){
   if (!colorCode) return true;
-  const s = `${normalize([p?.nombre, p?.sku, p?.marca].join(' '))}`;
+  const s = `${normalizeBase([p?.nombre, p?.sku, p?.marca].join(' '))}`;
   const map = {
     yellow:[/\bamarillo\b/i, /\byellow\b/i, /(^|[\s\-_\/])y($|[\s\-_\/])/i, /(^|[\s\-_\/])ylw($|[\s\-_\/])/i],
     magenta:[/\bmagenta\b/i, /(^|[\s\-_\/])m($|[\s\-_\/])/i],
@@ -588,33 +673,33 @@ function productHasColor(p, colorCode){
 
 function productMatchesFamily(p, family){
   if (!family) return true;
-  const s = normalize([p?.nombre, p?.sku, p?.marca, p?.compatible].join(' '));
+  const s = normalizeBase([p?.nombre, p?.sku, p?.marca, p?.compatible].join(' '));
 
   if (family==='versant'){
-    // preferir 550/560/570/80/180/2100 y evitar familias no-versa*
-    const hit = /\b(versant|v\s*ersant|550|560|570|80\b|180\b|2100)\b/i.test(s);
+    const hit = /\b(versant|550|560|570|80\b|180\b|2100)\b/i.test(s);
     const bad = /(c60|c70|c75|docucolor|prime\s*link|primelink|altalink|versa\s*link)/i.test(s);
+    return hit && !bad;
+  }
+  if (family==='docucolor'){
+    const hit = /\b(docucolor|550\/560\/570|550|560|570)\b/i.test(s);
+    const bad = /(versant|primelink|altalink|versalink|c60|c70|c75)/i.test(s);
     return hit && !bad;
   }
   if (family==='c70') return /\bc(60|70|75)\b/i.test(s) || s.includes('c60') || s.includes('c70') || s.includes('c75');
   if (family==='primelink') return /\bprime\s*link\b/i.test(s) || /\bprimelink\b/i.test(s);
+  if (family==='versalink') return /\bversa\s*link\b/i.test(s) || /\bversalink\b/i.test(s);
+  if (family==='altalink') return /\balta\s*link\b/i.test(s) || /\baltalink\b/i.test(s);
+  if (family==='apeos') return /\bapeos\b/i.test(s);
   return s.includes(family);
 }
 
-/* === findBestProduct robusto (respeta STRICT_FAMILY_MATCH y color) === */
+/* === findBestProduct: Color y Familia = filtros duros === */
 async function findBestProduct(env, queryText, opts = {}) {
   const hints = extractModelHints(queryText);
-  const colorCode = extractColorWord(queryText);
-  const strict = (env.STRICT_FAMILY_MATCH || '').toString().toLowerCase() === 'true';
+  const strict = true; // familia siempre duro en R4
+  const colorCode = hints.color || extractColorWord(queryText);
 
-  const penalizeOtherFamilies = (p) => {
-    // penaliza fuertemente si el usuario pidió versant y el producto es docucolor/c60/altalink/versalink/primelink
-    if (hints.family === 'versant') {
-      const s = normalize([p?.nombre, p?.sku, p?.marca, p?.compatible].join(' '));
-      if (/(c60|c70|c75|docucolor|prime\s*link|primelink|altalink|versa\s*link)/i.test(s)) return -4; // fuerte penalidad
-    }
-    return 0;
-  };
+  // Si IA extrae familia/color (por enrichQueryFromAI) ya vienen en queryText
 
   const pick = (arr) => {
     if (!Array.isArray(arr) || !arr.length) return null;
@@ -623,27 +708,17 @@ async function findBestProduct(env, queryText, opts = {}) {
     let pool = colorCode ? arr.filter(p => productHasColor(p, colorCode)) : arr.slice();
     if (!pool.length) return null;
 
-    // Si pidió familia específica, priorizarla muy fuerte
+    // Familia DURA: filtra; salvo ignoreFamily explícito (compatibles aprobados)
     if (hints.family && !opts.ignoreFamily) {
-      const famPool = pool.filter(p => productMatchesFamily(p, hints.family));
-      if (famPool.length) pool = famPool;
-      else if (strict) return null; // con estricto, no ofrecer otra familia
+      pool = pool.filter(p => productMatchesFamily(p, hints.family));
+      if (!pool.length) return null;
     }
 
-    // Orden por score: stock > match familia > penalización otras familias > precio
+    // Orden por score: stock > precio asc
     pool.sort((a,b) => {
       const sa = numberOrZero(a.stock) > 0 ? 1 : 0;
       const sb = numberOrZero(b.stock) > 0 ? 1 : 0;
       if (sa !== sb) return sb - sa;
-
-      const fa = hints.family && productMatchesFamily(a, hints.family) ? 1 : 0;
-      const fb = hints.family && productMatchesFamily(b, hints.family) ? 1 : 0;
-      if (fa !== fb) return fb - fa;
-
-      const pa = penalizeOtherFamilies(a);
-      const pb = penalizeOtherFamilies(b);
-      if (pa !== pb) return pb - pa;
-
       return numberOrZero(a.precio||0) - numberOrZero(b.precio||0);
     });
 
@@ -651,48 +726,62 @@ async function findBestProduct(env, queryText, opts = {}) {
   };
 
   try {
-    const res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 30 });
+    const res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 30 }) || [];
     const best = pick(res);
     if (best) return best;
   } catch {}
 
-  // Búsqueda por familia explícita
-  if (hints.family) {
+  // Búsqueda por familia explícita (si hay)
+  if (hints.family && !opts.ignoreFamily) {
     try {
       const like = encodeURIComponent(`%${hints.family}%`);
       const r = await sbGet(env, 'producto_stock_v', {
         query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&or=(nombre.ilike.${like},sku.ilike.${like},marca.ilike.${like},compatible.ilike.${like})&order=stock.desc.nullslast,precio.asc&limit=200`
-      });
+      }) || [];
       const best = pick(r);
       if (best) return best;
-      if (strict && !opts.ignoreFamily) return null;
+      return null; // familia dura → no regresamos otras familias aquí
     } catch {}
   }
 
-  // Búsqueda general “toner”
-  try {
-    const like = encodeURIComponent(`%toner%`);
-    const r = await sbGet(env, 'producto_stock_v', {
-      query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&or=(nombre.ilike.${like},sku.ilike.${like})&order=stock.desc.nullslast,precio.asc&limit=200`
-    });
-    const best = pick(r);
-    if (best) return best;
-  } catch {}
+  // Búsqueda general “toner” (sin familia indicada y sin compatibles)
+  if (!hints.family || opts.ignoreFamily) {
+    try {
+      const like = encodeURIComponent(`%toner%`);
+      const r = await sbGet(env, 'producto_stock_v', {
+        query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&or=(nombre.ilike.${like},sku.ilike.${like})&order=stock.desc.nullslast,precio.asc&limit=200`
+      }) || [];
+      // Si ignoreFamily=true, no filtramos por familia; si no, se filtra por hints arriba
+      const best = pick(r);
+      if (best) return best;
+    } catch {}
+  }
 
   return null;
 }
 
-async function startSalesFromQuery(env, session, toE164, text, ntext, now){
-  const best = await findBestProduct(env, ntext);
-  const hints = extractModelHints(ntext || text);
-  const strict = (env.STRICT_FAMILY_MATCH || '').toString().toLowerCase() === 'true';
+function extractColorWord(text=''){
+  const t = normalizeWithAliases(text);
+  if (/\b(amarillo|yellow)\b/i.test(t)) return 'yellow';
+  if (/\bmagenta\b/i.test(t)) return 'magenta';
+  if (/\b(cyan|cian)\b/i.test(t)) return 'cyan';
+  if (/\b(negro|black|bk|k)\b/i.test(t)) return 'black';
+  return null;
+}
 
-  if (!best && hints.family && !strict) {
-    // No hay exacto de la familia pedida; preguntar si quiere compatibles
+async function startSalesFromQuery(env, session, toE164, text, ntext, now){
+  const extracted = await aiExtractTonerQuery(env, ntext).catch(()=>null);
+  const enrichedQ = enrichQueryFromAI(ntext, extracted);
+  const best = await findBestProduct(env, enrichedQ);
+
+  const hints = extractModelHints(enrichedQ);
+
+  if (!best && hints.family) {
+    // No hay exacto de la familia pedida → ofrecer compatibles
     session.stage = 'await_compatibles';
-    session.data.pending_query = ntext || text;
+    session.data.pending_query = enrichedQ;
     await saveSession(env, session, now);
-    await sendWhatsAppText(env, toE164, `No veo disponibilidad *${hints.family}* ahora mismo 😕. ¿Te muestro opciones *compatibles*?`);
+    await sendWhatsAppText(env, toE164, `Ese modelo está *sobre pedido* o sin disponibilidad. ¿Quieres que te muestre opciones *compatibles* en otra línea?`);
     return ok('EVENT_RECEIVED');
   }
 
@@ -771,6 +860,7 @@ async function createOrderFromSession(env, session, toE164) {
     }));
     await sbUpsert(env, 'pedido_item', items, { returning: 'minimal' });
 
+    // Decremento de stock por RPC (hasta stock actual)
     for (const it of cart) {
       const sku = it.product?.sku;
       if (!sku) continue;
@@ -791,21 +881,22 @@ async function createOrderFromSession(env, session, toE164) {
 
 /* ============================ SOPORTE ============================ */
 function extractSvInfo(text) {
+  const t = normalizeWithAliases(text);
   const out = {};
-  if (/xerox/i.test(text)) out.marca = 'Xerox';
-  else if (/fujifilm|fuji\s?film/i.test(text)) out.marca = 'Fujifilm';
+  if (/xerox/i.test(t)) out.marca = 'Xerox';
+  else if (/fujifilm|fuji\s?film/i.test(t)) out.marca = 'Fujifilm';
 
   // Modelo tolerante (permite fallos de usuario)
-  const m = text.match(/(versant[\s-]*\d+(?:\/\d+)?|versalink\s*\w+|altalink\s*\w+|docucolor\s*\d+|prime\s*link\s*\w+|c\d{2,4}|b\d{2,4}|\b(550|560|570|80|180|2100)\b)/i);
+  const m = t.match(/(versant[\s-]*\d+(?:\/\d+)?|versalink\s*\w+|altalink\s*\w+|docucolor\s*[\w/]+|prime\s*link\s*\w+|primelink\s*\w+|c\d{2,4}|b\d{2,4}|\b(550|560|570|80|180|2100)\b)/i);
   if (m) out.modelo = m[0].toUpperCase().replace(/\s+/g,' ');
 
-  const err = text.match(/\berror\s*([0-9\-]+)\b/i);
+  const err = t.match(/\berror\s*([0-9\-]+)\b/i);
   if (err) out.error_code = err[1];
 
-  if (/no imprime/i.test(text)) out.falla = 'No imprime';
-  if (/atasc(a|o)|se atora|se traba|arrugad(i|o)|saca el papel/i.test(text)) out.falla = 'Atasco/arrugado de papel';
-  if (/mancha|calidad|linea|l[ií]nea/i.test(text)) out.falla = 'Calidad de impresión';
-  if (/\b(parado|urgente|producci[oó]n detenida|parada)\b/i.test(text)) out.prioridad = 'alta';
+  if (/no imprime/i.test(t)) out.falla = 'No imprime';
+  if (/atasc(a|o)|se atora|se traba|arrugad(i|o)|saca el papel/i.test(t)) out.falla = 'Atasco/arrugado de papel';
+  if (/mancha|calidad|linea|l[ií]nea/i.test(t)) out.falla = 'Calidad de impresión';
+  if (/\b(parado|urgente|producci[oó]n detenida|parada)\b/i.test(t)) out.prioridad = 'alta';
 
   const loose = parseAddressLoose(text);
   Object.assign(out, loose);
@@ -822,27 +913,27 @@ function extractSvInfo(text) {
 }
 
 function svFillFromAnswer(sv, field, text, env){
-  const t = text.trim();
+  const t = normalizeWithAliases(text).trim();
   if (field === 'modelo') {
-    const m = t.match(/(xerox|fujifilm|fuji\s?film)?\s*(versant[\s-]*\d+(?:\/\d+)?|versalink\s*\w+|altalink\s*\w+|docucolor\s*\d+|prime\s*link\s*\w+|c\d{2,4}|b\d{2,4}|\b(550|560|570|80|180|2100)\b)/i);
+    const m = t.match(/(xerox|fujifilm|fuji\s?film)?\s*(versant[\s-]*\d+(?:\/\d+)?|versalink\s*\w+|altalink\s*\w+|docucolor\s*[\w/]+|prime\s*link\s*\w+|primelink\s*\w+|c\d{2,4}|b\d{2,4}|\b(550|560|570|80|180|2100)\b)/i);
     if (m) {
       if (m[1]) sv.marca = /fuji/i.test(m[1]) ? 'Fujifilm' : 'Xerox';
       sv.modelo = m[2] ? m[2].toUpperCase() : m[0].toUpperCase();
     } else {
-      sv.modelo = clean(t);
+      sv.modelo = clean(text);
     }
     return;
   }
-  if (field === 'falla') { sv.falla = clean(t); return; }
-  if (field === 'nombre') { sv.nombre = clean(t); return; }
-  if (field === 'email') { const m = t.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i); sv.email = m ? m[0].toLowerCase() : clean(t).toLowerCase(); return; }
-  if (field === 'calle') { sv.calle = clean(t); return; }
-  if (field === 'numero') { const m = t.match(/\b(\d+[A-Z]?)\b/); sv.numero = m?m[1]:clean(t); return; }
-  if (field === 'colonia') { sv.colonia = clean(t); return; }
-  if (field === 'ciudad') { sv.ciudad = clean(t); return; }
-  if (field === 'estado') { sv.estado = clean(t); return; }
-  if (field === 'cp') { const m = t.match(/\b(\d{5})\b/); sv.cp = m?m[1]:clean(t); return; }
-  if (field === 'horario') { const dt = parseNaturalDateTime(t, env); if (dt?.start) sv.when = dt; return; }
+  if (field === 'falla') { sv.falla = clean(text); return; }
+  if (field === 'nombre') { sv.nombre = clean(text); return; }
+  if (field === 'email') { const em = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i); sv.email = em ? em[0].toLowerCase() : clean(text).toLowerCase(); return; }
+  if (field === 'calle') { sv.calle = clean(text); return; }
+  if (field === 'numero') { const mnum = text.match(/\b(\d+[A-Z]?)\b/); sv.numero = mnum?mnum[1]:clean(text); return; }
+  if (field === 'colonia') { sv.colonia = clean(text); return; }
+  if (field === 'ciudad') { sv.ciudad = clean(text); return; }
+  if (field === 'estado') { sv.estado = clean(text); return; }
+  if (field === 'cp') { const mcp = text.match(/\b(\d{5})\b/); sv.cp = mcp?mcp[1]:clean(text); return; }
+  if (field === 'horario') { const dt = parseNaturalDateTime(text, env); if (dt?.start) sv.when = dt; return; }
 }
 
 async function handleSupport(env, session, toE164, text, lowered, ntext, now, intent){
@@ -864,10 +955,10 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     // Bienvenida empática (una sola vez)
     if (!sv._welcomed || intent?.forceWelcome) {
       sv._welcomed = true;
-      await sendWhatsAppText(env, toE164, `Lamento el problema 😕. Te ayudo a resolverlo. ¿Me confirmas *marca y modelo* y una breve *descripción* del problema?`);
+      await sendWhatsAppText(env, toE164, `Lamento escuchar la falla 😕. Dime por favor la *marca y el modelo* del equipo y una breve *descripción* del problema.`);
     }
 
-    // Quick help
+    // Quick help (una sola vez)
     const quick = quickHelp(ntext);
     if (quick && !sv.quick_advice_sent) {
       sv.quick_advice_sent = true;
@@ -881,7 +972,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     if (!sv.nombre && truthy(c.nombre)) sv.nombre = c.nombre;
     if (!sv.email && truthy(c.email)) sv.email = c.email;
 
-    // Campos necesarios (orden solicitado por requerimiento)
+    // Campos necesarios (orden requerido)
     const needed = [];
     if (!truthy(sv.marca) && !truthy(sv.modelo)) needed.push('modelo');
     if (!truthy(sv.falla)) needed.push('falla');
@@ -971,7 +1062,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     console.warn('[SUPPORT] handleSupport catch', e);
     try{
       const need = session?.data?.sv_need_next || 'modelo';
-      await sendWhatsAppText(env, toE164, `Gracias por la info. Sigamos con lo necesario: ¿${displayFieldSupport(need)}?`);
+      await sendWhatsAppText(env, toE164, `Gracias por la info. Para avanzar, ¿${displayFieldSupport(need)}?`);
     }catch{
       await sendWhatsAppText(env, toE164, `Tomé tu solicitud de soporte. Si te parece, seguimos con los datos para agendar o te contacto enseguida 🙌`);
     }
@@ -1053,17 +1144,17 @@ async function maybeFAQ(env, ntext) {
 /* ============================ Fechas ============================ */
 function parseNaturalDateTime(text, env) {
   const tz = env.TZ || 'America/Mexico_City';
-  const now = new Date();
-  const base = new Date(now.toLocaleString('en-US', { timeZone: tz }));
+  const base = new Date(new Date().toLocaleString('en-US', { timeZone: tz }));
   let d = new Date(base);
   let targetDay = null;
+  const t = normalizeBase(text);
 
-  if (/\b(hoy)\b/i.test(text)) targetDay = 0;
-  else if (/\b(ma[ñn]ana)\b/i.test(text)) targetDay = 1;
+  if (/\bhoy\b/i.test(t)) targetDay = 0;
+  else if (/\bmañana\b/i.test(t) || /\bmanana\b/i.test(t)) targetDay = 1;
   else {
     const days = ['domingo','lunes','martes','miércoles','miercoles','jueves','viernes','sábado','sabado'];
     for (let i=0;i<days.length;i++) {
-      if (new RegExp(`\\b${days[i]}\\b`, 'i').test(text)) {
+      if (new RegExp(`\\b${days[i]}\\b`, 'i').test(t)) {
         const today = base.getDay();
         const want = i%7;
         let delta = (want - today + 7) % 7;
@@ -1076,17 +1167,17 @@ function parseNaturalDateTime(text, env) {
   if (targetDay!==null) d.setDate(d.getDate()+targetDay);
 
   let hour = null, minute = 0;
-  const m = text.match(/\b(\d{1,2})(?:[:\.](\d{2}))?\s*(am|pm)?\b/i);
+  const m = t.match(/\b(\d{1,2})(?:[:\.](\d{2}))?\s*(am|pm)?\b/i);
   if (m) {
     hour = Number(m[1]); minute = m[2]?Number(m[2]):0; const ampm = (m[3]||'').toLowerCase();
     if (ampm==='pm' && hour<12) hour+=12;
     if (ampm==='am' && hour===12) hour=0;
-  } else if (/\b(mediod[ií]a)\b/i.test(text)) { hour = 12; minute=0; }
+  } else if (/\bmediod[ií]a\b/i.test(t)) { hour = 12; minute=0; }
 
   if (hour===null){
-    const m2 = text.match(/\b(a\s+las\s+)?(\d{1,2})\b/i);
+    const m2 = t.match(/\b(a\s+las\s+)?(\d{1,2})\b/i);
     if (m2){ hour = Number(m2[2]); }
-    if (/\btarde\b/i.test(text) && hour && hour<12) hour += 12;
+    if (/\btarde\b/i.test(t) && hour && hour<12) hour += 12;
   }
 
   if (targetDay===null && hour===null) return null;
@@ -1161,7 +1252,7 @@ async function findNearestFreeSlot(env, calendarId, when, tz) {
     const busy = await isBusy(env, calendarId, curStart.toISOString(), curEnd.toISOString());
     if (!busy) break;
     curStart = new Date(curStart.getTime()+30*60*1000);
-    curEnd = new Date(curEnd.getTime()+30*60*1000);
+    curEnd = new Date(curStart.getTime()+30*60*1000);
     // si nos salimos de la ventana, mover al día hábil siguiente 10:00
     const h = curStart.getHours();
     if (h >= 15) {
@@ -1376,7 +1467,7 @@ function buildResumePrompt(session){
   if (st && st.startsWith('collect_')) {
     const k = st.replace('collect_','');
     return `¿${displayField(k)}?`;
-  }
+    }
   if (st === 'sv_collect') {
     const need = session?.data?.sv_need_next || 'modelo';
     const q = {
