@@ -1,21 +1,13 @@
 /**
  * CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
- * Oct/2025 – build “Borbón-R4”
+ * Sep/2025 – build “Borbón-R5”
  *
- * R4 (sobre R3):
- * - Saludo inicial más natural (ya no confirma nada en “hola”).
- * - Soporte: primer pedido de marca/modelo empático y humano.
- * - Reconocimiento de modelo mejorado:
- *     · normalización + alias comunes (verzan→versant, dococolor→docucolor, etc.)
- *     · regex tolerantes (versant/docucolor/versalink/altalink/primelink/apeos/C/B series)
- *     · IA opcional: aiExtractTonerQuery() para {familia,color,subfamilia,cantidad}
- * - Matching inventario:
- *     · Color = filtro duro
- *     · Familia = filtro duro (nunca mezcla, salvo que el usuario acepte ver “compatibles”)
- *     · Versant NUNCA trae DocuColor y viceversa
- *     · Subfamilia sólo refina; si sin stock → “sobre pedido” y ofrece compatibles
- * - Compatibles: sólo si el cliente lo aprueba (stage await_compatibles)
- * - UX: mensajes cálidos, humanos; máx. 1 emoji por mensaje; sin “trámite” ni frases robóticas
+ * R5 sobre R4:
+ * - Manejo de mensajes NO-TEXTO (audio, imagen, document, sticker, contacts, location):
+ *   · Respuesta amable pidiendo texto y no rompe el flujo.
+ * - Soporte de respuestas por botones WhatsApp (interactive.button_reply.title).
+ * - Idempotencia: sigue usando last_mid; early-return más estricto.
+ * - Pequeñas defensas extra en parseos y null-safety (sin cambiar firmas).
  */
 
 export default {
@@ -34,7 +26,7 @@ export default {
         return new Response('Forbidden', { status: 403 });
       }
 
-      // Cron
+      // Cron endpoint manual
       if (req.method === 'POST' && url.pathname === '/cron') {
         const sec = req.headers.get('x-cron-secret') || url.searchParams.get('secret');
         if (!sec || sec !== env.CRON_SECRET) return new Response('Forbidden', { status: 403 });
@@ -46,29 +38,42 @@ export default {
       if (req.method === 'POST' && url.pathname === '/') {
         const payload = await safeJson(req);
         const ctx = extractWhatsAppContext(payload);
-        if (!ctx) return ok('EVENT_RECEIVED');
+        if (!ctx) return ok('EVENT_RECEIVED'); // eventos no relevantes/estatus
 
-        const { mid, from, fromE164, profileName, textRaw } = ctx;
-        const text = (textRaw || '').trim();
-        const lowered = text.toLowerCase();
-        const ntext = normalizeWithAliases(text); // ← alias + normalización
-        const now = new Date();
+        const { mid, from, fromE164, profileName, textRaw, msgType } = ctx;
+        let text = (textRaw || '').trim();
+        const lowered0 = text.toLowerCase();
 
         // ===== Session =====
+        const now = new Date();
         let session = await loadSession(env, from);
         session.data = session.data || {};
         session.stage = session.stage || 'idle';
         session.from = from;
 
-        // Nombre por profile
+        // Nombre por profile (prefill suave)
         if (profileName && !session?.data?.customer?.nombre) {
           session.data.customer = session.data.customer || {};
           session.data.customer.nombre = toTitleCase(firstWord(profileName));
         }
 
-        // Idempotencia básica por mid
+        // Idempotencia por mid (si Meta reintenta)
         if (session?.data?.last_mid && session.data.last_mid === mid) return ok('EVENT_RECEIVED');
         session.data.last_mid = mid;
+
+        // Mensajes NO-TEXTO → pedir texto amable y salir (no rompemos flujo)
+        if (msgType !== 'text') {
+          // Permitimos botones (interactive.button_reply ya se mapea a textRaw en extractWhatsAppContext).
+          if (msgType === 'media' || msgType === 'location' || msgType === 'contacts' || msgType === 'sticker' || msgType === 'document') {
+            await sendWhatsAppText(env, fromE164, `¿Podrías escribirme con palabras lo que necesitas? Así te ayudo más rápido 🙂`);
+            await saveSession(env, session, now);
+            return ok('EVENT_RECEIVED');
+          }
+        }
+
+        // Normalización+alias
+        const lowered = text.toLowerCase();
+        const ntext = normalizeWithAliases(text);
 
         // ===== Comandos universales (soporte) =====
         if (/\b(cancel(a|ar).*(cita|visita|servicio))\b/i.test(lowered)) {
@@ -90,23 +95,20 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // ===== Global intent switch =====
+        // ===== Intentos globales =====
         const supportIntent = isSupportIntent(ntext) || (await intentIs(env, text, 'support'));
         const salesIntent = RX_INV_Q.test(ntext) || (await intentIs(env, text, 'sales'));
 
         // ===== Saludo =====
         const isGreet = RX_GREET.test(lowered);
         if (isGreet) {
-          // Limpia candidatos para que "hola" nunca confirme nada
           if (session?.data?.last_candidate) delete session.data.last_candidate;
           if (session?.data?.pending_query) delete session.data.pending_query;
 
-          // Saludo humano y natural
           const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
           await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
           session.data.last_greet_at = now.toISOString();
 
-          // Si había algo a medias, ofrece continuar sin sonar robótico
           if (session.stage !== 'idle') {
             session.data.last_stage = session.stage;
             session.stage = 'await_choice';
@@ -117,7 +119,7 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // ===== Elección de continuar o empezar otro =====
+        // ===== Continuar o empezar nuevo (si había algo pendiente) =====
         if (session.stage === 'await_choice') {
           if (supportIntent) {
             session.stage = 'sv_collect';
@@ -151,7 +153,6 @@ export default {
         // ===== Compatibles (aprobación) =====
         if (session.stage === 'await_compatibles') {
           if (isYesish(lowered)) {
-            // Buscar mejores opciones ignorando familia (compatibles)
             const q = session.data?.pending_query || ntext || lowered;
             const bestCompat = await findBestProduct(env, q, { ignoreFamily: true });
             session.stage = 'ask_qty';
@@ -184,7 +185,7 @@ export default {
           return handled;
         }
 
-        // ===== A ventas por intención =====
+        // ===== Ventas por intención =====
         if (salesIntent) {
           if (session.stage !== 'idle') {
             await sendWhatsAppText(env, fromE164, `Te ayudo con inventario. Dejo lo otro en pausa un momento.`);
@@ -202,7 +203,7 @@ export default {
         if (session.stage === 'await_invoice') return await handleAwaitInvoice(env, session, fromE164, lowered, now, text);
         if (session.stage?.startsWith('collect_')) return await handleCollectSequential(env, session, fromE164, text, now);
 
-        // ===== FAQs =====
+        // ===== FAQs rápidas por company_info o heurísticas =====
         const faqAns = await maybeFAQ(env, ntext);
         if (faqAns) {
           await sendWhatsAppText(env, fromE164, faqAns);
@@ -210,7 +211,7 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // ===== Fallback humano =====
+        // ===== Fallback IA breve =====
         const reply = await aiSmallTalk(env, session, 'fallback', text);
         await sendWhatsAppText(env, fromE164, reply);
         await saveSession(env, session, now);
@@ -269,9 +270,9 @@ function normalizeWithAliases(s=''){
   const aliases = [
     ['verzan','versant'], ['verzand','versant'], ['versan','versant'], ['vrsant','versant'],
     ['dococolor','docucolor'], ['docucolour','docucolor'], ['docu color','docucolor'],
-    ['versalink','versalink'], ['versa link','versalink'], ['altaling','altalink'], ['alta link','altalink'],
+    ['versa link','versalink'], ['altaling','altalink'], ['alta link','altalink'],
     ['prime link','primelink'], ['prime-link','primelink'], ['prymelink','primelink'],
-    ['fujifilm','fujifilm'], ['fuji film','fujifilm'], ['docucolor 5560','docucolor 550/560/570']
+    ['fuji film','fujifilm'], ['docucolor 5560','docucolor 550/560/570']
   ];
   let out = t;
   for (const [bad, good] of aliases){
@@ -366,17 +367,40 @@ async function notifySupport(env, body) {
   await sendWhatsAppText(env, to, `🛎️ *Soporte*\n${body}`);
 }
 
+/**
+ * Extrae contexto del webhook de WA.
+ * - Soporta text
+ * - Soporta interactive.button_reply -> lo convierte a textRaw (title)
+ * - Detecta tipos no-texto para respuesta amable
+ */
 function extractWhatsAppContext(payload) {
   try {
     const value = payload?.entry?.[0]?.changes?.[0]?.value;
     const msg = value?.messages?.[0];
-    if (!msg || msg.type !== 'text') return null;
+    if (!msg) return null;
+
+    let textRaw = '';
+    let msgType = 'text';
+
+    if (msg.type === 'text') {
+      textRaw = msg.text?.body || '';
+      msgType = 'text';
+    } else if (msg.type === 'interactive' && msg.interactive?.type === 'button_reply') {
+      textRaw = msg.interactive?.button_reply?.title || msg.interactive?.button_reply?.id || '';
+      msgType = 'text'; // lo tratamos como texto
+    } else if (msg.type === 'interactive' && msg.interactive?.type === 'list_reply') {
+      textRaw = msg.interactive?.list_reply?.title || msg.interactive?.list_reply?.id || '';
+      msgType = 'text';
+    } else {
+      // cualquier otra cosa la marcamos como media/no-texto
+      msgType = 'media';
+    }
+
     const from = msg.from;
     const fromE164 = `+${from}`;
     const mid = msg.id || `${Date.now()}_${Math.random()}`;
-    const textRaw = msg.text?.body || '';
     const profileName = value?.contacts?.[0]?.profile?.name || '';
-    return { msg, from, fromE164, mid, textRaw, profileName };
+    return { msg, from, fromE164, mid, textRaw, profileName, msgType };
   } catch { return null; }
 }
 
@@ -523,7 +547,6 @@ function enrichQueryFromAI(q, ai){
 }
 
 async function handleAwaitInvoice(env, session, toE164, lowered, now, originalText='') {
-  // “No” → cerrar a idle sin saludo automático
   if (/\b(no|gracias|todo bien)\b/i.test(lowered)) {
     session.stage = 'idle';
     await saveSession(env, session, now);
@@ -649,7 +672,6 @@ function extractModelHints(text='') {
   else if (/\bapeos\b/.test(t)) out.family = 'apeos';
   else if (/\bc(60|70|75)\b/.test(t)) out.family = 'c70';
 
-  // Color
   if (/\b(amarillo|yellow)\b/.test(t)) out.color = 'yellow';
   else if (/\bmagenta\b/.test(t)) out.color = 'magenta';
   else if (/\b(cyan|cian)\b/.test(t)) out.color = 'cyan';
@@ -696,25 +718,17 @@ function productMatchesFamily(p, family){
 /* === findBestProduct: Color y Familia = filtros duros === */
 async function findBestProduct(env, queryText, opts = {}) {
   const hints = extractModelHints(queryText);
-  const strict = true; // familia siempre duro en R4
   const colorCode = hints.color || extractColorWord(queryText);
-
-  // Si IA extrae familia/color (por enrichQueryFromAI) ya vienen en queryText
 
   const pick = (arr) => {
     if (!Array.isArray(arr) || !arr.length) return null;
-
-    // Color obligatorio si lo pidieron
     let pool = colorCode ? arr.filter(p => productHasColor(p, colorCode)) : arr.slice();
-    if (!pool.length) return null;
 
-    // Familia DURA: filtra; salvo ignoreFamily explícito (compatibles aprobados)
     if (hints.family && !opts.ignoreFamily) {
       pool = pool.filter(p => productMatchesFamily(p, hints.family));
       if (!pool.length) return null;
     }
 
-    // Orden por score: stock > precio asc
     pool.sort((a,b) => {
       const sa = numberOrZero(a.stock) > 0 ? 1 : 0;
       const sb = numberOrZero(b.stock) > 0 ? 1 : 0;
@@ -731,7 +745,6 @@ async function findBestProduct(env, queryText, opts = {}) {
     if (best) return best;
   } catch {}
 
-  // Búsqueda por familia explícita (si hay)
   if (hints.family && !opts.ignoreFamily) {
     try {
       const like = encodeURIComponent(`%${hints.family}%`);
@@ -740,18 +753,16 @@ async function findBestProduct(env, queryText, opts = {}) {
       }) || [];
       const best = pick(r);
       if (best) return best;
-      return null; // familia dura → no regresamos otras familias aquí
+      return null;
     } catch {}
   }
 
-  // Búsqueda general “toner” (sin familia indicada y sin compatibles)
   if (!hints.family || opts.ignoreFamily) {
     try {
       const like = encodeURIComponent(`%toner%`);
       const r = await sbGet(env, 'producto_stock_v', {
         query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&or=(nombre.ilike.${like},sku.ilike.${like})&order=stock.desc.nullslast,precio.asc&limit=200`
       }) || [];
-      // Si ignoreFamily=true, no filtramos por familia; si no, se filtra por hints arriba
       const best = pick(r);
       if (best) return best;
     } catch {}
@@ -777,7 +788,6 @@ async function startSalesFromQuery(env, session, toE164, text, ntext, now){
   const hints = extractModelHints(enrichedQ);
 
   if (!best && hints.family) {
-    // No hay exacto de la familia pedida → ofrecer compatibles
     session.stage = 'await_compatibles';
     session.data.pending_query = enrichedQ;
     await saveSession(env, session, now);
@@ -886,9 +896,8 @@ function extractSvInfo(text) {
   if (/xerox/i.test(t)) out.marca = 'Xerox';
   else if (/fujifilm|fuji\s?film/i.test(t)) out.marca = 'Fujifilm';
 
-  // Modelo tolerante (permite fallos de usuario)
   const m = t.match(/(versant[\s-]*\d+(?:\/\d+)?|versalink\s*\w+|altalink\s*\w+|docucolor\s*[\w/]+|prime\s*link\s*\w+|primelink\s*\w+|c\d{2,4}|b\d{2,4}|\b(550|560|570|80|180|2100)\b)/i);
-  if (m) out.modelo = m[0].toUpperCase().replace(/\s+/g,' ');
+  if (m) out.modelo = (m[2] ? m[2] : m[0]).toUpperCase().replace(/\s+/g,' ');
 
   const err = t.match(/\berror\s*([0-9\-]+)\b/i);
   if (err) out.error_code = err[1];
@@ -952,13 +961,11 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       if (dt?.start) sv.when = dt;
     }
 
-    // Bienvenida empática (una sola vez)
     if (!sv._welcomed || intent?.forceWelcome) {
       sv._welcomed = true;
       await sendWhatsAppText(env, toE164, `Lamento escuchar la falla 😕. Dime por favor la *marca y el modelo* del equipo y una breve *descripción* del problema.`);
     }
 
-    // Quick help (una sola vez)
     const quick = quickHelp(ntext);
     if (quick && !sv.quick_advice_sent) {
       sv.quick_advice_sent = true;
@@ -966,13 +973,11 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     }
     sv.prioridad = sv.prioridad || (intent?.severity || (quick ? 'baja' : 'media'));
 
-    // Prefill cliente
     await preloadCustomerIfAny(env, session);
     const c = session.data.customer || {};
     if (!sv.nombre && truthy(c.nombre)) sv.nombre = c.nombre;
     if (!sv.email && truthy(c.email)) sv.email = c.email;
 
-    // Campos necesarios (orden requerido)
     const needed = [];
     if (!truthy(sv.marca) && !truthy(sv.modelo)) needed.push('modelo');
     if (!truthy(sv.falla)) needed.push('falla');
@@ -1003,7 +1008,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       return ok('EVENT_RECEIVED');
     }
 
-    // Todo listo → agendar
+    // TODO listo → agendar
     let pool = [];
     try { pool = await getCalendarPool(env) || []; } catch(e){ console.warn('[GCal] pool', e); }
     const cal = pickCalendarFromPool(pool);
@@ -1127,7 +1132,7 @@ async function maybeFAQ(env, ntext) {
     if (r && r[0]?.content) return r[0].content;
   } catch {}
   if (/\b(qu[ié]nes?\s+son|sobre\s+ustedes|qu[eé]\s+es\s+cp(\s+digital)?|h[aá]blame\s+de\s+ustedes)\b/i.test(ntext)) {
-    return '¡Hola! Somos *CP Digital*. Ayudamos a empresas con consumibles y refacciones para impresoras Xerox y Fujifilm, y brindamos visitas de soporte técnico. Cotizamos, vendemos con o sin factura y agendamos servicio en tu horario 🙂';
+    return '¡Hola! Somos *CP Digital*. Ayudamos a empresas con consumibles y refacciones para impresoras Xerox y Fujifilm, y brindamos visitas de soporte técnico. Cotizamos, vendemos con o sin factura y agendamos  visitas de soporte técnico. Cotizamos, vendemos con o sin factura y agendamos servicio en tu horario 🙂';
   }
   if (/\b(horario|horarios|a\s+qu[eé]\s+hora)\b/i.test(ntext)) {
     return 'Horario de visitas: *10:00–15:00* (lun–vie). Entregas y atención por WhatsApp todo el día.';
@@ -1147,7 +1152,7 @@ function parseNaturalDateTime(text, env) {
   const base = new Date(new Date().toLocaleString('en-US', { timeZone: tz }));
   let d = new Date(base);
   let targetDay = null;
-  const t = normalizeBase(text);
+  const t = normalizeBase(text || '');
 
   if (/\bhoy\b/i.test(t)) targetDay = 0;
   else if (/\bmañana\b/i.test(t) || /\bmanana\b/i.test(t)) targetDay = 1;
@@ -1253,7 +1258,6 @@ async function findNearestFreeSlot(env, calendarId, when, tz) {
     if (!busy) break;
     curStart = new Date(curStart.getTime()+30*60*1000);
     curEnd = new Date(curStart.getTime()+30*60*1000);
-    // si nos salimos de la ventana, mover al día hábil siguiente 10:00
     const h = curStart.getHours();
     if (h >= 15) {
       curStart.setDate(curStart.getDate()+1); curStart.setHours(10,0,0,0);
@@ -1305,14 +1309,14 @@ async function upsertClienteByPhone(env, phone) {
 /* ============================ Dirección laxa ============================ */
 function parseAddressLoose(text=''){
   const out = {};
-  const mcp = text.match(/\b(\d{5})\b/); if (mcp) out.cp = mcp[1];
-  const mnum = text.match(/\b(\d+[A-Z]?)\b/); if (mnum) out.numero = mnum[1];
+  const mcp = (text||'').match(/\b(\d{5})\b/); if (mcp) out.cp = mcp[1];
+  const mnum = (text||'').match(/\b(\d+[A-Z]?)\b/); if (mnum) out.numero = mnum[1];
   if (out.cp) {
-    const pre = text.split(out.cp)[0];
+    const pre = text.split(out.cp)[0] || '';
     const parts = pre.split(',').map(s=>s.trim()).filter(Boolean);
     if (parts.length >= 1) out.colonia = parts[parts.length-1];
   }
-  const mcalle = text.match(/([A-Za-zÁÉÍÓÚÜÑ0-9 .\-']+)\s+(\d+[A-Z]?)/i);
+  const mcalle = (text||'').match(/([A-Za-zÁÉÍÓÚÜÑ0-9 .\-']+)\s+(\d+[A-Z]?)\b/i);
   if (mcalle) out.calle = clean(mcalle[1]);
   return out;
 }
@@ -1434,10 +1438,10 @@ function ok(msg='OK'){ return new Response(msg, { status: 200 }); }
 async function safeJson(req){ try{ return await req.json(); } catch { return {}; } }
 
 function parseCustomerText(text) {
-  const out = {}, t = text;
+  const out = {}, t = text || '';
   const mName = t.match(/(?:raz[oó]n social|nombre)\s*[:\-]\s*(.+)$/i); if (mName) out.nombre = clean(mName[1]);
   const mRFC = t.match(/\b([A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3})\b/i); if (mRFC) out.rfc = mRFC[1].toUpperCase();
-  const mMail = t.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i); if (mMail) out.email = mMail[0].toLowerCase();
+  const mMail = t.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i); if (mMail) out.email = (mMail[0]||'').toLowerCase();
   const mCP = t.match(/\b(\d{5})\b/); if (mCP) out.cp = mCP[1];
   const mCalle = t.match(/\b(calle|av(enida)?|avenida|blvd|boulevard|prolongaci[oó]n|camino|andador|privada|paseo|prol\.?)\s+([^\n,]+)\b/i);
   if (mCalle) out.calle = clean(`${mCalle[3]}`);
@@ -1467,7 +1471,7 @@ function buildResumePrompt(session){
   if (st && st.startsWith('collect_')) {
     const k = st.replace('collect_','');
     return `¿${displayField(k)}?`;
-    }
+  }
   if (st === 'sv_collect') {
     const need = session?.data?.sv_need_next || 'modelo';
     const q = {
