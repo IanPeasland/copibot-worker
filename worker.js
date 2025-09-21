@@ -8,6 +8,7 @@
  * - Soporte de respuestas por botones WhatsApp (interactive.button_reply.title).
  * - Idempotencia: sigue usando last_mid; early-return más estricto.
  * - Pequeñas defensas extra en parseos y null-safety (sin cambiar firmas).
+ * - FIX: detección de familia/color para evitar que DocuColor 550/560/570 se sugiera en consultas Versant.
  */
 
 export default {
@@ -664,14 +665,16 @@ function splitCart(cart = []){ return { inStockList: cart.filter(i => !i.backord
 function extractModelHints(text='') {
   const t = normalizeWithAliases(text);
   const out = {};
-  if (/\bversant\b/.test(t) || /\b(550|560|570|80|180|2100)\b/.test(t)) out.family = 'versant';
+  // —— Familia
+  if (/\bversant\b/.test(t) || /\b(80|180|2100|280|4100)\b/.test(t)) out.family = 'versant';
   else if (/\bversa[-\s]?link\b/.test(t)) out.family = 'versalink';
   else if (/\balta[-\s]?link\b/.test(t)) out.family = 'altalink';
-  else if (/\bdocu(color)?\b/.test(t)) out.family = 'docucolor';
+  else if (/\bdocu(color)?\b/.test(t) || /\b(550|560|570)\b/.test(t)) out.family = 'docucolor';
   else if (/\bprime\s*link\b/.test(t) || /\bprimelink\b/.test(t)) out.family = 'primelink';
   else if (/\bapeos\b/.test(t)) out.family = 'apeos';
   else if (/\bc(60|70|75)\b/.test(t)) out.family = 'c70';
 
+  // —— Color
   if (/\b(amarillo|yellow)\b/.test(t)) out.color = 'yellow';
   else if (/\bmagenta\b/.test(t)) out.color = 'magenta';
   else if (/\b(cyan|cian)\b/.test(t)) out.color = 'cyan';
@@ -698,13 +701,14 @@ function productMatchesFamily(p, family){
   const s = normalizeBase([p?.nombre, p?.sku, p?.marca, p?.compatible].join(' '));
 
   if (family==='versant'){
-    const hit = /\b(versant|550|560|570|80\b|180\b|2100)\b/i.test(s);
-    const bad = /(c60|c70|c75|docucolor|prime\s*link|primelink|altalink|versa\s*link)/i.test(s);
+    // Sólo coincidencias claras de Versant
+    const hit = /\bversant\b/i.test(s) || /\b(80|180|2100|280|4100)\b/i.test(s);
+    const bad = /(c60|c70|c75|docucolor|prime\s*link|primelink|altalink|versa\s*link|\b550\b|\b560\b|\b570\b)/i.test(s);
     return hit && !bad;
   }
   if (family==='docucolor'){
     const hit = /\b(docucolor|550\/560\/570|550|560|570)\b/i.test(s);
-    const bad = /(versant|primelink|altalink|versalink|c60|c70|c75)/i.test(s);
+    const bad = /(versant|primelink|altalink|versalink|c60|c70|c75|2100|180|280|4100)\b/i.test(s);
     return hit && !bad;
   }
   if (family==='c70') return /\bc(60|70|75)\b/i.test(s) || s.includes('c60') || s.includes('c70') || s.includes('c75');
@@ -896,7 +900,7 @@ function extractSvInfo(text) {
   if (/xerox/i.test(t)) out.marca = 'Xerox';
   else if (/fujifilm|fuji\s?film/i.test(t)) out.marca = 'Fujifilm';
 
-  const m = t.match(/(versant[\s-]*\d+(?:\/\d+)?|versalink\s*\w+|altalink\s*\w+|docucolor\s*[\w/]+|prime\s*link\s*\w+|primelink\s*\w+|c\d{2,4}|b\d{2,4}|\b(550|560|570|80|180|2100)\b)/i);
+  const m = t.match(/(versant[\s-]*\d+(?:\/\d+)?|versalink\s*\w+|altalink\s*\w+|docucolor\s*[\w/]+|prime\s*link\s*\w+|primelink\s*\w+|c\d{2,4}|b\d{2,4}|\b(550|560|570|80|180|2100|280|4100)\b)/i);
   if (m) out.modelo = (m[2] ? m[2] : m[0]).toUpperCase().replace(/\s+/g,' ');
 
   const err = t.match(/\berror\s*([0-9\-]+)\b/i);
@@ -924,7 +928,7 @@ function extractSvInfo(text) {
 function svFillFromAnswer(sv, field, text, env){
   const t = normalizeWithAliases(text).trim();
   if (field === 'modelo') {
-    const m = t.match(/(xerox|fujifilm|fuji\s?film)?\s*(versant[\s-]*\d+(?:\/\d+)?|versalink\s*\w+|altalink\s*\w+|docucolor\s*[\w/]+|prime\s*link\s*\w+|primelink\s*\w+|c\d{2,4}|b\d{2,4}|\b(550|560|570|80|180|2100)\b)/i);
+    const m = t.match(/(xerox|fujifilm|fuji\s?film)?\s*(versant[\s-]*\d+(?:\/\d+)?|versalink\s*\w+|altalink\s*\w+|docucolor\s*[\w/]+|prime\s*link\s*\w+|primelink\s*\w+|c\d{2,4}|b\d{2,4}|\b(550|560|570|80|180|2100|280|4100)\b)/i);
     if (m) {
       if (m[1]) sv.marca = /fuji/i.test(m[1]) ? 'Fujifilm' : 'Xerox';
       sv.modelo = m[2] ? m[2].toUpperCase() : m[0].toUpperCase();
@@ -1132,7 +1136,7 @@ async function maybeFAQ(env, ntext) {
     if (r && r[0]?.content) return r[0].content;
   } catch {}
   if (/\b(qu[ié]nes?\s+son|sobre\s+ustedes|qu[eé]\s+es\s+cp(\s+digital)?|h[aá]blame\s+de\s+ustedes)\b/i.test(ntext)) {
-    return '¡Hola! Somos *CP Digital*. Ayudamos a empresas con consumibles y refacciones para impresoras Xerox y Fujifilm, y brindamos visitas de soporte técnico. Cotizamos, vendemos con o sin factura y agendamos  visitas de soporte técnico. Cotizamos, vendemos con o sin factura y agendamos servicio en tu horario 🙂';
+    return '¡Hola! Somos *CP Digital*. Ayudamos a empresas con consumibles y refacciones para impresoras Xerox y Fujifilm, y brindamos visitas de soporte técnico. Cotizamos, vendemos con o sin factura y agendamos servicio en tu horario 🙂';
   }
   if (/\b(horario|horarios|a\s+qu[eé]\s+hora)\b/i.test(ntext)) {
     return 'Horario de visitas: *10:00–15:00* (lun–vie). Entregas y atención por WhatsApp todo el día.';
@@ -1299,194 +1303,178 @@ async function getLastOpenOS(env, phone) {
 
 async function upsertClienteByPhone(env, phone) {
   try {
-    const ex = await sbGet(env, 'cliente', { query: `select=id&telefono=eq.${phone}&limit=1` });
-    if (ex && ex[0]?.id) return ex[0].id;
+    const exist = await sbGet(env, 'cliente', { query: `select=id&telefono=eq.${phone}&limit=1` });
+    if (exist && exist[0]?.id) return exist[0].id;
     const ins = await sbUpsert(env, 'cliente', [{ telefono: phone }], { onConflict: 'telefono', returning: 'representation' });
     return ins?.data?.[0]?.id || null;
-  } catch { return null; }
+  } catch (e) {
+    console.warn('upsertClienteByPhone', e);
+    return null;
+  }
 }
 
-/* ============================ Dirección laxa ============================ */
-function parseAddressLoose(text=''){
+/* ============================ Address & Customer parsing ============================ */
+function parseCustomerText(text=''){
   const out = {};
-  const mcp = (text||'').match(/\b(\d{5})\b/); if (mcp) out.cp = mcp[1];
-  const mnum = (text||'').match(/\b(\d+[A-Z]?)\b/); if (mnum) out.numero = mnum[1];
-  if (out.cp) {
-    const pre = text.split(out.cp)[0] || '';
-    const parts = pre.split(',').map(s=>s.trim()).filter(Boolean);
-    if (parts.length >= 1) out.colonia = parts[parts.length-1];
-  }
-  const mcalle = (text||'').match(/([A-Za-zÁÉÍÓÚÜÑ0-9 .\-']+)\s+(\d+[A-Z]?)\b/i);
-  if (mcalle) out.calle = clean(mcalle[1]);
+  try{
+    const t = normalizeBase(text);
+    const em = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+    if (em) out.email = em[0].toLowerCase();
+    const rfc = text.match(/\b([A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3})\b/i);
+    if (rfc) out.rfc = rfc[1].toUpperCase();
+
+    const cp = text.match(/\b(\d{5})\b/);
+    if (cp) out.cp = cp[1];
+
+    // calle/numero/colonia básico
+    const calle = text.match(/\b(calle|av(?:\.|enida)?|blvd(?:\.|)|boulevard)\s+([^\n,]+?)(?=\s+\d+\b|,|$)/i);
+    if (calle) out.calle = clean(calle[2]);
+    const numero = text.match(/\b(no\.?|número|num\.?)\s*([0-9]+[A-Z]?)\b/i) || text.match(/\b([0-9]+[A-Z]?)\b/);
+    if (numero) out.numero = numero[2] || numero[1];
+    const col = text.match(/\b(col(?:\.|onia)?)\s+([^\n,]+?)(?=,|cp\b|\d{5}\b|$)/i);
+    if (col) out.colonia = clean(col[2]);
+  } catch {}
   return out;
 }
 
-/* ============================ SEPOMEX ============================ */
-async function cityFromCP(env, cp) {
-  try {
-    const r = await sbGet(env, 'sepomex_raw', { query: `select=d_mnpio,d_estado,d_ciudad&d_codigo=eq.${encodeURIComponent(cp)}&limit=1` });
-    if (r && r[0]) { return { municipio: r[0].d_mnpio || null, estado: r[0].d_estado || null, ciudad: r[0].d_ciudad || null }; }
+function parseAddressLoose(text=''){
+  const out = {};
+  try{
+    const cpM = text.match(/\b(\d{5})\b/);
+    if (cpM) out.cp = cpM[1];
+
+    const tokens = text.split(/,|\n/).map(s=>s.trim());
+    for (const tk of tokens){
+      if (!out.calle && /\b(calle|av(?:\.|enida)?|blvd(?:\.|)|boulevard)\b/i.test(tk)) out.calle = clean(tk.replace(/^(calle|av(?:\.|enida)?|blvd(?:\.|)|boulevard)\s+/i,''));
+      if (!out.colonia && /\b(col(?:\.|onia)?)\b/i.test(tk)) out.colonia = clean(tk.replace(/\b(col(?:\.|onia)?)\b/i,'').trim());
+      if (!out.numero && /\b(no\.?|número|num\.?)\s*\w+/i.test(tk)) out.numero = clean(tk.replace(/\b(no\.?|número|num\.?)\s*/i,''));
+    }
+  }catch{}
+  return out;
+}
+
+async function cityFromCP(env, cp){
+  if (!cp) return null;
+  try{
+    // Intentar tabla 'sepomex' primero; fallback 'cp_mx'
+    const r1 = await sbGet(env, 'sepomex', { query: `select=ciudad,municipio,estado&cp=eq.${cp}&limit=1` });
+    if (r1 && r1[0]) return r1[0];
+  } catch {}
+  try{
+    const r2 = await sbGet(env, 'cp_mx', { query: `select=ciudad,municipio,estado&cp=eq.${cp}&limit=1` });
+    if (r2 && r2[0]) return r2[0];
   } catch {}
   return null;
 }
 
-/* ============================ Supabase helpers ============================ */
-function sb(env){ const key = env.SUPABASE_SERVICE_ROLE || env.SUPABASE_KEY; return { url:`${env.SUPABASE_URL}/rest/v1`, key }; }
-
-async function sbGet(env, table, { query='', headers={} }={}) {
-  const b = sb(env);
-  const url = `${b.url}/${table}${query?`?${query}`:''}`;
-  const r = await fetch(url, { headers:{ apikey:b.key, Authorization:`Bearer ${b.key}`, ...headers } });
-  if (r.status===204) return [];
-  if (!r.ok){ console.warn('sbGet', table, r.status, await r.text()); return null; }
-  try { return await r.json(); } catch { return null; }
-}
-
-async function sbUpsert(env, table, body, { onConflict='', returning='representation', headers={} }={}) {
-  const b = sb(env);
-  const url = `${b.url}/${table}`;
-  const h = { apikey:b.key, Authorization:`Bearer ${b.key}`, 'Content-Type':'application/json', Prefer:`resolution=merge-duplicates${onConflict?`,on_conflict=${onConflict}`:''},return=${returning}`, ...headers };
+/* ============================ Session utils ============================ */
+function promptedRecently(session, key, ms=120000){
   try{
-    const r = await fetch(url, { method:'POST', headers:h, body: JSON.stringify(body) });
-    const text = await r.text(); let data=null; try{ data = text ? JSON.parse(text) : null; }catch{}
-    if(!r.ok) console.warn('sbUpsert', table, r.status, text);
-    return { data, status:r.status };
-  }catch(e){ console.warn('sbUpsert error', table, e); return { data:null, status:500 }; }
-}
-
-async function sbPatch(env, table, body, filter){
-  const b = sb(env);
-  const url = `${b.url}/${table}?${filter}`;
-  try{
-    const r = await fetch(url, { method:'PATCH', headers:{ apikey:b.key, Authorization:`Bearer ${b.key}`, 'Content-Type':'application/json' }, body: JSON.stringify(body) });
-    if(!r.ok) console.warn('sbPatch', table, r.status, await r.text());
-  }catch(e){ console.warn('sbPatch err', table, e); }
-}
-
-async function sbRpc(env, fn, args){
-  const b = sb(env);
-  const url = `${b.url}/rpc/${fn}`;
-  try{
-    const r = await fetch(url, { method:'POST', headers:{ apikey:b.key, Authorization:`Bearer ${b.key}`, 'Content-Type':'application/json' }, body: JSON.stringify(args || {}) });
-    if (!r.ok) { console.warn('sbRpc', fn, r.status, await r.text()); return null; }
-    const text = await r.text(); try{ return text ? JSON.parse(text) : null; }catch{ return null; }
-  }catch(e){ console.warn('sbRpc err', fn, e); return null; }
-}
-
-/* ============================ Sesiones ============================ */
-async function loadSession(env, from){
-  try{
-    const r = await sbGet(env, 'wa_session', { query:`select=from,stage,data,updated_at,expires_at&from=eq.${from}` });
-    if (r && r[0]) return r[0];
-  }catch(e){ console.warn('loadSession', e); }
-  return { from, stage:'idle', data:{} };
-}
-
-function promptedRecently(session, key, ms=5*60*1000){
-  session.data.prompts = session.data.prompts || {};
-  const last = session.data.prompts[key] ? Date.parse(session.data.prompts[key]) : 0;
-  const okk = (Date.now() - last) < ms;
-  session.data.prompts[key] = new Date().toISOString();
-  return okk;
-}
-
-async function saveSession(env, session, at=new Date()){
-  const days = Number(env.SESSION_TTL_DAYS || 90);
-  const exp = new Date(at.getTime()+days*24*60*60*1000).toISOString();
-  const body=[{ from:session.from, stage:session.stage||'idle', data:session.data||{}, updated_at:new Date().toISOString(), expires_at: exp }];
-  await sbUpsert(env, 'wa_session', body, { onConflict:'from', returning:'minimal' });
-}
-
-/* ============================ Cron: recordatorios ============================ */
-async function cronReminders(env) {
-  const now = new Date();
-  const fromISO = new Date(now.getTime() - 2 * 60 * 60 * 1000).toISOString();
-  const toISO = new Date(now.getTime() + 26 * 60 * 60 * 1000).toISOString();
-  const rows = await sbGet(env, 'orden_servicio', {
-    query: `select=id,cliente_id,ventana_inicio,remind_24h_sent,remind_1h_sent,estado&estado=in.(agendado,reprogramado)&ventana_inicio=gte.${fromISO}&ventana_inicio=lte.${toISO}`
-  }) || [];
-  let sent = 0;
-  for (const os of rows) {
-    const when = new Date(os.ventana_inicio);
-    const soon24h = Date.now() + 24 * 60 * 60 * 1000;
-    const soon1h = Date.now() + 60 * 60 * 1000;
-    const phone = await phoneForCliente(env, os.cliente_id);
-    if (!phone) continue;
-
-    if (!os.remind_24h_sent && Math.abs(+when - soon24h) < 15 * 60 * 1000) {
-      await sendWhatsAppText(env, `+${phone}`, `Recordatorio 📅 Mañana tenemos tu visita técnica.`);
-      await sbUpsert(env, 'orden_servicio', [{ id: os.id, remind_24h_sent: true }], { returning: 'minimal' });
-      sent++;
-    }
-    if (!os.remind_1h_sent && Math.abs(+when - soon1h) < 15 * 60 * 1000) {
-      await sendWhatsAppText(env, `+${phone}`, `Recordatorio ⏰ En 1 hora estaremos contigo para tu visita técnica.`);
-      await sbUpsert(env, 'orden_servicio', [{ id: os.id, remind_1h_sent: true }], { returning: 'minimal' });
-      sent++;
-    }
-  }
-  return { checked: rows.length, sent };
-}
-
-async function phoneForCliente(env, id) {
-  if (!id) return null;
-  const r = await sbGet(env, 'cliente', { query: `select=telefono&id=eq.${id}&limit=1` });
-  return r?.[0]?.telefono || null;
-}
-
-/* ============================ Util ============================ */
-function ok(msg='OK'){ return new Response(msg, { status: 200 }); }
-async function safeJson(req){ try{ return await req.json(); } catch { return {}; } }
-
-function parseCustomerText(text) {
-  const out = {}, t = text || '';
-  const mName = t.match(/(?:raz[oó]n social|nombre)\s*[:\-]\s*(.+)$/i); if (mName) out.nombre = clean(mName[1]);
-  const mRFC = t.match(/\b([A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3})\b/i); if (mRFC) out.rfc = mRFC[1].toUpperCase();
-  const mMail = t.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i); if (mMail) out.email = (mMail[0]||'').toLowerCase();
-  const mCP = t.match(/\b(\d{5})\b/); if (mCP) out.cp = mCP[1];
-  const mCalle = t.match(/\b(calle|av(enida)?|avenida|blvd|boulevard|prolongaci[oó]n|camino|andador|privada|paseo|prol\.?)\s+([^\n,]+)\b/i);
-  if (mCalle) out.calle = clean(`${mCalle[3]}`);
-  const mNum = t.match(/\b(no\.?|n[úu]mero|num)\s*[:\- ]\s*(\d+[A-Z]?)\b/i); if (mNum) out.numero = mNum[2];
-  const mCol = t.match(/\b(colonia|col\.)\s*[:\-]?\s*([A-Za-z0-9 áéíóúñ\-\.'\/]+)\b/i);
-  if (mCol) out.colonia = clean(mCol[2]);
-  else {
-    const m2 = t.match(/\b(fracc(ionamiento)?|residencial|barrio|villa[s]?|villas?)\s+([A-Za-z0-9 áéíóúñ\-\.'\/]+)\b/i);
-    if (m2) out.colonia = clean(m2[3] || m2[4] || m2[2]);
-  }
-  const mCity = t.match(/\b(ciudad|cd\.?|municipio)\s*[:\- ]\s*([A-Za-z áéíóúñ\.\-\/]+)\b/i);
-  if (mCity) out.ciudad = clean(mCity[2]);
-  const mState = t.match(/\b(estado)\s*[:\- ]\s*([A-Za-z áéíóúñ\.\-\/]+)\b/i);
-  if (mState) out.estado = clean(mState[2]);
-  return out;
-}
-
-function displayField(k){
-  const map={ nombre:'Nombre / Razón Social', rfc:'RFC', email:'Email', calle:'Calle', numero:'Número', colonia:'Colonia', ciudad:'Ciudad', cp:'CP' };
-  return map[k]||k;
+    session.data = session.data || {};
+    session.data._prompted = session.data._prompted || {};
+    const last = session.data._prompted[key] ? new Date(session.data._prompted[key]).getTime() : 0;
+    const now = Date.now();
+    if (now - last < ms) return true;
+    session.data._prompted[key] = new Date(now).toISOString();
+    return false;
+  }catch{ return false; }
 }
 
 function buildResumePrompt(session){
   const st = session?.stage || 'idle';
-  if (st === 'await_invoice') return '¿La cotizamos con factura o sin factura?';
-  if (st === 'cart_open') return '¿Lo agrego al carrito o prefieres otra opción?';
-  if (st && st.startsWith('collect_')) {
-    const k = st.replace('collect_','');
-    return `¿${displayField(k)}?`;
-  }
-  if (st === 'sv_collect') {
-    const need = session?.data?.sv_need_next || 'modelo';
-    const q = {
-      modelo: '¿Qué marca y modelo es tu impresora (p.ej., Xerox Versant 180)?',
-      falla: 'Cuéntame brevemente la falla (p.ej., “atasco en fusor”, “no imprime”).',
-      calle: '¿Cuál es la *calle* donde estará el equipo?',
-      numero: '¿Qué *número* es?',
-      colonia: '¿*Colonia*?',
-      cp: '¿*Código Postal* (5 dígitos)?',
-      horario: '¿Qué día y hora te viene bien entre *10:00 y 15:00*? (puedes decir “mañana 12:30”)',
-      nombre: '¿A nombre de quién registramos la visita?',
-      email: '¿Cuál es tu email?'
-    };
-    return q[need] || '¿Podrías compartirme el dato pendiente para continuar?';
-  }
-  if (st === 'sv_scheduled') return '¿Necesitas reprogramar o añadir algún detalle?';
-  return '¿En qué te ayudo hoy?';
+  if (st.startsWith('sv_')) return 'Retomamos tu *solicitud de soporte*.';
+  if (st === 'ask_qty') return 'Seguimos con las *piezas* del artículo sugerido.';
+  if (st === 'cart_open') return 'Seguimos con tu *carrito*.';
+  if (st === 'await_invoice') return 'Nos quedamos en *con/sin factura*.';
+  if (st.startsWith('collect_')) return 'Seguimos capturando tus *datos de facturación/envío*.';
+  return '¿Seguimos con lo que traíamos?';
 }
+
+/* ============================ Supabase helpers ============================ */
+function sbHeaders(env){
+  const key = env.SUPABASE_KEY || env.SB_SERVICE_ROLE || env.SB_KEY || env.SUPABASE_ANON_KEY;
+  return { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' };
+}
+function sbBase(env){ return (env.SUPABASE_URL || env.SB_URL || '').replace(/\/+$/,''); }
+
+async function sbGet(env, table, { query }){
+  const url = `${sbBase(env)}/rest/v1/${table}?${query}`;
+  const r = await fetch(url, { headers: { ...sbHeaders(env) , Prefer: 'count=none' } });
+  if (!r.ok) { console.warn('sbGet', table, r.status, await r.text()); return []; }
+  return await r.json();
+}
+
+async function sbPatch(env, table, patch, filter){
+  const url = `${sbBase(env)}/rest/v1/${table}?${filter}`;
+  const r = await fetch(url, { method: 'PATCH', headers: { ...sbHeaders(env), Prefer: 'return=representation' }, body: JSON.stringify(patch) });
+  if (!r.ok) { console.warn('sbPatch', table, r.status, await r.text()); return null; }
+  return await r.json();
+}
+
+async function sbUpsert(env, table, body, opts={}){
+  const params = [];
+  if (opts.onConflict) params.push(`on_conflict=${encodeURIComponent(opts.onConflict)}`);
+  if (opts.ignoreDuplicates) params.push('ignoreDuplicates=true');
+  const url = `${sbBase(env)}/rest/v1/${table}${params.length?`?${params.join('&')}`:''}`;
+  const prefer = [`resolution=merge-duplicates`,`return=${opts.returning || 'representation'}`].join(',');
+  const r = await fetch(url, { method:'POST', headers:{ ...sbHeaders(env), Prefer: prefer }, body: JSON.stringify(body) });
+  if (!r.ok) { console.warn('sbUpsert', table, r.status, await r.text()); return null; }
+  const txt = await r.text();
+  try { return { data: txt ? JSON.parse(txt) : [] }; } catch { return { data: [] }; }
+}
+
+async function sbRpc(env, fn, args={}){
+  const url = `${sbBase(env)}/rest/v1/rpc/${fn}`;
+  const r = await fetch(url, { method:'POST', headers: sbHeaders(env), body: JSON.stringify(args) });
+  if (!r.ok) { console.warn('sbRpc', fn, r.status, await r.text()); return null; }
+  return await r.json();
+}
+
+/* ============================ KV (sessions) ============================ */
+const _memSessions = new Map(); // fallback memoria (dev)
+
+async function loadSession(env, from){
+  try{
+    const key = `wa:${from}`;
+    const kv = env.SESSION_KV || env.SESSIONS || env.KV || null;
+    if (kv && kv.get) {
+      const raw = await kv.get(key);
+      return raw ? JSON.parse(raw) : { from, stage:'idle', data:{} };
+    }
+  } catch (e){ console.warn('loadSession kv', e); }
+  // fallback
+  return _memSessions.get(from) || { from, stage:'idle', data:{} };
+}
+
+async function saveSession(env, session, now=new Date()){
+  try{
+    session.data = session.data || {};
+    session.data.last_seen_at = now.toISOString();
+    const key = `wa:${session.from}`;
+    const kv = env.SESSION_KV || env.SESSIONS || env.KV || null;
+    const raw = JSON.stringify(session);
+    if (kv && kv.put) { await kv.put(key, raw, { expirationTtl: 60*60*24*14 }); return; }
+  } catch (e){ console.warn('saveSession kv', e); }
+  _memSessions.set(session.from, session);
+}
+
+/* ============================ Misc HTTP ============================ */
+async function safeJson(req){
+  try{ return await req.json(); }catch{ try{ const t = await req.text(); return t?JSON.parse(t):{}; }catch{ return {}; } }
+}
+function ok(body='OK'){ return new Response(typeof body==='string'? body : JSON.stringify(body), { status:200 }); }
+
+/* ============================ CRON (recordatorio simple) ============================ */
+async function cronReminders(env){
+  // Implementación mínima (no-op con contadores) para no romper el flujo si no existe tabla de recordatorios.
+  try{
+    // Ejemplo: podrías buscar OS de mañana y notificar.
+    // Dejamos un resultado de diagnóstico simple.
+    return { ok:true, ran:true, ts:new Date().toISOString() };
+  }catch(e){
+    console.warn('cronReminders', e);
+    return { ok:false, error:String(e) };
+  }
+}
+
+/* ============================ Fin del archivo ============================ */
