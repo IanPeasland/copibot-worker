@@ -1,12 +1,11 @@
 /**
  * CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
- * Sep/2025 – build “Borbón-R5.2”
+ * Sep/2025 – build “Borbón-R5.3”
  *
- * Cambios R5.2:
- * - Cortafuegos soporte más estricto: si stage sv_* o sv_need_next → siempre soporte.
- * - Persistencia de intención: last_intent='support' mientras dure el flujo.
- * - Heurística de soporte por marca/modelo/familia + no-inventario.
- * - Sigue fix: DocuColor 550/560/570 no se confunde con Versant. Sin stock muestra “sobre pedido”.
+ * Cambios R5.3:
+ * - Nuevo parser robusto parseBrandModel() para marca+modelo (tolerante a frases naturales).
+ * - En soporte, pedir “modelo” cuando falte cualquiera de los dos (marca o modelo).
+ * - Se mantiene cortafuegos soporte y fixes Versant vs DocuColor.
  */
 
 export default {
@@ -14,7 +13,6 @@ export default {
     try {
       const url = new URL(req.url);
 
-      // Webhook verify (Meta/WhatsApp)
       if (req.method === 'GET' && url.pathname === '/') {
         const mode = url.searchParams.get('hub.mode');
         const token = url.searchParams.get('hub.verify_token');
@@ -25,7 +23,6 @@ export default {
         return new Response('Forbidden', { status: 403 });
       }
 
-      // Cron endpoint manual
       if (req.method === 'POST' && url.pathname === '/cron') {
         const sec = req.headers.get('x-cron-secret') || url.searchParams.get('secret');
         if (!sec || sec !== env.CRON_SECRET) return new Response('Forbidden', { status: 403 });
@@ -33,7 +30,6 @@ export default {
         return ok(`cron ok ${JSON.stringify(out)}`);
       }
 
-      // WhatsApp webhook
       if (req.method === 'POST' && url.pathname === '/') {
         const payload = await safeJson(req);
         const ctx = extractWhatsAppContext(payload);
@@ -44,24 +40,20 @@ export default {
         const lowered = text.toLowerCase();
         const ntext = normalizeWithAliases(text);
 
-        // ===== Session =====
         const now = new Date();
         let session = await loadSession(env, from);
         session.data = session.data || {};
         session.stage = session.stage || 'idle';
         session.from = from;
 
-        // Prefill nombre
         if (profileName && !session?.data?.customer?.nombre) {
           session.data.customer = session.data.customer || {};
           session.data.customer.nombre = toTitleCase(firstWord(profileName));
         }
 
-        // Idempotencia
         if (session?.data?.last_mid && session.data.last_mid === mid) return ok('EVENT_RECEIVED');
         session.data.last_mid = mid;
 
-        // No-texto → amable
         if (msgType !== 'text') {
           if (['media','location','contacts','sticker','document'].includes(msgType)) {
             await sendWhatsAppText(env, fromE164, `¿Podrías escribirme con palabras lo que necesitas? Así te ayudo más rápido 🙂`);
@@ -70,7 +62,7 @@ export default {
           }
         }
 
-        // ===== CORTAFUEGOS SOPORTE (antes de cualquier cosa)
+        // ===== Cortafuegos soporte (muy temprano)
         const mustGoSupport =
           session.stage?.startsWith('sv_') ||
           !!session.data?.sv_need_next ||
@@ -80,11 +72,10 @@ export default {
         if (mustGoSupport) {
           session.data.last_intent = 'support';
           await saveSession(env, session, now);
-          const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support' });
-          return handled;
+          return await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support' });
         }
 
-        // ===== Comandos universales (soporte)
+        // ===== Comandos soporte rápidos
         if (/\b(cancel(a|ar).*(cita|visita|servicio))\b/i.test(lowered)) {
           await svCancel(env, session, fromE164);
           await saveSession(env, session, now);
@@ -104,7 +95,7 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // ===== Intents (fallbacks)
+        // ===== Intents
         const supportIntent = isSupportIntent(ntext) || (await intentIs(env, text, 'support'));
         const salesIntent = RX_INV_Q.test(ntext) || (await intentIs(env, text, 'sales'));
 
@@ -113,11 +104,9 @@ export default {
         if (isGreet) {
           if (session?.data?.last_candidate) delete session.data.last_candidate;
           if (session?.data?.pending_query) delete session.data.pending_query;
-
           const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
           await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
           session.data.last_greet_at = now.toISOString();
-
           if (session.stage !== 'idle') {
             session.data.last_stage = session.stage;
             session.stage = 'await_choice';
@@ -128,7 +117,7 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // ===== Continuar/Empezar nuevo
+        // ===== Continuar / nuevo
         if (session.stage === 'await_choice') {
           if (supportIntent) {
             session.data.last_intent = 'support';
@@ -160,12 +149,11 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // ===== Cambio de intención (prioridad soporte)
+        // ===== Cambio a soporte
         if (supportIntent) {
           session.data.last_intent = 'support';
           await saveSession(env, session, now);
-          const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support' });
-          return handled;
+          return await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support' });
         }
 
         // ===== Ventas
@@ -176,11 +164,10 @@ export default {
             session.stage = 'idle';
             await saveSession(env, session, now);
           }
-          const handled = await startSalesFromQuery(env, session, fromE164, text, ntext, now);
-          return handled;
+          return await startSalesFromQuery(env, session, fromE164, text, ntext, now);
         }
 
-        // ===== Stages ventas
+        // ===== Stages – ventas
         if (session.stage === 'ask_qty') return await handleAskQty(env, session, fromE164, text, lowered, ntext, now);
         if (session.stage === 'cart_open') return await handleCartOpen(env, session, fromE164, text, lowered, ntext, now);
         if (session.stage === 'await_invoice') return await handleAwaitInvoice(env, session, fromE164, lowered, now, text);
@@ -194,7 +181,7 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // ===== Fallback IA breve
+        // ===== Fallback
         const reply = await aiSmallTalk(env, session, 'fallback', text);
         await sendWhatsAppText(env, fromE164, reply);
         await saveSession(env, session, now);
@@ -225,7 +212,7 @@ const RX_INV_Q = /(toner|t[óo]ner|cartucho|developer|refacci[oó]n|precio|docuc
 function isContinueish(t){ return /\b(continuar|continuemos|seguir|retomar|reanudar|continuo|contin[uú]o)\b/i.test(t); }
 function isStartNewish(t){ return /\b(empezar|nuevo|desde cero|otra cosa|otro|iniciar|empecemos)\b/i.test(t); }
 
-/** Intent soporte determinista */
+/** Soporte determinista */
 function isSupportIntent(ntext='') {
   const t = `${ntext}`;
   const hasProblem = /(falla(?:ndo)?|fallo|problema|descompuest[oa]|no imprime|no escanea|no copia|no prende|no enciende|se apaga|error|atasc|ator(?:a|o|e|ando|ada|ado)|atasco|se traba|mancha|l[ií]nea|linea|calidad|ruido|marca c[oó]digo|c[oó]digo)/.test(t);
@@ -280,18 +267,15 @@ function formatMoneyMXN(n){
 function numberOrZero(n){ const v=Number(n||0); return Number.isFinite(v)?v:0; }
 function priceWithIVA(n){ const v=Number(n||0); return `${formatMoneyMXN(v)} + IVA`; }
 
-/* ===== Heurísticas extra para separar soporte vs inventario ===== */
+/* ===== Heurísticas soporte vs inventario ===== */
 function looksLikeInventoryRequest(t){
-  // señales de venta: color, "precio", "toner/cartucho/developer", etc.
   return /\b(toner|t[óo]ner|cartucho|developer|precio|amarillo|magenta|cyan|cian|negro|black|yellow|bk|k)\b/i.test(t);
 }
 function looksLikeBrandOrModel(t){
   return /\b(xerox|fujifilm|fuji\s?film|versant|altalink|versalink|primelink|docucolor|c\d{2,4}|b\d{2,4}|550|560|570|80|180|2100|280|4100)\b/i.test(t);
 }
 function detectSupportHeuristic(t){
-  // Marca/modelo/familia presente y NO pinta a inventario → soporte
   if (looksLikeBrandOrModel(t) && !looksLikeInventoryRequest(t)) return true;
-  // Frases con "mi/la impresora" sin palabras de precio/color → soporte
   if (/\b(impresora|equipo|copiadora)\b/i.test(t) && !looksLikeInventoryRequest(t)) return true;
   return false;
 }
@@ -316,11 +300,8 @@ async function aiSmallTalk(env, session, mode='general', userText=''){
   const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
   const sys = `Eres CopiBot de CP Digital (es-MX). Responde con calidez humana, breve y claro. Máx. 1 emoji. Evita listas salvo necesidad.`;
   let prompt = '';
-  if (mode === 'fallback') {
-    prompt = `El usuario dijo: """${userText}""". Responde breve, útil y amable. Si no hay contexto, ofrece inventario o soporte.`;
-  } else {
-    prompt = `El usuario dijo: """${userText}""". Responde breve y amable.`;
-  }
+  if (mode === 'fallback') prompt = `El usuario dijo: """${userText}""". Responde breve, útil y amable. Si no hay contexto, ofrece inventario o soporte.`;
+  else prompt = `El usuario dijo: """${userText}""". Responde breve y amable.`;
   const out = await aiCall(env, [{role:'system', content: sys}, {role:'user', content: prompt}], {});
   return out || (`Hola${nombre?`, ${nombre}`:''} 👋 ¿En qué te puedo ayudar?`);
 }
@@ -459,9 +440,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
   const cart = session.data.cart || [];
 
   if (RX_DONE.test(lowered) || (RX_NEG_NO.test(lowered) && cart.length > 0)) {
-    if (!cart.length && session.data.last_candidate) {
-      addWithStockSplit(session, session.data.last_candidate, 1);
-    }
+    if (!cart.length && session.data.last_candidate) addWithStockSplit(session, session.data.last_candidate, 1);
     session.stage = 'await_invoice';
     await saveSession(env, session, now);
     await sendWhatsAppText(env, toE164, `Perfecto 🙌 ¿La cotizamos *con factura* o *sin factura*?`);
@@ -706,7 +685,6 @@ function productMatchesFamily(p, family){
   return s.includes(family);
 }
 
-/* === findBestProduct === */
 async function findBestProduct(env, queryText, opts = {}) {
   const hints = extractModelHints(queryText);
   const colorCode = hints.color || extractColorWord(queryText);
@@ -809,9 +787,7 @@ async function startSalesFromQuery(env, session, toE164, text, ntext, now){
 async function preloadCustomerIfAny(env, session){
   try{
     const r = await sbGet(env, 'cliente', { query: `select=nombre,rfc,email,calle,numero,colonia,ciudad,estado,cp&telefono=eq.${session.from}&limit=1` });
-    if (r && r[0]) {
-      session.data.customer = { ...(session.data.customer||{}), ...r[0] };
-    }
+    if (r && r[0]) session.data.customer = { ...(session.data.customer||{}), ...r[0] };
   }catch(e){ console.warn('preloadCustomerIfAny', e); }
 }
 
@@ -861,7 +837,6 @@ async function createOrderFromSession(env, session, toE164) {
     }));
     await sbUpsert(env, 'pedido_item', items, { returning: 'minimal' });
 
-    // decrementar stock
     for (const it of cart) {
       const sku = it.product?.sku;
       if (!sku) continue;
@@ -881,14 +856,53 @@ async function createOrderFromSession(env, session, toE164) {
 }
 
 /* ============================ SOPORTE ============================ */
+
+/** Parser robusto para marca+modelo desde texto libre */
+function parseBrandModel(text=''){
+  const t = normalizeWithAliases(text);
+
+  let marca = null;
+  if (/\bxerox\b/i.test(t)) marca = 'Xerox';
+  else if (/\bfujifilm|fuji\s?film\b/i.test(t)) marca = 'Fujifilm';
+
+  // Normaliza espacios múltiples
+  const norm = t.replace(/\s+/g,' ').trim();
+
+  // 1) DocuColor 550/560/570
+  const mDocu = norm.match(/\bdocu ?color\s*(550|560|570)\b/i);
+  if (mDocu) return { marca: marca || 'Xerox', modelo: `DOCUCOLOR ${mDocu[1]}` };
+
+  // 2) Versant 80/180/2100/280/4100
+  const mVers = norm.match(/\bversant\s*(80|180|2100|280|4100)\b/i);
+  if (mVers) return { marca: marca || 'Xerox', modelo: `VERSANT ${mVers[1]}` };
+
+  // 3) VersaLink / AltaLink / PrimeLink + sufijo
+  const mVL = norm.match(/\b(versalink|versa ?link)\s*([a-z0-9\-]+)\b/i);
+  if (mVL) return { marca: marca || 'Xerox', modelo: `${mVL[1].replace(/\s/,'').toUpperCase()} ${mVL[2].toUpperCase()}` };
+
+  const mAL = norm.match(/\b(altalink|alta ?link)\s*([a-z0-9\-]+)\b/i);
+  if (mAL) return { marca: marca || 'Xerox', modelo: `${mAL[1].replace(/\s/,'').toUpperCase()} ${mAL[2].toUpperCase()}` };
+
+  const mPL = norm.match(/\b(primelink|prime ?link)\s*([a-z0-9\-]+)\b/i);
+  if (mPL) return { marca: marca || 'Xerox', modelo: `${mPL[1].replace(/\s/,'').toUpperCase()} ${mPL[2].toUpperCase()}` };
+
+  // 4) Series C/B (C60/C70/C75, Bxxx/Cxxx)
+  const mSeries = norm.match(/\b([cb]\d{2,4})\b/i);
+  if (mSeries) return { marca, modelo: mSeries[1].toUpperCase() };
+
+  // 5) Solo números claves si hay familia cerca (ej: “docucolor 550” ya cubierto; “versant 180” ya cubierto)
+  // 6) Si dijo “Xerox 550” y hay palabra docucolor implícita? No asumimos familia.
+  return { marca, modelo: null };
+}
+
 function extractSvInfo(text) {
   const t = normalizeWithAliases(text);
   const out = {};
-  if (/xerox/i.test(t)) out.marca = 'Xerox';
-  else if (/fujifilm|fuji\s?film/i.test(t)) out.marca = 'Fujifilm';
 
-  const m = t.match(/(versant[\s-]*\d+(?:\/\d+)?|versalink\s*\w+|altalink\s*\w+|docucolor\s*[\w/]+|prime\s*link\s*\w+|primelink\s*\w+|c\d{2,4}|b\d{2,4}|\b(550|560|570|80|180|2100|280|4100)\b)/i);
-  if (m) out.modelo = (m[2] ? m[2] : m[0]).toUpperCase().replace(/\s+/g,' ');
+  // Marca + modelo con parser robusto
+  const pm = parseBrandModel(text);
+  if (pm.marca) out.marca = pm.marca;
+  if (pm.modelo) out.modelo = pm.modelo;
 
   const err = t.match(/\berror\s*([0-9\-]+)\b/i);
   if (err) out.error_code = err[1];
@@ -913,15 +927,12 @@ function extractSvInfo(text) {
 }
 
 function svFillFromAnswer(sv, field, text, env){
+  const pm = parseBrandModel(text);
   const t = normalizeWithAliases(text).trim();
   if (field === 'modelo') {
-    const m = t.match(/(xerox|fujifilm|fuji\s?film)?\s*(versant[\s-]*\d+(?:\/\d+)?|versalink\s*\w+|altalink\s*\w+|docucolor\s*[\w/]+|prime\s*link\s*\w+|primelink\s*\w+|c\d{2,4}|b\d{2,4}|\b(550|560|570|80|180|2100|280|4100)\b)/i);
-    if (m) {
-      if (m[1]) sv.marca = /fuji/i.test(m[1]) ? 'Fujifilm' : 'Xerox';
-      sv.modelo = m[2] ? m[2].toUpperCase() : m[0].toUpperCase();
-    } else {
-      sv.modelo = clean(text);
-    }
+    if (pm.marca) sv.marca = pm.marca;
+    if (pm.modelo) sv.modelo = pm.modelo;
+    if (!pm.modelo) sv.modelo = clean(text); // fallback
     return;
   }
   if (field === 'falla') { sv.falla = clean(text); return; }
@@ -971,7 +982,8 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     if (!sv.email && truthy(c.email)) sv.email = c.email;
 
     const needed = [];
-    if (!truthy(sv.marca) && !truthy(sv.modelo)) needed.push('modelo');
+    // CAMBIO: si falta marca O falta modelo → pedir "modelo"
+    if (!truthy(sv.marca) || !truthy(sv.modelo)) needed.push('modelo');
     if (!truthy(sv.falla)) needed.push('falla');
     if (!truthy(sv.calle)) needed.push('calle');
     if (!truthy(sv.numero)) needed.push('numero');
@@ -1023,7 +1035,6 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       } catch (e) { console.warn('[GCal] create error', e); }
     }
 
-    // Crear OS
     let osId = null; let estado = event ? 'agendado' : 'pendiente';
     try {
       const osBody = [{
