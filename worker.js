@@ -1,13 +1,16 @@
 /**
  * CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
- * Sep/2025 – build “Borbón-R5” (full)
+ * Sep/2025 – build “Borbón-R5”
  *
- * Cambios recientes:
- * - Fix: DocuColor 550/560/570 ya NO se confunden con Versant.
- * - Fix: Si el match existe con stock 0, se muestra igual y se ofrece “sobre pedido” (no saltar a compatibles).
- * - Fix: Cuando el usuario está en soporte o escribe “marca + modelo” (p. ej. “xerox docucolor 550”),
- *        se fuerza flujo de SOPORTE y NO se dispara ventas.
- * - Robustecidos parsers y null-safety.
+ * R5 sobre R4:
+ * - Manejo de mensajes NO-TEXTO (audio, imagen, document, sticker, contacts, location):
+ *   · Respuesta amable pidiendo texto y no rompe el flujo.
+ * - Soporte de respuestas por botones WhatsApp (interactive.button_reply.title).
+ * - Idempotencia: sigue usando last_mid; early-return más estricto.
+ * - Pequeñas defensas extra en parseos y null-safety (sin cambiar firmas).
+ * - FIX inventario: DocuColor 550/560/570 ya no se sugiere en consultas Versant.
+ * - FIX inventario: si hay match sin stock, se muestra igual y se indica “0 pzas — sobre pedido”.
+ * - FIX soporte: si la sesión está en sv_*, se fuerza flujo de soporte (no ventas).
  */
 
 export default {
@@ -60,18 +63,27 @@ export default {
         if (session?.data?.last_mid && session.data.last_mid === mid) return ok('EVENT_RECEIVED');
         session.data.last_mid = mid;
 
-        // Mensajes NO-TEXTO → pedir texto y salir (no rompemos flujo)
+        // Mensajes NO-TEXTO → pedir texto amable y salir (no rompemos flujo)
         if (msgType !== 'text') {
-          if (msgType === 'media' || msgType === 'location' || msgType === 'contacts' || msgType === 'sticker' || msgType === 'document') {
+          // Permitimos botones (interactive.* ya se mapea a textRaw en extractWhatsAppContext).
+          if (['media','location','contacts','sticker','document'].includes(msgType)) {
             await sendWhatsAppText(env, fromE164, `¿Podrías escribirme con palabras lo que necesitas? Así te ayudo más rápido 🙂`);
             await saveSession(env, session, now);
             return ok('EVENT_RECEIVED');
           }
         }
 
+        // ===== Cortafuegos de soporte (si ya estoy en flujo sv_*) =====
+        const lowered0 = text.toLowerCase();
+        const ntext0 = normalizeWithAliases(text);
+        if (session.stage?.startsWith('sv_')) {
+          const handled = await handleSupport(env, session, fromE164, text, lowered0, ntext0, now, { intent: 'support' });
+          return handled;
+        }
+
         // Normalización+alias
-        const lowered = text.toLowerCase();
-        const ntext = normalizeWithAliases(text);
+        const lowered = lowered0;
+        const ntext = ntext0;
 
         // ===== Comandos universales (soporte) =====
         if (/\b(cancel(a|ar).*(cita|visita|servicio))\b/i.test(lowered)) {
@@ -94,12 +106,8 @@ export default {
         }
 
         // ===== Intentos globales =====
-        const supportLike = isSupportIntent(ntext) || looksLikeMakeModel(ntext); // <-- fuerza soporte si parece marca+modelo
-        const supportIntent = supportLike || (await intentIs(env, text, 'support'));
-
-        // ventas solo si NO estamos en soporte ni en modo sv_*
-        const allowedSales = !supportLike && !String(session.stage || '').startsWith('sv_');
-        const salesIntent = allowedSales && (RX_INV_Q.test(ntext) || (await intentIs(env, text, 'sales')));
+        const supportIntent = isSupportIntent(ntext) || (await intentIs(env, text, 'support'));
+        const salesIntent = RX_INV_Q.test(ntext) || (await intentIs(env, text, 'sales'));
 
         // ===== Saludo =====
         const isGreet = RX_GREET.test(lowered);
@@ -152,37 +160,8 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // ===== Compatibles (aprobación) =====
-        if (session.stage === 'await_compatibles') {
-          if (isYesish(lowered)) {
-            const q = session.data?.pending_query || ntext || lowered;
-            const bestCompat = await findBestProduct(env, q, { ignoreFamily: true });
-            session.stage = 'ask_qty';
-            session.data.last_candidate = bestCompat || null;
-            await saveSession(env, session, now);
-            if (bestCompat) {
-              const s = numberOrZero(bestCompat.stock);
-              await sendWhatsAppText(env, fromE164, `${renderProducto(bestCompat)}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; hay ${s} en stock y el resto sería *sobre pedido*.`);
-            } else {
-              await sendWhatsAppText(env, fromE164, `No veo compatibles claros ahora mismo. Si gustas, lo revisa un asesor.`);
-              await notifySupport(env, `Compatibles sin match. +${session.from}: ${q}`);
-              session.stage = 'idle';
-              await saveSession(env, session, now);
-            }
-            return ok('EVENT_RECEIVED');
-          } else if (isNoish(lowered)) {
-            session.stage = 'idle';
-            await saveSession(env, session, now);
-            await sendWhatsAppText(env, fromE164, `De acuerdo. Si te parece, puedo dejarlo *sobre pedido* o buscamos otro artículo.`);
-            return ok('EVENT_RECEIVED');
-          } else {
-            await sendWhatsAppText(env, fromE164, `¿Quieres que te muestre *compatibles* de otra línea? (Sí/No)`);
-            return ok('EVENT_RECEIVED');
-          }
-        }
-
-        // ===== Prioridad soporte si estamos en sv_* o parece marca+modelo =====
-        if (supportIntent || session.stage?.startsWith('sv_')) {
+        // ===== Cambio de intención en caliente (prioridad soporte) =====
+        if (supportIntent) {
           const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support' });
           return handled;
         }
@@ -205,7 +184,7 @@ export default {
         if (session.stage === 'await_invoice') return await handleAwaitInvoice(env, session, fromE164, lowered, now, text);
         if (session.stage?.startsWith('collect_')) return await handleCollectSequential(env, session, fromE164, text, now);
 
-        // ===== FAQs rápidas =====
+        // ===== FAQs rápidas por company_info o heurísticas =====
         const faqAns = await maybeFAQ(env, ntext);
         if (faqAns) {
           await sendWhatsAppText(env, fromE164, faqAns);
@@ -253,14 +232,6 @@ function isSupportIntent(ntext='') {
   return phrase || (hasProblem && hasDevice) || /\b(soporte|servicio|visita)\b/.test(t);
 }
 
-/** Marca+modelo típico (bloquea ventas) */
-function looksLikeMakeModel(ntext=''){
-  const t = normalizeBase(ntext);
-  const hasBrand = /\b(xerox|fujifilm|fuji\s?film)\b/.test(t);
-  const hasModel = /(versant[\s-]*\d+|versalink\s*\w+|altalink\s*\w+|docucolor\s*[\w/]+|primelink\s*\w+|prime\s*link\s*\w+|\bc\d{2,4}\b|\bb\d{2,4}\b|\b(550|560|570|80|180|2100|280|4100)\b)/i.test(t);
-  return hasBrand && hasModel;
-}
-
 const RX_NEG_NO = /\b(no|nel|ahorita no)\b/i;
 const RX_DONE = /\b(es(ta)?\s*todo|ser[ií]a\s*todo|nada\s*m[aá]s|con\s*eso|as[ií]\s*est[aá]\s*bien|ya\s*qued[oó]|listo|finaliza(r|mos)?|termina(r)?)\b/i;
 const RX_YES = /\b(s[ií]|sí|si|claro|va|dale|sale|correcto|ok|seguim(?:os)?|contin[uú]a(?:r)?|adelante|afirmativo|de acuerdo|me sirve)\b/i;
@@ -306,7 +277,6 @@ function formatMoneyMXN(n){
 }
 function numberOrZero(n){ const v=Number(n||0); return Number.isFinite(v)?v:0; }
 function priceWithIVA(n){ const v=Number(n||0); return `${formatMoneyMXN(v)} + IVA`; }
-function ok(body='OK'){ return new Response(typeof body==='string'?body:JSON.stringify(body), { status: 200 }); }
 
 /* ============================ IA ============================ */
 async function aiCall(env, messages, {json=false}={}) {
@@ -381,7 +351,7 @@ async function notifySupport(env, body) {
 /**
  * Extrae contexto del webhook de WA.
  * - Soporta text
- * - Soporta interactive.button_reply -> lo convierte a textRaw (title)
+ * - Soporta interactive.button_reply/list_reply -> lo convierte a textRaw (title)
  * - Detecta tipos no-texto para respuesta amable
  */
 function extractWhatsAppContext(payload) {
@@ -476,7 +446,9 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
   const cart = session.data.cart || [];
 
   if (RX_DONE.test(lowered) || (RX_NEG_NO.test(lowered) && cart.length > 0)) {
-    if (!cart.length && session.data.last_candidate) addWithStockSplit(session, session.data.last_candidate, 1);
+    if (!cart.length && session.data.last_candidate) {
+      addWithStockSplit(session, session.data.last_candidate, 1);
+    }
     session.stage = 'await_invoice';
     await saveSession(env, session, now);
     await sendWhatsAppText(env, toE164, `Perfecto 🙌 ¿La cotizamos *con factura* o *sin factura*?`);
@@ -520,6 +492,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
       await sendWhatsAppText(env, toE164, `${renderProducto(best)}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; hay ${s} en stock y el resto sería *sobre pedido*.`);
       return ok('EVENT_RECEIVED');
     } else {
+      // Ofrecer compatibles si detectamos familia en la consulta original o vía IA
       const hints = extractModelHints(enrichedQ);
       if (hints.family && ((env.STRICT_FAMILY_MATCH||'').toString().toLowerCase() !== 'true')) {
         session.stage = 'await_compatibles';
@@ -652,7 +625,7 @@ async function handleCollectSequential(env, session, toE164, text, now){
   const res = await createOrderFromSession(env, session, toE164);
   if (res?.ok) {
     await sendWhatsAppText(env, toE164, `¡Listo! Generé tu solicitud 🙌\n*Total estimado:* ${formatMoneyMXN(res.total)} + IVA\nUn asesor te confirmará entrega y forma de pago.`);
-    await notifySupport(env, `Nuevo pedido #${res?.pedido_id ?? '—'}\nCliente: ${c.nombre} (${toE164})`);
+    await notifySupport(env, `Nuevo pedido #${res.pedido_id ?? '—'}\nCliente: ${c.nombre} (${toE164})`);
   } else {
     await sendWhatsAppText(env, toE164, `Creé tu solicitud y la pasé a un asesor humano para confirmar detalles. 🙌`);
     await notifySupport(env, `Pedido (parcial) ${toE164}. Error: ${res?.error || 'N/A'}`);
@@ -663,6 +636,9 @@ async function handleCollectSequential(env, session, toE164, text, now){
   await sendWhatsAppText(env, toE164, `¿Puedo ayudarte con algo más? (Sí / No)`);
   return ok('EVENT_RECEIVED');
 }
+
+function summaryCart(cart = []) { return cart.map(i => `${i.product?.nombre} x ${i.qty}${i.backorder ? ' (sobre pedido)' : ''}`).join('; '); }
+function splitCart(cart = []){ return { inStockList: cart.filter(i => !i.backorder), backOrderList: cart.filter(i => i.backorder) }; }
 
 /* =============== Inventario & Pedido =============== */
 function extractModelHints(text='') {
@@ -704,6 +680,7 @@ function productMatchesFamily(p, family){
   const s = normalizeBase([p?.nombre, p?.sku, p?.marca, p?.compatible].join(' '));
 
   if (family==='versant'){
+    // Sólo coincidencias claras de Versant (no 550/560/570)
     const hit = /\bversant\b/i.test(s) || /\b(80|180|2100|280|4100)\b/i.test(s);
     const bad = /(c60|c70|c75|docucolor|prime\s*link|primelink|altalink|versa\s*link|\b550\b|\b560\b|\b570\b)/i.test(s);
     return hit && !bad;
@@ -728,13 +705,17 @@ async function findBestProduct(env, queryText, opts = {}) {
 
   const pick = (arr) => {
     if (!Array.isArray(arr) || !arr.length) return null;
+
+    // Filtrado por color si aplica
     let pool = colorCode ? arr.filter(p => productHasColor(p, colorCode)) : arr.slice();
 
+    // Filtrado por familia si aplica
     if (hints.family && !opts.ignoreFamily) {
       pool = pool.filter(p => productMatchesFamily(p, hints.family));
       if (!pool.length) return null;
     }
 
+    // Orden: primero con stock, luego precio asc
     pool.sort((a,b) => {
       const sa = numberOrZero(a.stock) > 0 ? 1 : 0;
       const sb = numberOrZero(b.stock) > 0 ? 1 : 0;
@@ -763,6 +744,7 @@ async function findBestProduct(env, queryText, opts = {}) {
     } catch {}
   }
 
+  // Búsqueda genérica (permite encontrar un match aún sin stock)
   if (!hints.family || opts.ignoreFamily) {
     try {
       const like = encodeURIComponent(`%toner%`);
@@ -1014,7 +996,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       return ok('EVENT_RECEIVED');
     }
 
-    // Agendar
+    // Listo → agendar
     let pool = [];
     try { pool = await getCalendarPool(env) || []; } catch(e){ console.warn('[GCal] pool', e); }
     const cal = pickCalendarFromPool(pool);
@@ -1047,7 +1029,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
         gcal_event_id: event?.id || null, calendar_id: cal?.gcal_id || null,
         calle: sv.calle || null, numero: sv.numero || null, colonia: sv.colonia || null, ciudad: sv.ciudad || null, estado: sv.estado || null, cp: sv.cp || null,
         created_at: new Date().toISOString()
-      }]];
+      }];
       const os = await sbUpsert(env, 'orden_servicio', osBody, { returning: 'representation' });
       osId = os?.data?.[0]?.id || null;
     } catch (e) { console.warn('[Supabase] OS upsert', e); estado = 'pendiente'; }
@@ -1211,6 +1193,7 @@ function clampToWindow(when, tz) {
 
 /* ============================ Google Calendar ============================ */
 async function gcalToken(env) {
+  if (!env.GCAL_CLIENT_ID || !env.GCAL_CLIENT_SECRET || !env.GCAL_REFRESH_TOKEN) return null;
   const r = await fetch('https://oauth2.googleapis.com/token', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -1259,7 +1242,7 @@ async function findNearestFreeSlot(env, calendarId, when, tz) {
   if (!calendarId) return when;
   let curStart = new Date(when.start);
   let curEnd = new Date(when.end);
-  for (let i=0;i<6;i++) {
+  for (let i=0;i<6;i++) { // 6 intentos de 30 min
     const busy = await isBusy(env, calendarId, curStart.toISOString(), curEnd.toISOString());
     if (!busy) break;
     curStart = new Date(curStart.getTime()+30*60*1000);
@@ -1305,119 +1288,115 @@ async function getLastOpenOS(env, phone) {
 
 async function upsertClienteByPhone(env, phone){
   try{
-    const exist = await sbGet(env, 'cliente', { query: `select=id,telefono&telefono=eq.${phone}&limit=1` });
-    if (exist && exist[0]) return exist[0].id;
-    const ins = await sbUpsert(env, 'cliente', [{ telefono: phone }], { onConflict: 'telefono', returning: 'representation' });
+    const exist = await sbGet(env, 'cliente', { query: `select=id&telefono=eq.${phone}&limit=1` });
+    if (exist && exist[0]?.id) return exist[0].id;
+    const ins = await sbUpsert(env, 'cliente', [{ telefono: phone, created_at: new Date().toISOString() }], { onConflict: 'telefono', returning: 'representation' });
     return ins?.data?.[0]?.id || null;
   }catch(e){ console.warn('upsertClienteByPhone', e); return null; }
 }
 
-/* ============================ Direcciones / Text parsing ============================ */
-function parseCustomerText(t=''){
-  const out = {};
-  const mcp = t.match(/\b(CP|C\.?P\.?)\s*(\d{5})\b/i) || t.match(/\b(\d{5})\b/);
-  if (mcp) out.cp = mcp[mcp.length-1];
-  const mnum = t.match(/\b#?\s?(\d+[A-Z]?)\b/);
-  if (mnum) out.numero = mnum[1];
-  return out;
-}
-
-/** súper laxo: intenta sacar calle/colonia/cp */
-function parseAddressLoose(t=''){
-  const out = {};
-  const mcp = t.match(/\b(\d{5})\b/); if (mcp) out.cp = mcp[1];
-  const col = t.match(/\bcol(?:\.|onia)?\s+([A-Za-z0-9\s\-_]+?)(?=,|\d{5}|$)/i);
-  if (col) out.colonia = clean(col[1]);
-  const calle = t.match(/\b(calle|av(?:\.|enida)?|blvd\.?)\s+([A-Za-z0-9\s\-_]+?)(?=,|\d+|col|cp|$)/i);
-  if (calle) out.calle = clean(calle[2]);
-  return out;
-}
-
-/* ============================ Misc UI helpers ============================ */
-function buildResumePrompt(session){
+/* ============================ Persistencia de sesión ============================ */
+async function loadSession(env, key){
   try{
-    if (session.stage?.startsWith('sv_')) return 'Seguimos con tu *soporte*.';
-    if (session.stage==='cart_open' || session.stage==='ask_qty') {
-      const items = (session.data?.cart||[]).map(i => `${i.product?.nombre} x ${i.qty}`).join(', ');
-      return `Tenías carrito abierto: ${items || 'vacío'}.`;
-    }
+    const r = await env.SESSIONS.get(`sess:${key}`, { type:'json' });
+    return r || { from:key, stage:'idle', data:{} };
+  }catch{ return { from:key, stage:'idle', data:{} }; }
+}
+async function saveSession(env, session, now){
+  try{
+    await env.SESSIONS.put(`sess:${session.from}`, JSON.stringify(session), { expirationTtl: 60*60*24*7 });
   }catch{}
-  return '¿Continuamos donde nos quedamos?';
 }
 
 function promptedRecently(session, key, ms){
-  const k = `_recent_${key}`;
-  const last = session?.data?.[k] ? new Date(session.data[k]).getTime() : 0;
+  const k = `_last_prompt_${key}`;
+  const t = session.data?.[k] ? new Date(session.data[k]).getTime() : 0;
   const now = Date.now();
-  if (now - last < ms) return true;
+  const ok = (now - t) < ms;
   session.data[k] = new Date().toISOString();
-  return false;
+  return ok;
 }
 
-/* ============================ Supabase REST helpers ============================ */
+function buildResumePrompt(session){
+  if (session.stage?.startsWith('sv_')) return 'Retomamos soporte.';
+  if (session.stage==='ask_qty' || session.stage==='cart_open') return 'Retomamos tu cotización.';
+  return 'Seguimos donde nos quedamos.';
+}
+
+/* ============================ Cron de recordatorios (placeholder simple) ============================ */
+async function cronReminders(env){
+  // Aquí podrías leer recordatorios desde Supabase y enviar avisos por WhatsApp.
+  return { ok:true, ran:true, ts: Date.now() };
+}
+
+/* ============================ Supabase helpers ============================ */
 function sbHeaders(env){
-  return { 'apikey': env.SUPABASE_ANON_KEY, 'Authorization': `Bearer ${env.SUPABASE_ANON_KEY}`, 'Content-Type':'application/json' };
+  return {
+    apikey: env.SUPABASE_ANON_KEY,
+    Authorization: `Bearer ${env.SUPABASE_ANON_KEY}`,
+    'Content-Type':'application/json'
+  };
 }
-function sbUrl(env, table){ return `${env.SUPABASE_URL}/rest/v1/${table}`; }
+function sbUrl(env, table, query){
+  const base = env.SUPABASE_URL?.replace(/\/+$/,'');
+  return `${base}/rest/v1/${table}${query?`?${query}`:''}`;
+}
 
-async function sbGet(env, table, { query }){
-  const url = `${sbUrl(env, table)}?${query}`;
-  const r = await fetch(url, { headers: sbHeaders(env) });
-  if (!r.ok) { console.warn('sbGet', table, r.status, await r.text()); return null; }
+async function sbGet(env, table, {query}={}){
+  if (!env.SUPABASE_URL || !env.SUPABASE_ANON_KEY) return null;
+  const r = await fetch(sbUrl(env, table, query||''), { headers: sbHeaders(env) });
+  if (!r.ok){ console.warn('sbGet', table, r.status, await r.text()); return null; }
   return await r.json();
 }
-async function sbUpsert(env, table, rows, { onConflict, returning='representation' }={}){
-  const url = `${sbUrl(env, table)}${onConflict?`?on_conflict=${encodeURIComponent(onConflict)}`:''}`;
-  const r = await fetch(url, { method:'POST', headers: { ...sbHeaders(env), Prefer: `resolution=merge-duplicates,return=${returning}` }, body: JSON.stringify(rows) });
-  if (!r.ok) { console.warn('sbUpsert', table, r.status, await r.text()); return null; }
-  const data = returning==='minimal' ? null : await r.json();
+
+async function sbUpsert(env, table, rows, {onConflict, returning='representation'}={}){
+  if (!env.SUPABASE_URL || !env.SUPABASE_ANON_KEY) return { data:[] };
+  const url = new URL(sbUrl(env, table));
+  if (onConflict) url.searchParams.set('on_conflict', onConflict);
+  url.searchParams.set('returning', returning);
+  const r = await fetch(url.toString(), { method:'POST', headers: sbHeaders(env), body: JSON.stringify(rows) });
+  if (!r.ok){ console.warn('sbUpsert', table, r.status, await r.text()); return { data:[] }; }
+  const data = returning==='minimal' ? [] : await r.json();
   return { data };
 }
+
 async function sbPatch(env, table, patch, filter){
-  const url = `${sbUrl(env, table)}?${filter}`;
-  const r = await fetch(url, { method:'PATCH', headers: { ...sbHeaders(env), Prefer:'return=minimal' }, body: JSON.stringify(patch) });
-  if (!r.ok) console.warn('sbPatch', table, r.status, await r.text());
+  if (!env.SUPABASE_URL || !env.SUPABASE_ANON_KEY) return null;
+  const url = sbUrl(env, table, filter);
+  const r = await fetch(url, { method:'PATCH', headers: sbHeaders(env), body: JSON.stringify(patch) });
+  if (!r.ok){ console.warn('sbPatch', table, r.status, await r.text()); return null; }
+  return await r.json().catch(()=>null);
 }
+
 async function sbRpc(env, fn, args){
-  const url = `${env.SUPABASE_URL}/rest/v1/rpc/${fn}`;
+  if (!env.SUPABASE_URL || !env.SUPABASE_ANON_KEY) return null;
+  const base = env.SUPABASE_URL?.replace(/\/+$/,'');
+  const url = `${base}/rest/v1/rpc/${fn}`;
   const r = await fetch(url, { method:'POST', headers: sbHeaders(env), body: JSON.stringify(args||{}) });
-  if (!r.ok) { console.warn('sbRpc', fn, r.status, await r.text()); return null; }
+  if (!r.ok){ console.warn('sbRpc', fn, r.status, await r.text()); return null; }
   return await r.json();
 }
 
-/* ============================ City from CP ============================ */
+/* ============================ Address & customer parse (suave) ============================ */
+function parseAddressLoose(text=''){
+  const t = normalizeBase(text);
+  const out = {};
+  const mcp = t.match(/\b(\d{5})\b/); if (mcp) out.cp = mcp[1];
+  const mnum = text.match(/\b(\d+[A-Z]?)\b/); if (mnum) out.numero = mnum[1];
+  return out;
+}
+function parseCustomerText(text=''){
+  const out = {};
+  const em = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i); if (em) out.email = em[0].toLowerCase();
+  return out;
+}
 async function cityFromCP(env, cp){
-  if (!cp) return null;
   try{
     const r = await sbGet(env, 'sepomex_cp', { query: `select=cp,estado,municipio,ciudad&cp=eq.${encodeURIComponent(cp)}&limit=1` });
-    return r && r[0] ? r[0] : null;
+    return r?.[0] || null;
   }catch{ return null; }
 }
 
-/* ============================ KV Session ============================ */
-async function loadSession(env, key){
-  try{
-    const ns = env.SESSION || env.SESSIONS || env.SESSION_NS; // KV binding
-    if (!ns || !ns.get) return { id:key, data:{}, stage:'idle', from:key };
-    const raw = await ns.get(`s:${key}`);
-    return raw ? JSON.parse(raw) : { id:key, data:{}, stage:'idle', from:key };
-  }catch(e){ console.warn('loadSession', e); return { id:key, data:{}, stage:'idle', from:key }; }
-}
-async function saveSession(env, session, now=new Date()){
-  try{
-    const ns = env.SESSION || env.SESSIONS || env.SESSION_NS;
-    if (!ns || !ns.put) return;
-    await ns.put(`s:${session.from}`, JSON.stringify(session), { expirationTtl: 60*60*24*7 });
-  }catch(e){ console.warn('saveSession', e); }
-}
-
-/* ============================ Cron (placeholder) ============================ */
-async function cronReminders(env){
-  // Aquí podrías consultar OS pendientes para recordar al cliente, etc.
-  return { ok:true, ranAt: new Date().toISOString() };
-}
-
-/* ============================ Safe JSON ============================ */
-async function safeJson(req){
-  try{ return await req.json(); }catch{ return {}; }
-}
+/* ============================ Miscelánea ============================ */
+async function safeJson(req){ try{ return await req.json(); }catch{ return {}; } }
+function ok(msg){ return new Response(msg || 'OK', { status: 200 }); }
