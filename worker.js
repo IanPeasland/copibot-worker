@@ -1,16 +1,12 @@
 /**
  * CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
- * Sep/2025 – build “Borbón-R5”
+ * Sep/2025 – build “Borbón-R5.2”
  *
- * R5 sobre R4:
- * - Manejo de mensajes NO-TEXTO (audio, imagen, document, sticker, contacts, location):
- *   · Respuesta amable pidiendo texto y no rompe el flujo.
- * - Soporte de respuestas por botones WhatsApp (interactive.button_reply.title).
- * - Idempotencia: sigue usando last_mid; early-return más estricto.
- * - Pequeñas defensas extra en parseos y null-safety (sin cambiar firmas).
- * - FIX inventario: DocuColor 550/560/570 ya no se sugiere en consultas Versant.
- * - FIX inventario: si hay match sin stock, se muestra igual y se indica “0 pzas — sobre pedido”.
- * - FIX soporte: si la sesión está en sv_*, se fuerza flujo de soporte (no ventas).
+ * Cambios R5.2:
+ * - Cortafuegos soporte más estricto: si stage sv_* o sv_need_next → siempre soporte.
+ * - Persistencia de intención: last_intent='support' mientras dure el flujo.
+ * - Heurística de soporte por marca/modelo/familia + no-inventario.
+ * - Sigue fix: DocuColor 550/560/570 no se confunde con Versant. Sin stock muestra “sobre pedido”.
  */
 
 export default {
@@ -41,10 +37,12 @@ export default {
       if (req.method === 'POST' && url.pathname === '/') {
         const payload = await safeJson(req);
         const ctx = extractWhatsAppContext(payload);
-        if (!ctx) return ok('EVENT_RECEIVED'); // eventos no relevantes/estatus
+        if (!ctx) return ok('EVENT_RECEIVED');
 
         const { mid, from, fromE164, profileName, textRaw, msgType } = ctx;
-        let text = (textRaw || '').trim();
+        const text = (textRaw || '').trim();
+        const lowered = text.toLowerCase();
+        const ntext = normalizeWithAliases(text);
 
         // ===== Session =====
         const now = new Date();
@@ -53,19 +51,18 @@ export default {
         session.stage = session.stage || 'idle';
         session.from = from;
 
-        // Nombre por profile (prefill suave)
+        // Prefill nombre
         if (profileName && !session?.data?.customer?.nombre) {
           session.data.customer = session.data.customer || {};
           session.data.customer.nombre = toTitleCase(firstWord(profileName));
         }
 
-        // Idempotencia por mid (si Meta reintenta)
+        // Idempotencia
         if (session?.data?.last_mid && session.data.last_mid === mid) return ok('EVENT_RECEIVED');
         session.data.last_mid = mid;
 
-        // Mensajes NO-TEXTO → pedir texto amable y salir (no rompemos flujo)
+        // No-texto → amable
         if (msgType !== 'text') {
-          // Permitimos botones (interactive.* ya se mapea a textRaw en extractWhatsAppContext).
           if (['media','location','contacts','sticker','document'].includes(msgType)) {
             await sendWhatsAppText(env, fromE164, `¿Podrías escribirme con palabras lo que necesitas? Así te ayudo más rápido 🙂`);
             await saveSession(env, session, now);
@@ -73,19 +70,21 @@ export default {
           }
         }
 
-        // ===== Cortafuegos de soporte (si ya estoy en flujo sv_*) =====
-        const lowered0 = text.toLowerCase();
-        const ntext0 = normalizeWithAliases(text);
-        if (session.stage?.startsWith('sv_')) {
-          const handled = await handleSupport(env, session, fromE164, text, lowered0, ntext0, now, { intent: 'support' });
+        // ===== CORTAFUEGOS SOPORTE (antes de cualquier cosa)
+        const mustGoSupport =
+          session.stage?.startsWith('sv_') ||
+          !!session.data?.sv_need_next ||
+          (session.data?.last_intent === 'support' && !looksLikeInventoryRequest(ntext)) ||
+          detectSupportHeuristic(ntext);
+
+        if (mustGoSupport) {
+          session.data.last_intent = 'support';
+          await saveSession(env, session, now);
+          const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support' });
           return handled;
         }
 
-        // Normalización+alias
-        const lowered = lowered0;
-        const ntext = ntext0;
-
-        // ===== Comandos universales (soporte) =====
+        // ===== Comandos universales (soporte)
         if (/\b(cancel(a|ar).*(cita|visita|servicio))\b/i.test(lowered)) {
           await svCancel(env, session, fromE164);
           await saveSession(env, session, now);
@@ -105,11 +104,11 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // ===== Intentos globales =====
+        // ===== Intents (fallbacks)
         const supportIntent = isSupportIntent(ntext) || (await intentIs(env, text, 'support'));
         const salesIntent = RX_INV_Q.test(ntext) || (await intentIs(env, text, 'sales'));
 
-        // ===== Saludo =====
+        // ===== Saludo
         const isGreet = RX_GREET.test(lowered);
         if (isGreet) {
           if (session?.data?.last_candidate) delete session.data.last_candidate;
@@ -129,9 +128,10 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // ===== Continuar o empezar nuevo (si había algo pendiente) =====
+        // ===== Continuar/Empezar nuevo
         if (session.stage === 'await_choice') {
           if (supportIntent) {
+            session.data.last_intent = 'support';
             session.stage = 'sv_collect';
             await saveSession(env, session, now);
             return await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support', forceWelcome: true });
@@ -160,13 +160,15 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // ===== Cambio de intención en caliente (prioridad soporte) =====
+        // ===== Cambio de intención (prioridad soporte)
         if (supportIntent) {
+          session.data.last_intent = 'support';
+          await saveSession(env, session, now);
           const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support' });
           return handled;
         }
 
-        // ===== Ventas por intención =====
+        // ===== Ventas
         if (salesIntent) {
           if (session.stage !== 'idle') {
             await sendWhatsAppText(env, fromE164, `Te ayudo con inventario. Dejo lo otro en pausa un momento.`);
@@ -178,13 +180,13 @@ export default {
           return handled;
         }
 
-        // ===== Stages de ventas =====
+        // ===== Stages ventas
         if (session.stage === 'ask_qty') return await handleAskQty(env, session, fromE164, text, lowered, ntext, now);
         if (session.stage === 'cart_open') return await handleCartOpen(env, session, fromE164, text, lowered, ntext, now);
         if (session.stage === 'await_invoice') return await handleAwaitInvoice(env, session, fromE164, lowered, now, text);
         if (session.stage?.startsWith('collect_')) return await handleCollectSequential(env, session, fromE164, text, now);
 
-        // ===== FAQs rápidas por company_info o heurísticas =====
+        // ===== FAQs
         const faqAns = await maybeFAQ(env, ntext);
         if (faqAns) {
           await sendWhatsAppText(env, fromE164, faqAns);
@@ -192,7 +194,7 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // ===== Fallback IA breve =====
+        // ===== Fallback IA breve
         const reply = await aiSmallTalk(env, session, 'fallback', text);
         await sendWhatsAppText(env, fromE164, reply);
         await saveSession(env, session, now);
@@ -223,7 +225,7 @@ const RX_INV_Q = /(toner|t[óo]ner|cartucho|developer|refacci[oó]n|precio|docuc
 function isContinueish(t){ return /\b(continuar|continuemos|seguir|retomar|reanudar|continuo|contin[uú]o)\b/i.test(t); }
 function isStartNewish(t){ return /\b(empezar|nuevo|desde cero|otra cosa|otro|iniciar|empecemos)\b/i.test(t); }
 
-/** Determinista intención soporte (con ntext normalizado) */
+/** Intent soporte determinista */
 function isSupportIntent(ntext='') {
   const t = `${ntext}`;
   const hasProblem = /(falla(?:ndo)?|fallo|problema|descompuest[oa]|no imprime|no escanea|no copia|no prende|no enciende|se apaga|error|atasc|ator(?:a|o|e|ando|ada|ado)|atasco|se traba|mancha|l[ií]nea|linea|calidad|ruido|marca c[oó]digo|c[oó]digo)/.test(t);
@@ -278,6 +280,22 @@ function formatMoneyMXN(n){
 function numberOrZero(n){ const v=Number(n||0); return Number.isFinite(v)?v:0; }
 function priceWithIVA(n){ const v=Number(n||0); return `${formatMoneyMXN(v)} + IVA`; }
 
+/* ===== Heurísticas extra para separar soporte vs inventario ===== */
+function looksLikeInventoryRequest(t){
+  // señales de venta: color, "precio", "toner/cartucho/developer", etc.
+  return /\b(toner|t[óo]ner|cartucho|developer|precio|amarillo|magenta|cyan|cian|negro|black|yellow|bk|k)\b/i.test(t);
+}
+function looksLikeBrandOrModel(t){
+  return /\b(xerox|fujifilm|fuji\s?film|versant|altalink|versalink|primelink|docucolor|c\d{2,4}|b\d{2,4}|550|560|570|80|180|2100|280|4100)\b/i.test(t);
+}
+function detectSupportHeuristic(t){
+  // Marca/modelo/familia presente y NO pinta a inventario → soporte
+  if (looksLikeBrandOrModel(t) && !looksLikeInventoryRequest(t)) return true;
+  // Frases con "mi/la impresora" sin palabras de precio/color → soporte
+  if (/\b(impresora|equipo|copiadora)\b/i.test(t) && !looksLikeInventoryRequest(t)) return true;
+  return false;
+}
+
 /* ============================ IA ============================ */
 async function aiCall(env, messages, {json=false}={}) {
   const OPENAI_KEY = env.OPENAI_API_KEY || env.OPENAI_KEY;
@@ -321,7 +339,7 @@ async function aiClassifyIntent(env, text){
   try { return JSON.parse(out||'{}'); } catch { return null; }
 }
 
-/** IA opcional para reforzar NER de inventario */
+/** IA opcional NER inventario */
 async function aiExtractTonerQuery(env, text){
   if (!env.OPENAI_API_KEY && !env.OPENAI_KEY) return null;
   const sys = `Extrae de una consulta (es-MX) sobre tóners los campos { "familia": "versant|docucolor|primelink|versalink|altalink|apeos|c70|", "color": "yellow|magenta|cyan|black|null", "subfamilia": "string|null", "cantidad": "number|null" } en JSON. No inventes.`;
@@ -348,12 +366,7 @@ async function notifySupport(env, body) {
   await sendWhatsAppText(env, to, `🛎️ *Soporte*\n${body}`);
 }
 
-/**
- * Extrae contexto del webhook de WA.
- * - Soporta text
- * - Soporta interactive.button_reply/list_reply -> lo convierte a textRaw (title)
- * - Detecta tipos no-texto para respuesta amable
- */
+/* ============================ Extract WA context ============================ */
 function extractWhatsAppContext(payload) {
   try {
     const value = payload?.entry?.[0]?.changes?.[0]?.value;
@@ -479,11 +492,10 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
   if (RX_ADD_ITEM.test(lowered) || RX_INV_Q.test(ntext)) {
     const cleanQ = lowered.replace(RX_ADD_ITEM, '').trim() || ntext;
 
-    // Intento de NER con IA si ambiguo
     const extracted = await aiExtractTonerQuery(env, cleanQ).catch(()=>null);
     const enrichedQ = enrichQueryFromAI(cleanQ, extracted);
 
-    const best = await findBestProduct(env, enrichedQ); // familia+color = duro
+    const best = await findBestProduct(env, enrichedQ);
     if (best) {
       session.data.last_candidate = best;
       session.stage = 'ask_qty';
@@ -492,7 +504,6 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
       await sendWhatsAppText(env, toE164, `${renderProducto(best)}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; hay ${s} en stock y el resto sería *sobre pedido*.`);
       return ok('EVENT_RECEIVED');
     } else {
-      // Ofrecer compatibles si detectamos familia en la consulta original o vía IA
       const hints = extractModelHints(enrichedQ);
       if (hints.family && ((env.STRICT_FAMILY_MATCH||'').toString().toLowerCase() !== 'true')) {
         session.stage = 'await_compatibles';
@@ -644,7 +655,6 @@ function splitCart(cart = []){ return { inStockList: cart.filter(i => !i.backord
 function extractModelHints(text='') {
   const t = normalizeWithAliases(text);
   const out = {};
-  // —— Familia
   if (/\bversant\b/.test(t) || /\b(80|180|2100|280|4100)\b/.test(t)) out.family = 'versant';
   else if (/\bversa[-\s]?link\b/.test(t)) out.family = 'versalink';
   else if (/\balta[-\s]?link\b/.test(t)) out.family = 'altalink';
@@ -653,7 +663,6 @@ function extractModelHints(text='') {
   else if (/\bapeos\b/.test(t)) out.family = 'apeos';
   else if (/\bc(60|70|75)\b/.test(t)) out.family = 'c70';
 
-  // —— Color
   if (/\b(amarillo|yellow)\b/.test(t)) out.color = 'yellow';
   else if (/\bmagenta\b/.test(t)) out.color = 'magenta';
   else if (/\b(cyan|cian)\b/.test(t)) out.color = 'cyan';
@@ -680,7 +689,6 @@ function productMatchesFamily(p, family){
   const s = normalizeBase([p?.nombre, p?.sku, p?.marca, p?.compatible].join(' '));
 
   if (family==='versant'){
-    // Sólo coincidencias claras de Versant (no 550/560/570)
     const hit = /\bversant\b/i.test(s) || /\b(80|180|2100|280|4100)\b/i.test(s);
     const bad = /(c60|c70|c75|docucolor|prime\s*link|primelink|altalink|versa\s*link|\b550\b|\b560\b|\b570\b)/i.test(s);
     return hit && !bad;
@@ -698,24 +706,20 @@ function productMatchesFamily(p, family){
   return s.includes(family);
 }
 
-/* === findBestProduct: Color y Familia = filtros duros === */
+/* === findBestProduct === */
 async function findBestProduct(env, queryText, opts = {}) {
   const hints = extractModelHints(queryText);
   const colorCode = hints.color || extractColorWord(queryText);
 
   const pick = (arr) => {
     if (!Array.isArray(arr) || !arr.length) return null;
-
-    // Filtrado por color si aplica
     let pool = colorCode ? arr.filter(p => productHasColor(p, colorCode)) : arr.slice();
 
-    // Filtrado por familia si aplica
     if (hints.family && !opts.ignoreFamily) {
       pool = pool.filter(p => productMatchesFamily(p, hints.family));
       if (!pool.length) return null;
     }
 
-    // Orden: primero con stock, luego precio asc
     pool.sort((a,b) => {
       const sa = numberOrZero(a.stock) > 0 ? 1 : 0;
       const sb = numberOrZero(b.stock) > 0 ? 1 : 0;
@@ -744,7 +748,6 @@ async function findBestProduct(env, queryText, opts = {}) {
     } catch {}
   }
 
-  // Búsqueda genérica (permite encontrar un match aún sin stock)
   if (!hints.family || opts.ignoreFamily) {
     try {
       const like = encodeURIComponent(`%toner%`);
@@ -858,7 +861,7 @@ async function createOrderFromSession(env, session, toE164) {
     }));
     await sbUpsert(env, 'pedido_item', items, { returning: 'minimal' });
 
-    // Decremento de stock por RPC (hasta stock actual)
+    // decrementar stock
     for (const it of cart) {
       const sku = it.product?.sku;
       if (!sku) continue;
@@ -926,9 +929,9 @@ function svFillFromAnswer(sv, field, text, env){
   if (field === 'email') { const em = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i); sv.email = em ? em[0].toLowerCase() : clean(text).toLowerCase(); return; }
   if (field === 'calle') { sv.calle = clean(text); return; }
   if (field === 'numero') { const mnum = text.match(/\b(\d+[A-Z]?)\b/); sv.numero = mnum?mnum[1]:clean(text); return; }
-  if (field === 'colonia') { sv.colonia = clean(text); return; }
-  if (field === 'ciudad') { sv.ciudad = clean(text); return; }
-  if (field === 'estado') { sv.estado = clean(text); return; }
+  if (field==='colonia') { sv.colonia = clean(text); return; }
+  if (field==='ciudad') { sv.ciudad = clean(text); return; }
+  if (field==='estado') { sv.estado = clean(text); return; }
   if (field === 'cp') { const mcp = text.match(/\b(\d{5})\b/); sv.cp = mcp?mcp[1]:clean(text); return; }
   if (field === 'horario') { const dt = parseNaturalDateTime(text, env); if (dt?.start) sv.when = dt; return; }
 }
@@ -936,6 +939,7 @@ function svFillFromAnswer(sv, field, text, env){
 async function handleSupport(env, session, toE164, text, lowered, ntext, now, intent){
   try {
     session.data = session.data || {};
+    session.data.last_intent = 'support';
     session.data.sv = session.data.sv || {};
     const sv = session.data.sv;
 
@@ -996,7 +1000,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       return ok('EVENT_RECEIVED');
     }
 
-    // Listo → agendar
+    // Agendar
     let pool = [];
     try { pool = await getCalendarPool(env) || []; } catch(e){ console.warn('[GCal] pool', e); }
     const cal = pickCalendarFromPool(pool);
@@ -1242,7 +1246,7 @@ async function findNearestFreeSlot(env, calendarId, when, tz) {
   if (!calendarId) return when;
   let curStart = new Date(when.start);
   let curEnd = new Date(when.end);
-  for (let i=0;i<6;i++) { // 6 intentos de 30 min
+  for (let i=0;i<6;i++) {
     const busy = await isBusy(env, calendarId, curStart.toISOString(), curEnd.toISOString());
     if (!busy) break;
     curStart = new Date(curStart.getTime()+30*60*1000);
@@ -1323,9 +1327,8 @@ function buildResumePrompt(session){
   return 'Seguimos donde nos quedamos.';
 }
 
-/* ============================ Cron de recordatorios (placeholder simple) ============================ */
+/* ============================ Cron (placeholder) ============================ */
 async function cronReminders(env){
-  // Aquí podrías leer recordatorios desde Supabase y enviar avisos por WhatsApp.
   return { ok:true, ran:true, ts: Date.now() };
 }
 
@@ -1377,7 +1380,7 @@ async function sbRpc(env, fn, args){
   return await r.json();
 }
 
-/* ============================ Address & customer parse (suave) ============================ */
+/* ============================ Address & customer parse ============================ */
 function parseAddressLoose(text=''){
   const t = normalizeBase(text);
   const out = {};
