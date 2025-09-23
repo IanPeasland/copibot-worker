@@ -3,12 +3,13 @@
  * Sep/2025 – build “Borbón-R5”
  *
  * R5 sobre R4:
- * - Manejo de mensajes NO-TEXTO (audio, imagen, document, sticker, contacts, location):
- *   · Respuesta amable pidiendo texto y no rompe el flujo.
+ * - Manejo de mensajes NO-TEXTO (audio, imagen, document, sticker, contacts, location).
  * - Soporte de respuestas por botones WhatsApp (interactive.button_reply.title).
- * - Idempotencia: sigue usando last_mid; early-return más estricto.
- * - Pequeñas defensas extra en parseos y null-safety (sin cambiar firmas).
- * - FIX: detección de familia/color para evitar que DocuColor 550/560/570 se sugiera en consultas Versant.
+ * - Idempotencia por last_mid (early-return).
+ * - Defensas extra en parseos y null-safety (sin cambiar firmas).
+ * - FIX familias: Versant ya no colisiona con DocuColor 550/560/570; agrega 80/180/2100/280/4100.
+ * - INVENTARIO: si no hay stock, se muestra el mismo bloque con “0 pzas — *sobre pedido*”.
+ * - Fallback inventario: si no hay match con color, se relaja color dentro de la misma familia antes de rendirse.
  */
 
 export default {
@@ -36,14 +37,13 @@ export default {
       }
 
       // WhatsApp webhook
-      if (req.method === 'POST' && url.pathname === '/') {
+      if (req.method === 'POST' && (url.pathname === '/' || url.pathname === '/webhook')) {
         const payload = await safeJson(req);
         const ctx = extractWhatsAppContext(payload);
         if (!ctx) return ok('EVENT_RECEIVED'); // eventos no relevantes/estatus
 
         const { mid, from, fromE164, profileName, textRaw, msgType } = ctx;
         let text = (textRaw || '').trim();
-        const lowered0 = text.toLowerCase();
 
         // ===== Session =====
         const now = new Date();
@@ -149,35 +149,6 @@ export default {
           }
           await sendWhatsAppText(env, fromE164, `¿Prefieres continuar con lo pendiente o empezamos algo nuevo?`);
           return ok('EVENT_RECEIVED');
-        }
-
-        // ===== Compatibles (aprobación) =====
-        if (session.stage === 'await_compatibles') {
-          if (isYesish(lowered)) {
-            const q = session.data?.pending_query || ntext || lowered;
-            const bestCompat = await findBestProduct(env, q, { ignoreFamily: true });
-            session.stage = 'ask_qty';
-            session.data.last_candidate = bestCompat || null;
-            await saveSession(env, session, now);
-            if (bestCompat) {
-              const s = numberOrZero(bestCompat.stock);
-              await sendWhatsAppText(env, fromE164, `${renderProducto(bestCompat)}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; hay ${s} en stock y el resto sería *sobre pedido*.`);
-            } else {
-              await sendWhatsAppText(env, fromE164, `No veo compatibles claros ahora mismo. Si gustas, lo revisa un asesor.`);
-              await notifySupport(env, `Compatibles sin match. +${session.from}: ${q}`);
-              session.stage = 'idle';
-              await saveSession(env, session, now);
-            }
-            return ok('EVENT_RECEIVED');
-          } else if (isNoish(lowered)) {
-            session.stage = 'idle';
-            await saveSession(env, session, now);
-            await sendWhatsAppText(env, fromE164, `De acuerdo. Si te parece, puedo dejarlo *sobre pedido* o buscamos otro artículo.`);
-            return ok('EVENT_RECEIVED');
-          } else {
-            await sendWhatsAppText(env, fromE164, `¿Quieres que te muestre *compatibles* de otra línea? (Sí/No)`);
-            return ok('EVENT_RECEIVED');
-          }
         }
 
         // ===== Cambio de intención en caliente (prioridad soporte) =====
@@ -504,7 +475,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     const extracted = await aiExtractTonerQuery(env, cleanQ).catch(()=>null);
     const enrichedQ = enrichQueryFromAI(cleanQ, extracted);
 
-    const best = await findBestProduct(env, enrichedQ); // familia+color = duro
+    const best = await findBestProduct(env, enrichedQ); // familia+color = duro, con fallback a relajar color
     if (best) {
       session.data.last_candidate = best;
       session.stage = 'ask_qty';
@@ -513,15 +484,6 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
       await sendWhatsAppText(env, toE164, `${renderProducto(best)}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; hay ${s} en stock y el resto sería *sobre pedido*.`);
       return ok('EVENT_RECEIVED');
     } else {
-      // Ofrecer compatibles si detectamos familia en la consulta original o vía IA
-      const hints = extractModelHints(enrichedQ);
-      if (hints.family && ((env.STRICT_FAMILY_MATCH||'').toString().toLowerCase() !== 'true')) {
-        session.stage = 'await_compatibles';
-        session.data.pending_query = enrichedQ;
-        await saveSession(env, session, now);
-        await sendWhatsAppText(env, toE164, `Ese modelo está *sobre pedido* o sin disponibilidad. ¿Quieres que te muestre opciones *compatibles* en otra línea?`);
-        return ok('EVENT_RECEIVED');
-      }
       await sendWhatsAppText(env, toE164, `No encontré una coincidencia directa 😕. ¿Busco otra opción o lo revisa un asesor?`);
       await notifySupport(env, `Inventario sin match. ${toE164}: ${text}`);
       await saveSession(env, session, now);
@@ -719,14 +681,14 @@ function productMatchesFamily(p, family){
   return s.includes(family);
 }
 
-/* === findBestProduct: Color y Familia = filtros duros === */
+/* === findBestProduct: Color y Familia = filtros duros; si no hay, relaja color === */
 async function findBestProduct(env, queryText, opts = {}) {
   const hints = extractModelHints(queryText);
   const colorCode = hints.color || extractColorWord(queryText);
 
-  const pick = (arr) => {
+  const pickWith = (arr, useColor=true) => {
     if (!Array.isArray(arr) || !arr.length) return null;
-    let pool = colorCode ? arr.filter(p => productHasColor(p, colorCode)) : arr.slice();
+    let pool = useColor && colorCode ? arr.filter(p => productHasColor(p, colorCode)) : arr.slice();
 
     if (hints.family && !opts.ignoreFamily) {
       pool = pool.filter(p => productMatchesFamily(p, hints.family));
@@ -736,41 +698,44 @@ async function findBestProduct(env, queryText, opts = {}) {
     pool.sort((a,b) => {
       const sa = numberOrZero(a.stock) > 0 ? 1 : 0;
       const sb = numberOrZero(b.stock) > 0 ? 1 : 0;
-      if (sa !== sb) return sb - sa;
-      return numberOrZero(a.precio||0) - numberOrZero(b.precio||0);
+      if (sa !== sb) return sb - sa;                 // stock primero
+      return numberOrZero(a.precio||0) - numberOrZero(b.precio||0); // luego precio más bajo
     });
 
     return pool[0] || null;
   };
 
+  // 1) RPC trigram
   try {
-    const res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 30 }) || [];
-    const best = pick(res);
+    const res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 40 }) || [];
+    let best = pickWith(res, true);
+    if (!best) best = pickWith(res, false); // RELAX: ignorar color
     if (best) return best;
   } catch {}
 
+  // 2) Búsqueda por familia explícita
   if (hints.family && !opts.ignoreFamily) {
     try {
       const like = encodeURIComponent(`%${hints.family}%`);
       const r = await sbGet(env, 'producto_stock_v', {
         query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&or=(nombre.ilike.${like},sku.ilike.${like},marca.ilike.${like},compatible.ilike.${like})&order=stock.desc.nullslast,precio.asc&limit=200`
       }) || [];
-      const best = pick(r);
+      let best = pickWith(r, true);
+      if (!best) best = pickWith(r, false); // RELAX color
       if (best) return best;
-      return null;
     } catch {}
   }
 
-  if (!hints.family || opts.ignoreFamily) {
-    try {
-      const like = encodeURIComponent(`%toner%`);
-      const r = await sbGet(env, 'producto_stock_v', {
-        query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&or=(nombre.ilike.${like},sku.ilike.${like})&order=stock.desc.nullslast,precio.asc&limit=200`
-      }) || [];
-      const best = pick(r);
-      if (best) return best;
-    } catch {}
-  }
+  // 3) Búsqueda genérica por "toner" (último recurso)
+  try {
+    const like = encodeURIComponent(`%toner%`);
+    const r = await sbGet(env, 'producto_stock_v', {
+      query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&or=(nombre.ilike.${like},sku.ilike.${like})&order=stock.desc.nullslast,precio.asc&limit=200`
+    }) || [];
+    let best = pickWith(r, true);
+    if (!best) best = pickWith(r, false);
+    if (best) return best;
+  } catch {}
 
   return null;
 }
@@ -788,16 +753,6 @@ async function startSalesFromQuery(env, session, toE164, text, ntext, now){
   const extracted = await aiExtractTonerQuery(env, ntext).catch(()=>null);
   const enrichedQ = enrichQueryFromAI(ntext, extracted);
   const best = await findBestProduct(env, enrichedQ);
-
-  const hints = extractModelHints(enrichedQ);
-
-  if (!best && hints.family) {
-    session.stage = 'await_compatibles';
-    session.data.pending_query = enrichedQ;
-    await saveSession(env, session, now);
-    await sendWhatsAppText(env, toE164, `Ese modelo está *sobre pedido* o sin disponibilidad. ¿Quieres que te muestre opciones *compatibles* en otra línea?`);
-    return ok('EVENT_RECEIVED');
-  }
 
   if (best) {
     session.stage = 'ask_qty';
@@ -1012,7 +967,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       return ok('EVENT_RECEIVED');
     }
 
-    // TODO listo → agendar
+    // Agendar
     let pool = [];
     try { pool = await getCalendarPool(env) || []; } catch(e){ console.warn('[GCal] pool', e); }
     const cal = pickCalendarFromPool(pool);
@@ -1045,7 +1000,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
         gcal_event_id: event?.id || null, calendar_id: cal?.gcal_id || null,
         calle: sv.calle || null, numero: sv.numero || null, colonia: sv.colonia || null, ciudad: sv.ciudad || null, estado: sv.estado || null, cp: sv.cp || null,
         created_at: new Date().toISOString()
-      }];
+      }]);
       const os = await sbUpsert(env, 'orden_servicio', osBody, { returning: 'representation' });
       osId = os?.data?.[0]?.id || null;
     } catch (e) { console.warn('[Supabase] OS upsert', e); estado = 'pendiente'; }
@@ -1301,180 +1256,114 @@ async function getLastOpenOS(env, phone) {
   return null;
 }
 
-async function upsertClienteByPhone(env, phone) {
-  try {
-    const exist = await sbGet(env, 'cliente', { query: `select=id&telefono=eq.${phone}&limit=1` });
-    if (exist && exist[0]?.id) return exist[0].id;
-    const ins = await sbUpsert(env, 'cliente', [{ telefono: phone }], { onConflict: 'telefono', returning: 'representation' });
+async function upsertClienteByPhone(env, phone){
+  try{
+    const exist = await sbGet(env, 'cliente', { query:`select=id,telefono&telefono=eq.${phone}&limit=1` });
+    if (exist && exist[0]) return exist[0].id;
+    const ins = await sbUpsert(env, 'cliente', [{ telefono: phone, created_at: new Date().toISOString() }], { onConflict: 'telefono', returning: 'representation' });
     return ins?.data?.[0]?.id || null;
-  } catch (e) {
-    console.warn('upsertClienteByPhone', e);
-    return null;
-  }
+  }catch(e){ console.warn('upsertClienteByPhone', e); return null; }
 }
 
-/* ============================ Address & Customer parsing ============================ */
-function parseCustomerText(text=''){
+/* ============================ Direcciones & Cliente text ============================ */
+function parseAddressLoose(text=''){
+  const t = normalizeBase(text);
   const out = {};
-  try{
-    const t = normalizeBase(text);
-    const em = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
-    if (em) out.email = em[0].toLowerCase();
-    const rfc = text.match(/\b([A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3})\b/i);
-    if (rfc) out.rfc = rfc[1].toUpperCase();
-
-    const cp = text.match(/\b(\d{5})\b/);
-    if (cp) out.cp = cp[1];
-
-    // calle/numero/colonia básico
-    const calle = text.match(/\b(calle|av(?:\.|enida)?|blvd(?:\.|)|boulevard)\s+([^\n,]+?)(?=\s+\d+\b|,|$)/i);
-    if (calle) out.calle = clean(calle[2]);
-    const numero = text.match(/\b(no\.?|número|num\.?)\s*([0-9]+[A-Z]?)\b/i) || text.match(/\b([0-9]+[A-Z]?)\b/);
-    if (numero) out.numero = numero[2] || numero[1];
-    const col = text.match(/\b(col(?:\.|onia)?)\s+([^\n,]+?)(?=,|cp\b|\d{5}\b|$)/i);
-    if (col) out.colonia = clean(col[2]);
-  } catch {}
+  const mcp = t.match(/\b(\d{5})\b/); if (mcp) out.cp = mcp[1];
+  const mnum = text.match(/\b(\d+[A-Z]?)\b/); if (mnum) out.numero = mnum[1];
+  // heurísticas básicas
+  const mcol = text.match(/\b(col(?:onia)?\s*[:\-]?\s*)([A-Za-z0-9\s\.áéíóúñ\-]+)/i);
+  if (mcol) out.colonia = clean(mcol[2]);
+  const mcal = text.match(/\b(calle|av(?:enida)?|blvd\.?)\s*[:\-]?\s*([A-Za-z0-9\s\.áéíóúñ\-]+)/i);
+  if (mcal) out.calle = clean(mcal[2]);
   return out;
 }
 
-function parseAddressLoose(text=''){
+function parseCustomerText(text=''){
   const out = {};
-  try{
-    const cpM = text.match(/\b(\d{5})\b/);
-    if (cpM) out.cp = cpM[1];
-
-    const tokens = text.split(/,|\n/).map(s=>s.trim());
-    for (const tk of tokens){
-      if (!out.calle && /\b(calle|av(?:\.|enida)?|blvd(?:\.|)|boulevard)\b/i.test(tk)) out.calle = clean(tk.replace(/^(calle|av(?:\.|enida)?|blvd(?:\.|)|boulevard)\s+/i,''));
-      if (!out.colonia && /\b(col(?:\.|onia)?)\b/i.test(tk)) out.colonia = clean(tk.replace(/\b(col(?:\.|onia)?)\b/i,'').trim());
-      if (!out.numero && /\b(no\.?|número|num\.?)\s*\w+/i.test(tk)) out.numero = clean(tk.replace(/\b(no\.?|número|num\.?)\s*/i,''));
-    }
-  }catch{}
+  const em = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i); if (em) out.email = em[0].toLowerCase();
+  const mcp = text.match(/\b(\d{5})\b/); if (mcp) out.cp = mcp[1];
   return out;
 }
 
 async function cityFromCP(env, cp){
   if (!cp) return null;
   try{
-    // Intentar tabla 'sepomex' primero; fallback 'cp_mx'
-    const r1 = await sbGet(env, 'sepomex', { query: `select=ciudad,municipio,estado&cp=eq.${cp}&limit=1` });
-    if (r1 && r1[0]) return r1[0];
+    const r = await sbGet(env, 'sepomex_cp', { query:`select=cp,municipio,ciudad,estado&cp=eq.${cp}&limit=1` });
+    return r && r[0] ? r[0] : null;
+  }catch{return null;}
+}
+
+/* ============================ Persistencia sesión (Supabase) ============================ */
+async function loadSession(env, from) {
+  try {
+    const r = await sbGet(env, 'wa_session', { query:`select=from,stage,data,updated_at&from=eq.${from}&limit=1` });
+    if (r && r[0]) return { from, stage: r[0].stage || 'idle', data: r[0].data || {}, updated_at: r[0].updated_at };
   } catch {}
+  return { from, stage:'idle', data:{} };
+}
+
+async function saveSession(env, session, now = new Date()) {
   try{
-    const r2 = await sbGet(env, 'cp_mx', { query: `select=ciudad,municipio,estado&cp=eq.${cp}&limit=1` });
-    if (r2 && r2[0]) return r2[0];
-  } catch {}
-  return null;
+    await sbUpsert(env, 'wa_session', [{
+      from: session.from, stage: session.stage||'idle', data: session.data||{}, updated_at: now.toISOString()
+    }], { onConflict:'from', returning: 'minimal' });
+  }catch(e){ console.warn('saveSession', e); }
 }
 
-/* ============================ Session utils ============================ */
-function promptedRecently(session, key, ms=120000){
-  try{
-    session.data = session.data || {};
-    session.data._prompted = session.data._prompted || {};
-    const last = session.data._prompted[key] ? new Date(session.data._prompted[key]).getTime() : 0;
-    const now = Date.now();
-    if (now - last < ms) return true;
-    session.data._prompted[key] = new Date(now).toISOString();
-    return false;
-  }catch{ return false; }
+function promptedRecently(session, key, ms){
+  const k = `last_prompt_${key}`;
+  const prev = session?.data?.[k] ? new Date(session.data[k]).getTime() : 0;
+  const now = Date.now();
+  if (now - prev < ms) return true;
+  session.data[k] = new Date(now).toISOString();
+  return false;
 }
 
-function buildResumePrompt(session){
-  const st = session?.stage || 'idle';
-  if (st.startsWith('sv_')) return 'Retomamos tu *solicitud de soporte*.';
-  if (st === 'ask_qty') return 'Seguimos con las *piezas* del artículo sugerido.';
-  if (st === 'cart_open') return 'Seguimos con tu *carrito*.';
-  if (st === 'await_invoice') return 'Nos quedamos en *con/sin factura*.';
-  if (st.startsWith('collect_')) return 'Seguimos capturando tus *datos de facturación/envío*.';
-  return '¿Seguimos con lo que traíamos?';
+/* ============================ Supabase utils ============================ */
+function sb(env){ const key = env.SUPABASE_SERVICE_ROLE || env.SUPABASE_KEY; return { url:`${env.SUPABASE_URL}/rest/v1`, key }; }
+
+async function sbGet(env, table, { query }) {
+  const b = sb(env);
+  const url = `${b.url}/${table}?${query}`;
+  const r = await fetch(url, { headers: { apikey:b.key, Authorization:`Bearer ${b.key}` } });
+  if (!r.ok) { console.warn('sbGet', table, r.status); return null; }
+  try { return await r.json(); } catch { return null; }
 }
 
-/* ============================ Supabase helpers ============================ */
-function sbHeaders(env){
-  const key = env.SUPABASE_KEY || env.SB_SERVICE_ROLE || env.SB_KEY || env.SUPABASE_ANON_KEY;
-  return { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type': 'application/json' };
-}
-function sbBase(env){ return (env.SUPABASE_URL || env.SB_URL || '').replace(/\/+$/,''); }
-
-async function sbGet(env, table, { query }){
-  const url = `${sbBase(env)}/rest/v1/${table}?${query}`;
-  const r = await fetch(url, { headers: { ...sbHeaders(env) , Prefer: 'count=none' } });
-  if (!r.ok) { console.warn('sbGet', table, r.status, await r.text()); return []; }
-  return await r.json();
-}
-
-async function sbPatch(env, table, patch, filter){
-  const url = `${sbBase(env)}/rest/v1/${table}?${filter}`;
-  const r = await fetch(url, { method: 'PATCH', headers: { ...sbHeaders(env), Prefer: 'return=representation' }, body: JSON.stringify(patch) });
-  if (!r.ok) { console.warn('sbPatch', table, r.status, await r.text()); return null; }
-  return await r.json();
-}
-
-async function sbUpsert(env, table, body, opts={}){
-  const params = [];
-  if (opts.onConflict) params.push(`on_conflict=${encodeURIComponent(opts.onConflict)}`);
-  if (opts.ignoreDuplicates) params.push('ignoreDuplicates=true');
-  const url = `${sbBase(env)}/rest/v1/${table}${params.length?`?${params.join('&')}`:''}`;
-  const prefer = [`resolution=merge-duplicates`,`return=${opts.returning || 'representation'}`].join(',');
-  const r = await fetch(url, { method:'POST', headers:{ ...sbHeaders(env), Prefer: prefer }, body: JSON.stringify(body) });
+async function sbUpsert(env, table, body, { onConflict='', returning='representation' }={}) {
+  const b = sb(env);
+  const url = `${b.url}/${table}`;
+  const h = { apikey:b.key, Authorization:`Bearer ${b.key}`, 'Content-Type':'application/json', Prefer:`resolution=merge-duplicates${onConflict?`,on_conflict=${onConflict}`:''},return=${returning}` };
+  const r = await fetch(url, { method:'POST', headers:h, body: JSON.stringify(body) });
   if (!r.ok) { console.warn('sbUpsert', table, r.status, await r.text()); return null; }
-  const txt = await r.text();
-  try { return { data: txt ? JSON.parse(txt) : [] }; } catch { return { data: [] }; }
+  try { return await r.json(); } catch { return null; }
 }
 
-async function sbRpc(env, fn, args={}){
-  const url = `${sbBase(env)}/rest/v1/rpc/${fn}`;
-  const r = await fetch(url, { method:'POST', headers: sbHeaders(env), body: JSON.stringify(args) });
+async function sbPatch(env, table, body, where) {
+  const b = sb(env);
+  const url = `${b.url}/${table}?${where}`;
+  const h = { apikey:b.key, Authorization:`Bearer ${b.key}`, 'Content-Type':'application/json', Prefer:'return=representation' };
+  const r = await fetch(url, { method:'PATCH', headers:h, body: JSON.stringify(body) });
+  if (!r.ok) { console.warn('sbPatch', table, r.status, await r.text()); return null; }
+  try { return await r.json(); } catch { return null; }
+}
+
+async function sbRpc(env, fn, args={}) {
+  const b = sb(env);
+  const url = `${b.url}/rpc/${fn}`;
+  const r = await fetch(url, { method: 'POST', headers: { apikey:b.key, Authorization:`Bearer ${b.key}`, 'Content-Type':'application/json' }, body: JSON.stringify(args) });
   if (!r.ok) { console.warn('sbRpc', fn, r.status, await r.text()); return null; }
-  return await r.json();
+  try { return await r.json(); } catch { return null; }
 }
 
-/* ============================ KV (sessions) ============================ */
-const _memSessions = new Map(); // fallback memoria (dev)
+/* ============================ Boilerplate ============================ */
+function ok(msg='EVENT_RECEIVED'){ return new Response(msg, { status: 200 }); }
+async function safeJson(req){ try{ return await req.json(); }catch{ return {}; } }
+function buildResumePrompt(session){ return '¿Seguimos con lo pendiente o empezamos algo nuevo?'; }
 
-async function loadSession(env, from){
-  try{
-    const key = `wa:${from}`;
-    const kv = env.SESSION_KV || env.SESSIONS || env.KV || null;
-    if (kv && kv.get) {
-      const raw = await kv.get(key);
-      return raw ? JSON.parse(raw) : { from, stage:'idle', data:{} };
-    }
-  } catch (e){ console.warn('loadSession kv', e); }
-  // fallback
-  return _memSessions.get(from) || { from, stage:'idle', data:{} };
-}
-
-async function saveSession(env, session, now=new Date()){
-  try{
-    session.data = session.data || {};
-    session.data.last_seen_at = now.toISOString();
-    const key = `wa:${session.from}`;
-    const kv = env.SESSION_KV || env.SESSIONS || env.KV || null;
-    const raw = JSON.stringify(session);
-    if (kv && kv.put) { await kv.put(key, raw, { expirationTtl: 60*60*24*14 }); return; }
-  } catch (e){ console.warn('saveSession kv', e); }
-  _memSessions.set(session.from, session);
-}
-
-/* ============================ Misc HTTP ============================ */
-async function safeJson(req){
-  try{ return await req.json(); }catch{ try{ const t = await req.text(); return t?JSON.parse(t):{}; }catch{ return {}; } }
-}
-function ok(body='OK'){ return new Response(typeof body==='string'? body : JSON.stringify(body), { status:200 }); }
-
-/* ============================ CRON (recordatorio simple) ============================ */
+/* ============================ Cron (placeholder) ============================ */
 async function cronReminders(env){
-  // Implementación mínima (no-op con contadores) para no romper el flujo si no existe tabla de recordatorios.
-  try{
-    // Ejemplo: podrías buscar OS de mañana y notificar.
-    // Dejamos un resultado de diagnóstico simple.
-    return { ok:true, ran:true, ts:new Date().toISOString() };
-  }catch(e){
-    console.warn('cronReminders', e);
-    return { ok:false, error:String(e) };
-  }
+  // Aquí podrías disparar recordatorios de OS/pedidos, etc.
+  return { ok:true, ts:new Date().toISOString() };
 }
-
-/* ============================ Fin del archivo ============================ */
