@@ -1,15 +1,13 @@
 /**
  * CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
- * Sep/2025 – build “Borbón-R5”
+ * Sep/2025 – build “Borbón-R5” (full)
  *
- * R5 sobre R4:
- * - Manejo de mensajes NO-TEXTO (audio, imagen, document, sticker, contacts, location) con respuesta amable.
- * - Soporte de respuestas por botones WhatsApp (interactive.button_reply.title).
- * - Idempotencia con last_mid y early-return más estricto.
- * - Defensas extra en parseos y null-safety (sin cambiar firmas).
- * - FIX inventario: evitar que DocuColor 550/560/570 sea sugerido para Versant; mejora familia/color.
- * - FIX UX sin stock: se muestra la misma tarjeta de producto, indicando “0 pzas — sobre pedido”.
- * - FIX soporte: mientras estés en flujo sv_* (pidiendo datos), NUNCA cambia a ventas por “docucolor 550”, etc.
+ * Cambios recientes:
+ * - Fix: DocuColor 550/560/570 ya NO se confunden con Versant.
+ * - Fix: Si el match existe con stock 0, se muestra igual y se ofrece “sobre pedido” (no saltar a compatibles).
+ * - Fix: Cuando el usuario está en soporte o escribe “marca + modelo” (p. ej. “xerox docucolor 550”),
+ *        se fuerza flujo de SOPORTE y NO se dispara ventas.
+ * - Robustecidos parsers y null-safety.
  */
 
 export default {
@@ -58,7 +56,7 @@ export default {
           session.data.customer.nombre = toTitleCase(firstWord(profileName));
         }
 
-        // Idempotencia por mid
+        // Idempotencia por mid (si Meta reintenta)
         if (session?.data?.last_mid && session.data.last_mid === mid) return ok('EVENT_RECEIVED');
         session.data.last_mid = mid;
 
@@ -95,16 +93,13 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // === BLOQUE DE PRIORIDAD SOPORTE (hard-lock) ===
-        // Si estamos en un flujo sv_*, forzamos soporte ANTES de evaluar ventas/FAQs.
-        if (session.stage?.startsWith('sv_')) {
-          const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support' });
-          return handled;
-        }
-
         // ===== Intentos globales =====
-        const supportIntent = isSupportIntent(ntext) || (await intentIs(env, text, 'support'));
-        const salesIntent = RX_INV_Q.test(ntext) || (await intentIs(env, text, 'sales'));
+        const supportLike = isSupportIntent(ntext) || looksLikeMakeModel(ntext); // <-- fuerza soporte si parece marca+modelo
+        const supportIntent = supportLike || (await intentIs(env, text, 'support'));
+
+        // ventas solo si NO estamos en soporte ni en modo sv_*
+        const allowedSales = !supportLike && !String(session.stage || '').startsWith('sv_');
+        const salesIntent = allowedSales && (RX_INV_Q.test(ntext) || (await intentIs(env, text, 'sales')));
 
         // ===== Saludo =====
         const isGreet = RX_GREET.test(lowered);
@@ -186,8 +181,8 @@ export default {
           }
         }
 
-        // ===== Cambio de intención en caliente (prioridad soporte) =====
-        if (supportIntent) {
+        // ===== Prioridad soporte si estamos en sv_* o parece marca+modelo =====
+        if (supportIntent || session.stage?.startsWith('sv_')) {
           const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support' });
           return handled;
         }
@@ -258,6 +253,14 @@ function isSupportIntent(ntext='') {
   return phrase || (hasProblem && hasDevice) || /\b(soporte|servicio|visita)\b/.test(t);
 }
 
+/** Marca+modelo típico (bloquea ventas) */
+function looksLikeMakeModel(ntext=''){
+  const t = normalizeBase(ntext);
+  const hasBrand = /\b(xerox|fujifilm|fuji\s?film)\b/.test(t);
+  const hasModel = /(versant[\s-]*\d+|versalink\s*\w+|altalink\s*\w+|docucolor\s*[\w/]+|primelink\s*\w+|prime\s*link\s*\w+|\bc\d{2,4}\b|\bb\d{2,4}\b|\b(550|560|570|80|180|2100|280|4100)\b)/i.test(t);
+  return hasBrand && hasModel;
+}
+
 const RX_NEG_NO = /\b(no|nel|ahorita no)\b/i;
 const RX_DONE = /\b(es(ta)?\s*todo|ser[ií]a\s*todo|nada\s*m[aá]s|con\s*eso|as[ií]\s*est[aá]\s*bien|ya\s*qued[oó]|listo|finaliza(r|mos)?|termina(r)?)\b/i;
 const RX_YES = /\b(s[ií]|sí|si|claro|va|dale|sale|correcto|ok|seguim(?:os)?|contin[uú]a(?:r)?|adelante|afirmativo|de acuerdo|me sirve)\b/i;
@@ -303,12 +306,7 @@ function formatMoneyMXN(n){
 }
 function numberOrZero(n){ const v=Number(n||0); return Number.isFinite(v)?v:0; }
 function priceWithIVA(n){ const v=Number(n||0); return `${formatMoneyMXN(v)} + IVA`; }
-
-function ok(msg='OK'){ return new Response(typeof msg==='string'?msg:JSON.stringify(msg), { status: 200 }); }
-
-async function safeJson(req){
-  try{ return await req.json(); }catch{ return {}; }
-}
+function ok(body='OK'){ return new Response(typeof body==='string'?body:JSON.stringify(body), { status: 200 }); }
 
 /* ============================ IA ============================ */
 async function aiCall(env, messages, {json=false}={}) {
@@ -478,9 +476,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
   const cart = session.data.cart || [];
 
   if (RX_DONE.test(lowered) || (RX_NEG_NO.test(lowered) && cart.length > 0)) {
-    if (!cart.length && session.data.last_candidate) {
-      addWithStockSplit(session, session.data.last_candidate, 1);
-    }
+    if (!cart.length && session.data.last_candidate) addWithStockSplit(session, session.data.last_candidate, 1);
     session.stage = 'await_invoice';
     await saveSession(env, session, now);
     await sendWhatsAppText(env, toE164, `Perfecto 🙌 ¿La cotizamos *con factura* o *sin factura*?`);
@@ -524,18 +520,8 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
       await sendWhatsAppText(env, toE164, `${renderProducto(best)}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; hay ${s} en stock y el resto sería *sobre pedido*.`);
       return ok('EVENT_RECEIVED');
     } else {
-      // Si detectamos familia → ofrecer compatibles, PERO primero intentamos “sobre pedido” mostrando tarjeta 0 pzas
       const hints = extractModelHints(enrichedQ);
       if (hints.family && ((env.STRICT_FAMILY_MATCH||'').toString().toLowerCase() !== 'true')) {
-        // Buscar por familia aunque no haya stock para mostrar tarjeta con 0 pzas
-        const fallback = await findBestProduct(env, enrichedQ, { ignoreFamily: false });
-        if (fallback) {
-          session.data.last_candidate = fallback;
-          session.stage = 'ask_qty';
-          await saveSession(env, session, now);
-          await sendWhatsAppText(env, toE164, `${renderProducto({ ...fallback, stock: numberOrZero(fallback.stock) })}\n\nEste artículo está *sobre pedido*. ¿Cuántas piezas necesitas?`);
-          return ok('EVENT_RECEIVED');
-        }
         session.stage = 'await_compatibles';
         session.data.pending_query = enrichedQ;
         await saveSession(env, session, now);
@@ -666,7 +652,7 @@ async function handleCollectSequential(env, session, toE164, text, now){
   const res = await createOrderFromSession(env, session, toE164);
   if (res?.ok) {
     await sendWhatsAppText(env, toE164, `¡Listo! Generé tu solicitud 🙌\n*Total estimado:* ${formatMoneyMXN(res.total)} + IVA\nUn asesor te confirmará entrega y forma de pago.`);
-    await notifySupport(env, `Nuevo pedido #${res.pedido_id ?? '—'}\nCliente: ${c.nombre} (${toE164})`);
+    await notifySupport(env, `Nuevo pedido #${res?.pedido_id ?? '—'}\nCliente: ${c.nombre} (${toE164})`);
   } else {
     await sendWhatsAppText(env, toE164, `Creé tu solicitud y la pasé a un asesor humano para confirmar detalles. 🙌`);
     await notifySupport(env, `Pedido (parcial) ${toE164}. Error: ${res?.error || 'N/A'}`);
@@ -677,9 +663,6 @@ async function handleCollectSequential(env, session, toE164, text, now){
   await sendWhatsAppText(env, toE164, `¿Puedo ayudarte con algo más? (Sí / No)`);
   return ok('EVENT_RECEIVED');
 }
-
-function summaryCart(cart = []) { return cart.map(i => `${i.product?.nombre} x ${i.qty}${i.backorder ? ' (sobre pedido)' : ''}`).join('; '); }
-function splitCart(cart = []){ return { inStockList: cart.filter(i => !i.backorder), backOrderList: cart.filter(i => i.backorder) }; }
 
 /* =============== Inventario & Pedido =============== */
 function extractModelHints(text='') {
@@ -721,7 +704,6 @@ function productMatchesFamily(p, family){
   const s = normalizeBase([p?.nombre, p?.sku, p?.marca, p?.compatible].join(' '));
 
   if (family==='versant'){
-    // Sólo coincidencias claras de Versant
     const hit = /\bversant\b/i.test(s) || /\b(80|180|2100|280|4100)\b/i.test(s);
     const bad = /(c60|c70|c75|docucolor|prime\s*link|primelink|altalink|versa\s*link|\b550\b|\b560\b|\b570\b)/i.test(s);
     return hit && !bad;
@@ -807,15 +789,9 @@ function extractColorWord(text=''){
 async function startSalesFromQuery(env, session, toE164, text, ntext, now){
   const extracted = await aiExtractTonerQuery(env, ntext).catch(()=>null);
   const enrichedQ = enrichQueryFromAI(ntext, extracted);
-  let best = await findBestProduct(env, enrichedQ);
+  const best = await findBestProduct(env, enrichedQ);
 
   const hints = extractModelHints(enrichedQ);
-
-  // Si no hay best pero hay familia, intenta mostrar tarjeta “sobre pedido” antes de compatibles
-  if (!best && hints.family) {
-    const fallback = await findBestProduct(env, enrichedQ, { ignoreFamily: false });
-    if (fallback) best = fallback;
-  }
 
   if (!best && hints.family) {
     session.stage = 'await_compatibles';
@@ -831,8 +807,10 @@ async function startSalesFromQuery(env, session, toE164, text, ntext, now){
     session.data.last_candidate = best;
     await saveSession(env, session, now);
     const s = numberOrZero(best.stock);
-    const extra = s > 0 ? '' : `\n\nEste artículo está *sobre pedido*.`;
-    await sendWhatsAppText(env, toE164, `${renderProducto(best)}${extra}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; hay ${s} en stock y el resto sería *sobre pedido*.`);
+    await sendWhatsAppText(
+      env, toE164,
+      `${renderProducto(best)}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; hay ${s} en stock y el resto sería *sobre pedido*.`
+    );
     return ok('EVENT_RECEIVED');
   } else {
     await sendWhatsAppText(env, toE164, `No encontré una coincidencia directa 😕. Te conecto con un asesor…`);
@@ -1022,7 +1000,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       session.data.sv_need_next = needed[0];
       await saveSession(env, session, now);
       const Q = {
-        modelo: '¿Qué *marca y modelo* es tu impresora? (p.ej., *Xerox Versant 180*)',
+        modelo: '¿Qué *marca y modelo* es tu impresora? (p.ej., *Xerox DocuColor 550* o *Xerox Versant 180*)',
         falla: '¿Me describes brevemente la *falla*? (p.ej., “*atasco en fusor*”, “*no imprime*”)',
         calle: '¿En qué *calle* está el equipo?',
         numero: '¿Qué *número* es?',
@@ -1036,7 +1014,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       return ok('EVENT_RECEIVED');
     }
 
-    // listo → agendar
+    // Agendar
     let pool = [];
     try { pool = await getCalendarPool(env) || []; } catch(e){ console.warn('[GCal] pool', e); }
     const cal = pickCalendarFromPool(pool);
@@ -1069,7 +1047,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
         gcal_event_id: event?.id || null, calendar_id: cal?.gcal_id || null,
         calle: sv.calle || null, numero: sv.numero || null, colonia: sv.colonia || null, ciudad: sv.ciudad || null, estado: sv.estado || null, cp: sv.cp || null,
         created_at: new Date().toISOString()
-      }];
+      }]];
       const os = await sbUpsert(env, 'orden_servicio', osBody, { returning: 'representation' });
       osId = os?.data?.[0]?.id || null;
     } catch (e) { console.warn('[Supabase] OS upsert', e); estado = 'pendiente'; }
@@ -1082,7 +1060,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       session.stage = 'sv_scheduled';
     } else {
       await sendWhatsAppText(env, toE164, `Tengo tus datos ✍️. En breve te confirmo el horario exacto por este medio.`);
-      await notifySupport(env, `OS *pendiente/agendar* para ${toE164}\nEquipo: ${sv.marca||''} ${sv.modelo||''}\nFalla: ${sv.falla}\nDirección: ${sv.calle} ${sv.numero} ${sv.colonia}, ${sv.cp} ${sv.ciudad||''}\nNombre: ${sv.nombre} | Email: ${sv.email}`);
+      await notifySupport(env, `OS *pendiente/agendar* para ${toE164}\nEquipo: ${sv.marca||''} ${sv.modelo||''}\nFalla: ${sv.falla}\nDirección: ${sv.calle} ${sv.numero}, ${sv.colonia}, ${sv.cp} ${sv.ciudad||''}\nNombre: ${sv.nombre} | Email: ${sv.email}`);
       session.stage = 'sv_scheduled';
     }
 
@@ -1285,7 +1263,7 @@ async function findNearestFreeSlot(env, calendarId, when, tz) {
     const busy = await isBusy(env, calendarId, curStart.toISOString(), curEnd.toISOString());
     if (!busy) break;
     curStart = new Date(curStart.getTime()+30*60*1000);
-    curEnd = new Date(curStart.getTime()+30*60*1000);
+    curEnd = new Date(curStart.getTime()+60*60*1000);
     const h = curStart.getHours();
     if (h >= 15) {
       curStart.setDate(curStart.getDate()+1); curStart.setHours(10,0,0,0);
@@ -1327,112 +1305,119 @@ async function getLastOpenOS(env, phone) {
 
 async function upsertClienteByPhone(env, phone){
   try{
-    const exist = await sbGet(env, 'cliente', { query: `select=id&telefono=eq.${phone}&limit=1` });
-    if (exist && exist[0]?.id) return exist[0].id;
+    const exist = await sbGet(env, 'cliente', { query: `select=id,telefono&telefono=eq.${phone}&limit=1` });
+    if (exist && exist[0]) return exist[0].id;
     const ins = await sbUpsert(env, 'cliente', [{ telefono: phone }], { onConflict: 'telefono', returning: 'representation' });
     return ins?.data?.[0]?.id || null;
   }catch(e){ console.warn('upsertClienteByPhone', e); return null; }
 }
 
-/* ============================ Sesión (KV) ============================ */
-async function loadSession(env, phone){
-  const kv = env.SESS || env.SESSION || env.SESSION_KV;
-  if (!kv) return { from: phone, stage: 'idle', data: {} };
-  try{
-    const raw = await kv.get(`sess:${phone}`);
-    if (!raw) return { from: phone, stage: 'idle', data: {} };
-    return JSON.parse(raw);
-  }catch{ return { from: phone, stage: 'idle', data: {} }; }
+/* ============================ Direcciones / Text parsing ============================ */
+function parseCustomerText(t=''){
+  const out = {};
+  const mcp = t.match(/\b(CP|C\.?P\.?)\s*(\d{5})\b/i) || t.match(/\b(\d{5})\b/);
+  if (mcp) out.cp = mcp[mcp.length-1];
+  const mnum = t.match(/\b#?\s?(\d+[A-Z]?)\b/);
+  if (mnum) out.numero = mnum[1];
+  return out;
 }
 
-async function saveSession(env, session, now){
-  const kv = env.SESS || env.SESSION || env.SESSION_KV;
-  if (!kv) return;
-  try{
-    session.updated_at = (now || new Date()).toISOString();
-    await kv.put(`sess:${session.from}`, JSON.stringify(session), { expirationTtl: 60*60*24*7 }); // 7 días
-  }catch(e){ console.warn('saveSession', e); }
+/** súper laxo: intenta sacar calle/colonia/cp */
+function parseAddressLoose(t=''){
+  const out = {};
+  const mcp = t.match(/\b(\d{5})\b/); if (mcp) out.cp = mcp[1];
+  const col = t.match(/\bcol(?:\.|onia)?\s+([A-Za-z0-9\s\-_]+?)(?=,|\d{5}|$)/i);
+  if (col) out.colonia = clean(col[1]);
+  const calle = t.match(/\b(calle|av(?:\.|enida)?|blvd\.?)\s+([A-Za-z0-9\s\-_]+?)(?=,|\d+|col|cp|$)/i);
+  if (calle) out.calle = clean(calle[2]);
+  return out;
 }
 
+/* ============================ Misc UI helpers ============================ */
 function buildResumePrompt(session){
-  if (session.stage?.startsWith('sv_')) return 'Seguimos con tu *solicitud de soporte*.';
-  if ((session.data?.cart||[]).length>0) return `Seguimos con tu carrito: ${summaryCart(session.data.cart)}.`;
-  return '¿Seguimos donde nos quedamos?';
+  try{
+    if (session.stage?.startsWith('sv_')) return 'Seguimos con tu *soporte*.';
+    if (session.stage==='cart_open' || session.stage==='ask_qty') {
+      const items = (session.data?.cart||[]).map(i => `${i.product?.nombre} x ${i.qty}`).join(', ');
+      return `Tenías carrito abierto: ${items || 'vacío'}.`;
+    }
+  }catch{}
+  return '¿Continuamos donde nos quedamos?';
 }
 
 function promptedRecently(session, key, ms){
-  session.data = session.data || {};
-  const k = `last_prompt_${key}`;
+  const k = `_recent_${key}`;
+  const last = session?.data?.[k] ? new Date(session.data[k]).getTime() : 0;
   const now = Date.now();
-  const last = Number(session.data[k] || 0);
   if (now - last < ms) return true;
-  session.data[k] = now;
+  session.data[k] = new Date().toISOString();
   return false;
 }
 
-/* ============================ Direcciones / CP ============================ */
+/* ============================ Supabase REST helpers ============================ */
+function sbHeaders(env){
+  return { 'apikey': env.SUPABASE_ANON_KEY, 'Authorization': `Bearer ${env.SUPABASE_ANON_KEY}`, 'Content-Type':'application/json' };
+}
+function sbUrl(env, table){ return `${env.SUPABASE_URL}/rest/v1/${table}`; }
+
+async function sbGet(env, table, { query }){
+  const url = `${sbUrl(env, table)}?${query}`;
+  const r = await fetch(url, { headers: sbHeaders(env) });
+  if (!r.ok) { console.warn('sbGet', table, r.status, await r.text()); return null; }
+  return await r.json();
+}
+async function sbUpsert(env, table, rows, { onConflict, returning='representation' }={}){
+  const url = `${sbUrl(env, table)}${onConflict?`?on_conflict=${encodeURIComponent(onConflict)}`:''}`;
+  const r = await fetch(url, { method:'POST', headers: { ...sbHeaders(env), Prefer: `resolution=merge-duplicates,return=${returning}` }, body: JSON.stringify(rows) });
+  if (!r.ok) { console.warn('sbUpsert', table, r.status, await r.text()); return null; }
+  const data = returning==='minimal' ? null : await r.json();
+  return { data };
+}
+async function sbPatch(env, table, patch, filter){
+  const url = `${sbUrl(env, table)}?${filter}`;
+  const r = await fetch(url, { method:'PATCH', headers: { ...sbHeaders(env), Prefer:'return=minimal' }, body: JSON.stringify(patch) });
+  if (!r.ok) console.warn('sbPatch', table, r.status, await r.text());
+}
+async function sbRpc(env, fn, args){
+  const url = `${env.SUPABASE_URL}/rest/v1/rpc/${fn}`;
+  const r = await fetch(url, { method:'POST', headers: sbHeaders(env), body: JSON.stringify(args||{}) });
+  if (!r.ok) { console.warn('sbRpc', fn, r.status, await r.text()); return null; }
+  return await r.json();
+}
+
+/* ============================ City from CP ============================ */
 async function cityFromCP(env, cp){
   if (!cp) return null;
   try{
-    const r = await sbGet(env, 'cp_mx', { query: `select=cp,municipio,estado,ciudad&cp=eq.${encodeURIComponent(cp)}&limit=1` });
-    if (r && r[0]) return r[0];
-  }catch{}
-  return null;
-}
-function parseAddressLoose(text){
-  const out = {};
-  const mcp = text.match(/\b(\d{5})\b/); if (mcp) out.cp = mcp[1];
-  const street = text.match(/\bcalle\s+([a-z0-9\s\.#\-]+)/i); if (street) out.calle = clean(street[1]);
-  const num = text.match(/\bn[uú]mero\s+(\d+[a-z]?)/i); if (num) out.numero = num[1];
-  const col = text.match(/\bcoloni[ao]\s+([a-z0-9\s\.\-]+)/i); if (col) out.colonia = clean(col[1]);
-  return out;
-}
-function parseCustomerText(text){
-  const out = {};
-  const em = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i); if (em) out.email = em[0].toLowerCase();
-  const nm = text.match(/\b([A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3})\b/i); if (nm) out.rfc = nm[1].toUpperCase();
-  return out;
+    const r = await sbGet(env, 'sepomex_cp', { query: `select=cp,estado,municipio,ciudad&cp=eq.${encodeURIComponent(cp)}&limit=1` });
+    return r && r[0] ? r[0] : null;
+  }catch{ return null; }
 }
 
-/* ============================ Supabase helpers ============================ */
-function sbHeaders(env){
-  const key = env.SUPABASE_ANON_KEY || env.SUPABASE_SERVICE_KEY || env.SUPABASE_KEY;
-  return { 'apikey': key, 'Authorization': `Bearer ${key}`, 'Content-Type':'application/json' };
+/* ============================ KV Session ============================ */
+async function loadSession(env, key){
+  try{
+    const ns = env.SESSION || env.SESSIONS || env.SESSION_NS; // KV binding
+    if (!ns || !ns.get) return { id:key, data:{}, stage:'idle', from:key };
+    const raw = await ns.get(`s:${key}`);
+    return raw ? JSON.parse(raw) : { id:key, data:{}, stage:'idle', from:key };
+  }catch(e){ console.warn('loadSession', e); return { id:key, data:{}, stage:'idle', from:key }; }
 }
-function sbBase(env){
-  return (env.SUPABASE_URL || '').replace(/\/+$/,'') + '/rest/v1';
-}
-async function sbGet(env, table, { query }){
-  if (!env.SUPABASE_URL) { console.warn('sbGet no SUPABASE_URL'); return []; }
-  const url = `${sbBase(env)}/${table}?${query}`;
-  const r = await fetch(url, { headers: sbHeaders(env) });
-  if (!r.ok){ console.warn('sbGet', table, r.status, await r.text()); return []; }
-  return await r.json();
-}
-async function sbUpsert(env, table, rows, { onConflict, returning='minimal' }={}){
-  if (!env.SUPABASE_URL) { console.warn('sbUpsert no SUPABASE_URL'); return { data: [] }; }
-  const url = `${sbBase(env)}/${table}${onConflict?`?on_conflict=${encodeURIComponent(onConflict)}`:''}`;
-  const r = await fetch(url, { method:'POST', headers: sbHeaders(env), body: JSON.stringify(rows), cf:{cacheTtl:0} , });
-  if (!r.ok){ console.warn('sbUpsert', table, r.status, await r.text()); return { data: [] }; }
-  if (returning==='representation') return { data: await r.json() };
-  return { data: [] };
-}
-async function sbPatch(env, table, patch, filterQuery){
-  if (!env.SUPABASE_URL) { console.warn('sbPatch no SUPABASE_URL'); return; }
-  const url = `${sbBase(env)}/${table}?${filterQuery}`;
-  const r = await fetch(url, { method:'PATCH', headers: sbHeaders(env), body: JSON.stringify(patch) });
-  if (!r.ok){ console.warn('sbPatch', table, r.status, await r.text()); }
-}
-async function sbRpc(env, fn, args){
-  if (!env.SUPABASE_URL) { console.warn('sbRpc no SUPABASE_URL'); return []; }
-  const url = `${sbBase(env)}/rpc/${fn}`;
-  const r = await fetch(url, { method:'POST', headers: sbHeaders(env), body: JSON.stringify(args||{}) });
-  if (!r.ok){ console.warn('sbRpc', fn, r.status, await r.text()); return []; }
-  return await r.json();
+async function saveSession(env, session, now=new Date()){
+  try{
+    const ns = env.SESSION || env.SESSIONS || env.SESSION_NS;
+    if (!ns || !ns.put) return;
+    await ns.put(`s:${session.from}`, JSON.stringify(session), { expirationTtl: 60*60*24*7 });
+  }catch(e){ console.warn('saveSession', e); }
 }
 
-/* ============================ Cron (recordatorio simple) ============================ */
+/* ============================ Cron (placeholder) ============================ */
 async function cronReminders(env){
-  // Hook para hacer recordatorios/pedidos pendientes si deseas
-  return { ok:true };
+  // Aquí podrías consultar OS pendientes para recordar al cliente, etc.
+  return { ok:true, ranAt: new Date().toISOString() };
+}
+
+/* ============================ Safe JSON ============================ */
+async function safeJson(req){
+  try{ return await req.json(); }catch{ return {}; }
 }
