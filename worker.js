@@ -1288,8 +1288,7 @@ async function upsertClienteByPhone(env, phone){
 async function sbGet(env, table, { query }) {
   const url = `${env.SUPABASE_URL}/rest/v1/${table}?${query}`;
   const r = await fetch(url, { headers: { apikey: env.SUPABASE_ANON_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE || env.SUPABASE_ANON_KEY}` } });
-  if (!r.ok) { console.warn('
-  if (!r.ok) { console.warn('sbGet', r.status, await r.text()); return []; }
+    if (!r.ok) { console.warn('sbGet', r.status, await r.text()); return []; }
   try { return await r.json(); } catch { return []; }
 }
 
