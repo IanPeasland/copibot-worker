@@ -216,20 +216,36 @@ if (req.method === 'POST' && url.pathname === '/') {
     return ok('EVENT_RECEIVED');
   }
 
-  // --- Rutas no coincidentes → 404 controlado (fuera del try/catch) ---
-  return new Response('Not found', { status: 404 });
-}, // <-- cierra método fetch
+      // --- Rutas no coincidentes → 404 controlado (fuera del try/catch) ---
+      return new Response('Not found', { status: 404 });
+    } catch (e) {
+      console.error('Worker error', e);
+      // Fail-safe: intenta rescatar el remitente y avisa que sí llegó el msg
+      try {
+        const body = await safeJson(req).catch(() => ({}));
+        const ctz = extractWhatsAppContext(body);
+        if (ctz?.fromE164) {
+          await sendWhatsAppText(
+            env,
+            ctz.fromE164,
+            'Tu mensaje llegó, tuve un problema momentáneo pero ya estoy encima 🙂'
+          );
+        }
+      } catch {}
+      return new Response('EVENT_RECEIVED', { status: 200 });
+    }
+  }, // <-- cierra método fetch dentro del export default
 
-// Cron (scheduled) opcional
-async scheduled(event, env, ctx) {
-  try {
-    const out = await cronReminders(env);
-    console.log('cron run', out);
-  } catch (e) {
-    console.error('cron error', e);
+  // Cron (scheduled) opcional
+  async scheduled(event, env, ctx) {
+    try {
+      const out = await cronReminders(env);
+      console.log('cron run', out);
+    } catch (e) {
+      console.error('cron error', e);
+    }
   }
-}
-}; // <-- cierra export default
+}; // <-- cierra export default (objeto completo)
 
 /* ============================ Utilidades HTTP ============================ */
 async function safeJson(req) {
@@ -1617,6 +1633,7 @@ async function cronReminders(env){
 }
       
 };      
+
 
 
 
