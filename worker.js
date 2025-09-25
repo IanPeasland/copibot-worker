@@ -364,7 +364,7 @@ function addWithStockSplit(session, product, qty){
   if (rest > 0) pushCart(session, product, rest, true);
 }
 
-/** Render compacto y claro (no bloquea por stock=0: muestra “sobre pedido”). */
+/** Render compacto y claro (si stock=0, muestra “sobre pedido”, no corta flujo). */
 function renderProducto(p) {
   const precio = priceWithIVA(p.precio);
   const sku = p.sku ? `\nSKU: ${p.sku}` : '';
@@ -438,7 +438,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     const extracted = await aiExtractTonerQuery(env, cleanQ).catch(()=>null);
     const enrichedQ = enrichQueryFromAI(cleanQ, extracted);
 
-    // —— Buscamos con relajación escalonada
+    // —— Búsqueda escalonada
     let best = await findBestProduct(env, enrichedQ, { relaxed: false });
     if (!best) best = await findBestProduct(env, enrichedQ, { relaxed: true });
     if (!best) best = await findBestProduct(env, 'toner', { relaxed: true, ignoreFamily: true });
@@ -542,11 +542,9 @@ function firstMissing(list, c={}){ for (const k of list){ if (!truthy(c[k])) ret
 
 /* =============== Inventario & Búsquedas =============== */
 
-/** Heurística ligera de familia/color */
 function extractModelHints(text='') {
   const t = normalizeWithAliases(text);
   const out = {};
-  // —— Familia
   if (/\bversant\b/.test(t) || /\b(80|180|2100|280|4100)\b/.test(t)) out.family = 'versant';
   else if (/\bversa[-\s]?link\b/.test(t)) out.family = 'versalink';
   else if (/\balta[-\s]?link\b/.test(t)) out.family = 'altalink';
@@ -555,7 +553,6 @@ function extractModelHints(text='') {
   else if (/\bapeos\b/.test(t)) out.family = 'apeos';
   else if (/\bc(60|70|75)\b/.test(t)) out.family = 'c70';
 
-  // —— Color
   if (/\b(amarillo|yellow)\b/.test(t)) out.color = 'yellow';
   else if (/\bmagenta\b/.test(t)) out.color = 'magenta';
   else if (/\b(cyan|cian)\b/.test(t)) out.color = 'cyan';
@@ -599,12 +596,7 @@ function productMatchesFamily(p, family){
   return s.includes(family);
 }
 
-/**
- * Búsqueda escalonada:
- * 1) Estricta: trigramas + color + familia
- * 2) Relajada: trigramas + color (sin familia)
- * 3) Fallbacks por LIKEs a vista producto_stock_v
- */
+/** Búsqueda escalonada (estricta → relajada → genérica) */
 async function findBestProduct(env, queryText, opts = {}) {
   const { relaxed = false, ignoreFamily = false } = opts;
   const hints = extractModelHints(queryText);
@@ -612,14 +604,11 @@ async function findBestProduct(env, queryText, opts = {}) {
 
   const pick = (arr) => {
     if (!Array.isArray(arr) || !arr.length) return null;
-    // 1) Color
     let pool = colorCode ? arr.filter(p => productHasColor(p, colorCode)) : arr.slice();
-    // 2) Familia (solo si no estamos en modo “relajado” y no se indica ignoreFamily)
     if (hints.family && !relaxed && !ignoreFamily) {
       const familyPool = pool.filter(p => productMatchesFamily(p, hints.family));
-      pool = familyPool.length ? familyPool : pool; // si vacía, NO devolvemos null: mantenemos pool sin familia.
+      pool = familyPool.length ? familyPool : pool;
     }
-    // Prioriza stock y precio
     pool.sort((a,b) => {
       const sa = numberOrZero(a.stock) > 0 ? 1 : 0;
       const sb = numberOrZero(b.stock) > 0 ? 1 : 0;
@@ -629,7 +618,6 @@ async function findBestProduct(env, queryText, opts = {}) {
     return pool[0] || null;
   };
 
-  // —— 1) RPC trigramas sobre producto
   try {
     const res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 50 }) || [];
     const best = pick(res);
@@ -638,7 +626,6 @@ async function findBestProduct(env, queryText, opts = {}) {
     console.warn('[findBestProduct] rpc match_products_trgm', e);
   }
 
-  // —— 2) LIKE por familia (vista unificada)
   const fam = (!ignoreFamily && hints.family) ? hints.family : null;
   if (fam && !relaxed) {
     try {
@@ -653,7 +640,6 @@ async function findBestProduct(env, queryText, opts = {}) {
     }
   }
 
-  // —— 3) LIKE “toner” general (si llegamos aquí, relajamos todo)
   try {
     const like = encodeURIComponent(`%toner%`);
     const r = await sbGet(env, 'producto_stock_v', {
@@ -677,206 +663,13 @@ function extractColorWord(text=''){
   return null;
 }
 
-/** Entrada a ventas desde intención de mensaje libre */
 async function startSalesFromQuery(env, session, toE164, text, ntext, now){
   const extracted = await aiExtractTonerQuery(env, ntext).catch(()=>null);
   const enrichedQ = enrichQueryFromAI(ntext, extracted);
 
-  // —— Escalonado: estricta → relajada → genérica
   let best = await findBestProduct(env, enrichedQ, { relaxed: false });
   if (!best) best = await findBestProduct(env, enrichedQ, { relaxed: true });
   if (!best) best = await findBestProduct(env, 'toner', { relaxed: true, ignoreFamily: true });
-
-  if (best) {
-    session.stage = 'ask_qty';
-    session.data.cart = session.data.cart || [];
-    session.data.last_candidate = best;
-    await saveSessionMulti(env, session, session.from, toE164);
-    const s = numberOrZero(best.stock);
-    await sendWhatsAppText(
-      env, toE164,
-      `${renderProducto(best)}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; hay ${s} en stock y el resto sería *sobre pedido*.`
-    );
-    return ok('EVENT_RECEIVED');
-  } else {
-    await sendWhatsAppText(env, toE164, `No encontré una coincidencia directa 😕. Te conecto con un asesor…`);
-    await notifySupport(env, `Inventario sin match. +${session.from}: ${text}`);
-    await saveSessionMulti(env, session, session.from, toE164);
-    return ok('EVENT_RECEIVED');
-  }
-}
-
-/* ========================================================================== */
-/* =============== Inventario: normalización, hints y matching ============== */
-/* ========================================================================== */
-
-/** Normaliza y corrige alias comunes de familia/modelo para aumentar recall. */
-function normalizeWithAliases(s=''){
-  const t = normalizeBase(s);
-  const aliases = [
-    ['verzan','versant'], ['verzand','versant'], ['versan','versant'], ['vrsant','versant'],
-    ['dococolor','docucolor'], ['docucolour','docucolor'], ['docu color','docucolor'],
-    ['versa link','versalink'], ['altaling','altalink'], ['alta link','altalink'],
-    ['prime link','primelink'], ['prime-link','primelink'], ['prymelink','primelink'],
-    ['fuji film','fujifilm'], ['docucolor 5560','docucolor 550/560/570']
-  ];
-  let out = t;
-  for (const [bad, good] of aliases){
-    out = out.replace(new RegExp(`\\b${bad}\\b`, 'g'), good);
-  }
-  return out;
-}
-
-/** Extrae pista de familia/color a partir del texto normalizado. */
-function extractModelHints(text='') {
-  const t = normalizeWithAliases(text);
-  const out = {};
-  // —— Familia
-  if (/\bversant\b/.test(t) || /\b(80|180|2100|280|4100)\b/.test(t)) out.family = 'versant';
-  else if (/\bversa[-\s]?link\b/.test(t)) out.family = 'versalink';
-  else if (/\balta[-\s]?link\b/.test(t)) out.family = 'altalink';
-  else if (/\bdocu(color)?\b/.test(t) || /\b(550|560|570)\b/.test(t)) out.family = 'docucolor';
-  else if (/\bprime\s*link\b/.test(t) || /\bprimelink\b/.test(t)) out.family = 'primelink';
-  else if (/\bapeos\b/.test(t)) out.family = 'apeos';
-  else if (/\bc(60|70|75)\b/.test(t)) out.family = 'c70';
-
-  // —— Color
-  if (/\b(amarillo|yellow)\b/.test(t)) out.color = 'yellow';
-  else if (/\bmagenta\b/.test(t)) out.color = 'magenta';
-  else if (/\b(cyan|cian)\b/.test(t)) out.color = 'cyan';
-  else if (/\b(negro|black|bk|k)\b/.test(t)) out.color = 'black';
-
-  return out;
-}
-
-/** Determina si un producto “apunta” al color pedido. */
-function productHasColor(p, colorCode){
-  if (!colorCode) return true;
-  const s = `${normalizeBase([p?.nombre, p?.sku, p?.marca].join(' '))}`;
-  const map = {
-    yellow:[/\bamarillo\b/i, /\byellow\b/i, /(^|[\s\-_\/])y($|[\s\-_\/])/i, /(^|[\s\-_\/])ylw($|[\s\-_\/])/i],
-    magenta:[/\bmagenta\b/i, /(^|[\s\-_\/])m($|[\s\-_\/])/i],
-    cyan:[/\bcyan\b/i, /\bcian\b/i, /(^|[\s\-_\/])c($|[\s\-_\/])/i],
-    black:[/\bnegro\b/i, /\bblack\b/i, /(^|[\s\-_\/])k($|[\s\-_\/])/i, /(^|[\s\-_\/])bk($|[\s\-_\/])/i],
-  };
-  const arr = map[colorCode] || [];
-  return arr.some(rx => rx.test(p?.nombre) || rx.test(p?.sku) || rx.test(s));
-}
-
-/** Filtra por familia, evitando falsos positivos de familias parecidas. */
-function productMatchesFamily(p, family){
-  if (!family) return true;
-  const s = normalizeBase([p?.nombre, p?.sku, p?.marca, p?.compatible].join(' '));
-
-  if (family==='versant'){
-    const hit = /\bversant\b/i.test(s) || /\b(80|180|2100|280|4100)\b/i.test(s);
-    const bad = /(c60|c70|c75|docucolor|prime\s*link|primelink|altalink|versa\s*link|\b550\b|\b560\b|\b570\b)/i.test(s);
-    return hit && !bad;
-  }
-  if (family==='docucolor'){
-    const hit = /\b(docucolor|550\/560\/570|550|560|570)\b/i.test(s);
-    const bad = /(versant|primelink|altalink|versalink|c60|c70|c75|2100|180|280|4100)\b/i.test(s);
-    return hit && !bad;
-  }
-  if (family==='c70') return /\bc(60|70|75)\b/i.test(s) || s.includes('c60') || s.includes('c70') || s.includes('c75');
-  if (family==='primelink') return /\bprime\s*link\b/i.test(s) || /\bprimelink\b/i.test(s);
-  if (family==='versalink') return /\bversa\s*link\b/i.test(s) || /\bversalink\b/i.test(s);
-  if (family==='altalink') return /\balta\s*link\b/i.test(s) || /\baltalink\b/i.test(s);
-  if (family==='apeos') return /\bapeos\b/i.test(s);
-  return s.includes(family);
-}
-
-/** Extrae color de texto (fallback cuando NER no lo da). */
-function extractColorWord(text=''){
-  const t = normalizeWithAliases(text);
-  if (/\b(amarillo|yellow)\b/i.test(t)) return 'yellow';
-  if (/\bmagenta\b/i.test(t)) return 'magenta';
-  if (/\b(cyan|cian)\b/i.test(t)) return 'cyan';
-  if (/\b(negro|black|bk|k)\b/i.test(t)) return 'black';
-  return null;
-}
-
-/* === findBestProduct: Color y Familia = filtros duros. SIEMPRE vendible === */
-async function findBestProduct(env, queryText, opts = {}) {
-  const hints = extractModelHints(queryText);
-  const colorCode = hints.color || extractColorWord(queryText);
-
-  const pick = (arr) => {
-    if (!Array.isArray(arr) || !arr.length) return null;
-
-    // 1) Duro por color si vino
-    let pool = colorCode ? arr.filter(p => productHasColor(p, colorCode)) : arr.slice();
-
-    // 2) Duro por familia (si deducimos familia y no se ignora)
-    if (hints.family && !opts.ignoreFamily) {
-      pool = pool.filter(p => productMatchesFamily(p, hints.family));
-      if (!pool.length) return null;
-    }
-
-    // 3) Ordenar: preferimos con stock visible; si empata, por precio:
-    pool.sort((a,b) => {
-      const sa = numberOrZero(a.stock) > 0 ? 1 : 0;
-      const sb = numberOrZero(b.stock) > 0 ? 1 : 0;
-      if (sa !== sb) return sb - sa;
-      return numberOrZero(a.precio||0) - numberOrZero(b.precio||0);
-    });
-
-    // ✅ Política “siempre vendible”: si todo está sin stock, igual regresamos el 1º (sobre pedido)
-    return pool[0] || null;
-  };
-
-  // 1) RPC fuzzy por trigramas (mejor recall)
-  try {
-    const res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 30 }) || [];
-    const best = pick(res);
-    if (best) return best;
-  } catch {}
-
-  // 2) Filtro por familia si había señal
-  if (hints.family && !opts.ignoreFamily) {
-    try {
-      const like = encodeURIComponent(`%${hints.family}%`);
-      const r = await sbGet(env, 'producto_stock_v', {
-        query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&or=(nombre.ilike.${like},sku.ilike.${like},marca.ilike.${like},compatible.ilike.${like})&order=stock.desc.nullslast,precio.asc&limit=200`
-      }) || [];
-      const best = pick(r);
-      if (best) return best;
-      return null; // sin familia válida, no hay match
-    } catch {}
-  }
-
-  // 3) Búsqueda amplia por la palabra “toner” como último recurso
-  if (!hints.family || opts.ignoreFamily) {
-    try {
-      const like = encodeURIComponent(`%toner%`);
-      const r = await sbGet(env, 'producto_stock_v', {
-        query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&or=(nombre.ilike.${like},sku.ilike.${like})&order=stock.desc.nullslast,precio.asc&limit=200`
-      }) || [];
-      const best = pick(r);
-      if (best) return best;
-    } catch {}
-  }
-
-  return null;
-}
-
-/* ====== Arranque de flujo de ventas desde consulta libre ====== */
-async function startSalesFromQuery(env, session, toE164, text, ntext, now){
-  // Refuerzo NER con IA (opcional)
-  const extracted = await aiExtractTonerQuery(env, ntext).catch(()=>null);
-  const enrichedQ = enrichQueryFromAI(ntext, extracted);
-
-  // Candidateo principal
-  const best = await findBestProduct(env, enrichedQ);
-  const hints = extractModelHints(enrichedQ);
-
-  if (!best && hints.family) {
-    session.stage = 'await_compatibles';
-    session.data.pending_query = enrichedQ;
-    await saveSessionMulti(env, session, session.from, toE164);
-    await sendWhatsAppText(env, toE164, `Ese modelo está *sobre pedido* o sin disponibilidad. ¿Quieres que te muestre opciones *compatibles* en otra línea?`);
-    return ok('EVENT_RECEIVED');
-  }
 
   if (best) {
     session.stage = 'ask_qty';
@@ -1601,5 +1394,6 @@ async function cronReminders(env){
   // - Recordar pedidos con estado “nuevo” > 48h.
   return { ok: true, ts: new Date().toISOString() };
 }
+
 
 
