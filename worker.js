@@ -1,6 +1,6 @@
 /**
- * CopiBot – Conversacional con IA + Ventas + Soporte Técnico + GCal + Supabase + KV
- * Build: “Borbón-R7” (completo) - VERSIÓN CORREGIDA
+ * CopiBot – Conversacional con IA + Ventas + Soporte Técnico + GCal + Supabase
+ * Build: “Borbón-R7” - VERSIÓN SUPABASE SESSIONS
  */
 
 export default {
@@ -44,19 +44,6 @@ export default {
     if (req.method === 'POST' && url.pathname === '/') {
       try {
         const payload = await safeJson(req);
-        
-        // DEBUG TEMPORAL: Eco inmediato
-        const ctxDebug = extractWhatsAppContext(payload);
-        if (ctxDebug?.fromE164) {
-          console.log('📱 WA IN:', { 
-            from: ctxDebug.fromE164, 
-            msgType: ctxDebug.msgType, 
-            text: ctxDebug.textRaw?.substring(0, 50) 
-          });
-          // Eco temporal para pruebas - COMENTAR LUEGO
-          await sendWhatsAppText(env, ctxDebug.fromE164, `✅ Recibí: "${ctxDebug.textRaw || '(sin texto)'}"`);
-        }
-        
         const ctx = extractWhatsAppContext(payload);
         if (!ctx) return ok('EVENT_RECEIVED');
 
@@ -65,7 +52,7 @@ export default {
         const lowered = text.toLowerCase();
         const ntext = normalizeWithAliases(text);
 
-        // Sesión
+        // Sesión desde Supabase
         const now = new Date();
         let session = await loadSession(env, from);
         session.data = session.data || {};
@@ -125,8 +112,7 @@ export default {
 
         // ===== Saludo genuino =====
         if (isGreet) {
-          if (session?.data?.last_candidate) delete session.data.last_candidate;
-          if (session?.data?.pending_query) delete session.data.pending_query;
+          // NO eliminar last_candidate para mantener continuidad
           const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
           await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
           session.data.last_greet_at = now.toISOString();
@@ -232,7 +218,7 @@ export default {
   }
 }; // export default
 
-// ===== FUNCIONES CRÍTICAS FALTANTES - AGREGADAS =====
+// ===== FUNCIONES CRÍTICAS =====
 
 function extractWhatsAppContext(payload) {
   try {
@@ -356,7 +342,7 @@ function fmtTime(d, tz){
 }
 function formatMoneyMXN(n){
   const v=Number(n||0);
-  try{ return new Intl.NumberFormat('es-MX',{style:'currency',currency:'MXN',maximumFractionDigits:2}).format(v); }
+  try{ return new Intl.NumberFormat('es-MX',{style:'currency',currency:'MXN',maximumFractionDigits:2).format(v); }
   catch{ return `$${v.toFixed(2)}`; }
 }
 function numberOrZero(n){ const v=Number(n||0); return Number.isFinite(v)?v:0; }
@@ -429,6 +415,64 @@ async function notifySupport(env, body) {
   await sendWhatsAppText(env, to, `🛎️ *Soporte*\n${body}`);
 }
 
+/* ============================ Persistencia de sesión (Supabase - 90 días) ============================ */
+async function loadSession(env, phone) {
+  try {
+    const r = await sbGet(env, 'wa_session', {
+      query: `select=session_data,created_at&phone=eq.${phone}&limit=1`
+    });
+    
+    if (r && r[0] && r[0].session_data) {
+      const sessionData = r[0].session_data;
+      // Verificar si la sesión es muy vieja (más de 90 días)
+      const createdAt = new Date(r[0].created_at);
+      const now = new Date();
+      const daysDiff = (now - createdAt) / (1000 * 60 * 60 * 24);
+      
+      if (daysDiff > 90) {
+        // Sesión muy vieja, crear nueva pero mantener nombre si existe
+        const newSession = { 
+          from: phone, 
+          stage: 'idle', 
+          data: { customer: sessionData.data?.customer || {} } 
+        };
+        return newSession;
+      }
+      
+      return sessionData;
+    }
+    
+    // Sesión nueva
+    return { from: phone, stage: 'idle', data: {} };
+  } catch (e) {
+    console.warn('loadSession error', e);
+    return { from: phone, stage: 'idle', data: {} };
+  }
+}
+
+async function saveSession(env, session, now = new Date()) {
+  try {
+    const sessionData = {
+      from: session.from,
+      stage: session.stage,
+      data: session.data || {},
+      last_updated: now.toISOString()
+    };
+    
+    await sbUpsert(env, 'wa_session', [{
+      phone: session.from,
+      session_data: sessionData,
+      last_updated: now.toISOString(),
+      created_at: session.data?.created_at || now.toISOString()
+    }], { 
+      onConflict: 'phone', 
+      returning: 'minimal' 
+    });
+  } catch (e) {
+    console.warn('saveSession error', e);
+  }
+}
+
 /* ============================ Ventas / Carrito ============================ */
 const RX_WANT_QTY = /\b(quiero|ocupo|me llevo|pon|agrega|añade|mete|dame|manda|env[ií]ame|p[oó]n)\s+(\d+)\b/i;
 const RX_ADD_ITEM = /\b(agrega(?:me)?|añade|mete|pon|suma|incluye)\b/i;
@@ -464,7 +508,7 @@ function renderProducto(p) {
   const marca = p.marca ? `\nMarca: ${p.marca}` : '';
   const s = numberOrZero(p.stock);
   const stockLine = s > 0 ? `${s} pzas en stock` : `0 pzas — *sobre pedido*`;
-  return `1. ${p.nombre}${marca}${sku}\n${precio}\n${stockLine}\n\nEste suele ser el indicado para tu equipo.`;
+  return `1. ${p.nombre}${marga}${sku}\n${precio}\n${stockLine}\n\nEste suele ser el indicado para tu equipo.`;
 }
 
 async function handleAskQty(env, session, toE164, text, lowered, ntext, now){
@@ -1488,25 +1532,6 @@ async function cityFromCP(env, cp){
     const r = await sbGet(env, 'sepomex_cp', { query: `cp=eq.${encodeURIComponent(cp)}&select=cp,estado,municipio,ciudad&limit=1` });
     return r?.[0] || null;
   } catch { return null; }
-}
-
-/* ============================ Persistencia de sesión (KV) ============================ */
-async function loadSession(env, id){
-  try{
-    const r = await env.COPIBOT_KV.get(`sess:${id}`, 'json');
-    return r || { from:id, stage:'idle', data:{} };
-  }catch{
-    return { from:id, stage:'idle', data:{} };
-  }
-}
-async function saveSession(env, sess, now=new Date()){
-  try{
-    await env.COPIBOT_KV.put(
-      `sess:${sess.from}`,
-      JSON.stringify(sess),
-      { expirationTtl: 60*60*24*7 }
-    );
-  }catch{}
 }
 
 /* ============================ Prompt gating ============================ */
