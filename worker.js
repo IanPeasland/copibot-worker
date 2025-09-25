@@ -631,24 +631,24 @@ async function handleCollectSequential(env, session, toE164, text, now){
 function summaryCart(cart = []) { return cart.map(i => `${i.product?.nombre} x ${i.qty}${i.backorder ? ' (sobre pedido)' : ''}`).join('; '); }
 function splitCart(cart = []){ return { inStockList: cart.filter(i => !i.backorder), backOrderList: cart.filter(i => i.backorder) }; }
 
-/* =============== Inventario & Pedido =============== */
+/* ===== Inventario: extracción, filtros y matching estricto ===== */
+
 function extractModelHints(text='') {
   const t = normalizeWithAliases(text);
   const out = {};
-  // —— Familia
-  if (/\bversant\b/.test(t) || /\b(80|180|2100|280|4100)\b/.test(t)) out.family = 'versant';
-  else if (/\bversa[-\s]?link\b/.test(t)) out.family = 'versalink';
-  else if (/\balta[-\s]?link\b/.test(t)) out.family = 'altalink';
-  else if (/\bdocu(color)?\b/.test(t) || /\b(550|560|570)\b/.test(t)) out.family = 'docucolor';
-  else if (/\bprime\s*link\b/.test(t) || /\bprimelink\b/.test(t)) out.family = 'primelink';
-  else if (/\bapeos\b/.test(t)) out.family = 'apeos';
-  else if (/\bc(60|70|75)\b/.test(t)) out.family = 'c70';
+
+  // —— Familia (determinista)
+  if (/\bversant\b/i.test(t) || /\b(80|180|2100|280|4100)\b/i.test(t)) out.family = 'versant';
+  else if (/\bdocu\s*color\b/i.test(t) || /\b(550|560|570)\b/.test(t)) out.family = 'docucolor';
+  else if (/\bprime\s*link\b/i.test(t) || /\bprimelink\b/i.test(t)) out.family = 'primelink';
+  else if (/\bversa\s*link\b/i.test(t) || /\bversalink\b/i.test(t)) out.family = 'versalink';
+  else if (/\balta\s*link\b/i.test(t) || /\baltalink\b/i.test(t)) out.family = 'altalink';
+  else if (/\bapeos\b/i.test(t)) out.family = 'apeos';
+  else if (/\bc(60|70|75)\b/i.test(t)) out.family = 'c70';
 
   // —— Color
-  if (/\b(amarillo|yellow)\b/.test(t)) out.color = 'yellow';
-  else if (/\bmagenta\b/.test(t)) out.color = 'magenta';
-  else if (/\b(cyan|cian)\b/.test(t)) out.color = 'cyan';
-  else if (/\b(negro|black|bk|k)\b/.test(t)) out.color = 'black';
+  const c = extractColorWord(t);
+  if (c) out.color = c;
 
   return out;
 }
@@ -671,14 +671,13 @@ function productMatchesFamily(p, family){
   const s = normalizeBase([p?.nombre, p?.sku, p?.marca, p?.compatible].join(' '));
 
   if (family==='versant'){
-    // Sólo coincidencias claras de Versant
     const hit = /\bversant\b/i.test(s) || /\b(80|180|2100|280|4100)\b/i.test(s);
-    const bad = /(c60|c70|c75|docucolor|prime\s*link|primelink|altalink|versa\s*link|\b550\b|\b560\b|\b570\b)/i.test(s);
+    const bad = /(docu\s*color|primelink|alta\s*link|versa\s*link|\bc(60|70|75)\b|\b550\b|\b560\b|\b570\b)/i.test(s);
     return hit && !bad;
   }
   if (family==='docucolor'){
-    const hit = /\b(docucolor|550\/560\/570|550|560|570)\b/i.test(s);
-    const bad = /(versant|primelink|altalink|versalink|c60|c70|c75|2100|180|280|4100)\b/i.test(s);
+    const hit = /\b(docu\s*color|550\/560\/570|550|560|570)\b/i.test(s);
+    const bad = /(versant|primelink|alta\s*link|versa\s*link|\b2100\b|\b180\b|\b280\b|\b4100\b)/i.test(s);
     return hit && !bad;
   }
   if (family==='c70') return /\bc(60|70|75)\b/i.test(s) || s.includes('c60') || s.includes('c70') || s.includes('c75');
@@ -689,61 +688,84 @@ function productMatchesFamily(p, family){
   return s.includes(family);
 }
 
-/* === findBestProduct: Color y Familia = filtros duros (si no hay stock, igual devolvemos 1 candidato “sobre pedido”) === */
+function extractColorWord(text=''){
+  const t = normalizeWithAliases(text);
+  if (/\b(amarillo|yellow)\b/i.test(t)) return 'yellow';
+  if (/\bmagenta\b/i.test(t)) return 'magenta';
+  if (/\b(cyan|cian)\b/i.test(t)) return 'cyan';
+  if (/\b(negro|black|bk|k)\b/i.test(t)) return 'black';
+  return null;
+}
+
+/* === findBestProduct: estricta por familia y color, con fallbacks fuertes === */
 async function findBestProduct(env, queryText, opts = {}) {
   const hints = extractModelHints(queryText);
   const colorCode = hints.color || extractColorWord(queryText);
+  const debug = (env.DEBUG === 'true');
 
-  const pick = (arr) => {
+  const scoreAndPick = (arr=[]) => {
     if (!Array.isArray(arr) || !arr.length) return null;
-    let pool = colorCode ? arr.filter(p => productHasColor(p, colorCode)) : arr.slice();
+    let pool = arr.slice();
 
-    if (hints.family && !opts.ignoreFamily) {
-      pool = pool.filter(p => productMatchesFamily(p, hints.family));
-      if (!pool.length) return null;
-    }
+    // Filtro duro por familia y color
+    if (hints.family && !opts.ignoreFamily) pool = pool.filter(p => productMatchesFamily(p, hints.family));
+    if (colorCode) pool = pool.filter(p => productHasColor(p, colorCode));
 
+    if (!pool.length) return null;
+
+    // Priorizar stock >0, luego precio
     pool.sort((a,b) => {
       const sa = numberOrZero(a.stock) > 0 ? 1 : 0;
       const sb = numberOrZero(b.stock) > 0 ? 1 : 0;
       if (sa !== sb) return sb - sa;
       return numberOrZero(a.precio||0) - numberOrZero(b.precio||0);
     });
-
     return pool[0] || null;
   };
 
+  // 1) RPC (si existe)
   try {
-    const res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 30 }) || [];
-    const best = pick(res);
-    if (best) return best;
-  } catch {}
+    const res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 40 }) || [];
+    const pick1 = scoreAndPick(res);
+    if (debug) console.log('[INV] RPC matches:', res?.length || 0, 'pick:', pick1?.sku);
+    if (pick1) return pick1;
+  } catch (e) {
+    if (debug) console.log('[INV] RPC error', e);
+  }
 
+  // 2) Vista por familia (traemos candidatos por familia y luego filtramos color en JS)
   if (hints.family && !opts.ignoreFamily) {
     try {
-      const like = encodeURIComponent(`%${hints.family}%`);
+      const likeFam = encodeURIComponent(`%${hints.family}%`);
       const r = await sbGet(env, 'producto_stock_v', {
-        query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&or=(nombre.ilike.${like},sku.ilike.${like},marca.ilike.${like},compatible.ilike.${like})&order=stock.desc.nullslast,precio.asc&limit=200`
+        // Tipicamente tus nombres ya contienen "TONER ... VERSANT XX", esto trae suficientes candidatos
+        query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&or=(nombre.ilike.${likeFam},sku.ilike.${likeFam},marca.ilike.${likeFam},compatible.ilike.${likeFam})&order=stock.desc.nullslast,precio.asc&limit=200`
       }) || [];
-      const best = pick(r);
-      if (best) return best;
-      return null;
-    } catch {}
+      const pick2 = scoreAndPick(r);
+      if (debug) console.log('[INV] Family scan:', hints.family, 'cands:', r?.length || 0, 'pick:', pick2?.sku);
+      if (pick2) return pick2;
+    } catch (e) {
+      if (debug) console.log('[INV] family scan error', e);
+    }
   }
 
-  if (!hints.family || opts.ignoreFamily) {
-    try {
-      const like = encodeURIComponent(`%toner%`);
-      const r = await sbGet(env, 'producto_stock_v', {
-        query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&or=(nombre.ilike.${like},sku.ilike.${like})&order=stock.desc.nullslast,precio.asc&limit=200`
-      }) || [];
-      const best = pick(r);
-      if (best) return best;
-    } catch {}
+  // 3) Fallback fuerte: traemos un lote amplio de TONER y filtramos TODO en JS
+  try {
+    const likeToner = encodeURIComponent(`%toner%`);
+    const r2 = await sbGet(env, 'producto_stock_v', {
+      query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&or=(nombre.ilike.${likeToner},sku.ilike.${likeToner})&order=stock.desc.nullslast,precio.asc&limit=400`
+    }) || [];
+    const pick3 = scoreAndPick(r2);
+    if (debug) console.log('[INV] Broad scan (toner) cands:', r2?.length || 0, 'pick:', pick3?.sku);
+    if (pick3) return pick3;
+  } catch (e) {
+    if (debug) console.log('[INV] broad scan error', e);
   }
 
+  // 4) No hay nada claro
   return null;
 }
+
 
 function extractColorWord(text=''){
   const t = normalizeWithAliases(text);
@@ -1584,4 +1606,5 @@ async function cronReminders(env){
   // Espacio para recordatorios o tareas programadas
   return { ok:true, ts: Date.now() };
 }
+
 
