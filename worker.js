@@ -218,7 +218,7 @@ if (req.method === 'POST' && url.pathname === '/') {
 
   // --- Rutas no coincidentes → 404 controlado (fuera del try/catch) ---
   return new Response('Not found', { status: 404 });
-}, // <-- cierra método fetch
+}; // <-- cierra método fetch
 
 // Cron (scheduled) opcional
 async scheduled(event, env, ctx) {
@@ -1617,4 +1617,5 @@ async function cronReminders(env){
 }
       
 };      
+
 
