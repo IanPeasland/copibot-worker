@@ -47,217 +47,168 @@ export default {
         return ok(`cron ok ${JSON.stringify(out)}`);
       }
 
-      // Webhook principal WA
-      if (req.method === 'POST' && url.pathname === '/') {
-        const payload = await safeJson(req);
-        const ctx = extractWhatsAppContext(payload);
-        if (!ctx) return ok('EVENT_RECEIVED'); // ack eventos no-mensaje
+// --- WhatsApp webhook principal ---
+if (req.method === 'POST' && url.pathname === '/') {
+  try {
+    const payload = await safeJson(req);
+    const ctx = extractWhatsAppContext(payload);
+    if (!ctx) return ok('EVENT_RECEIVED');
 
-        const { mid, from, fromE164, profileName, textRaw, msgType } = ctx;
-        let text = (textRaw || '').trim();
+    const { mid, from, fromE164, profileName, textRaw, msgType } = ctx;
+    const text = (textRaw || '').trim();
+    const lowered = text.toLowerCase();
+    const ntext = normalizeWithAliases(text);
 
-        // ===== Session =====
-        const now = new Date();
-        let session = await loadSession(env, from);
-        session.data = session.data || {};
-        session.stage = session.stage || 'idle';
-        session.from = from;
+    // ====== Sesión ======
+    const now = new Date();
+    let session = await loadSession(env, from);
+    session.data = session.data || {};
+    session.stage = session.stage || 'idle';
+    session.from = from;
 
-        // Prefill de nombre
-        if (profileName && !session?.data?.customer?.nombre) {
-          session.data.customer = session.data.customer || {};
-          session.data.customer.nombre = toTitleCase(firstWord(profileName));
-        }
-
-        // Idempotencia por mid
-        if (session?.data?.last_mid && session.data.last_mid === mid) return ok('EVENT_RECEIVED');
-        session.data.last_mid = mid;
-
-        // NO-TEXTO → pedir texto amable (sin botones)
-        if (msgType !== 'text') {
-          await sendWhatsAppText(env, fromE164, `¿Podrías escribirme con palabras lo que necesitas? Así te ayudo más rápido 🙂`);
-          await saveSession(env, session, now);
-          return ok('EVENT_RECEIVED');
-        }
-
-        // Normalización
-        const lowered = text.toLowerCase();
-        const ntext = normalizeWithAliases(text);
-
-        // Comandos universales (soporte)
-        if (/\b(cancel(a|ar).*(cita|visita|servicio))\b/i.test(lowered)) {
-          await svCancel(env, session, fromE164);
-          await saveSession(env, session, now);
-          return ok('EVENT_RECEIVED');
-        }
-        if (/\b(reprogram|mueve|cambia|modif)\w*/i.test(lowered)) {
-          const when = parseNaturalDateTime(lowered, env);
-          if (when?.start) {
-            await svReschedule(env, session, fromE164, when);
-            await saveSession(env, session, now);
-            return ok('EVENT_RECEIVED');
-          }
-        }
-        if (/\b(cu[aá]ndo|cuando).*(cita|visita|servicio)\b/i.test(lowered)) {
-          await svWhenIsMyVisit(env, session, fromE164);
-          await saveSession(env, session, now);
-          return ok('EVENT_RECEIVED');
-        }
-
-        // Intención
-        const supportIntent = isSupportIntent(ntext) || (await intentIs(env, text, 'support'));
-        const salesIntent = RX_INV_Q.test(ntext) || (await intentIs(env, text, 'sales'));
-
-        // ====== PRIORIDAD: stages activos de ventas antes que saludo ======
-        if (session.stage === 'ask_qty') {
-          return await handleAskQty(env, session, fromE164, text, lowered, ntext, now);
-        }
-        if (session.stage === 'cart_open') {
-          return await handleCartOpen(env, session, fromE164, text, lowered, ntext, now);
-        }
-        if (session.stage === 'await_invoice') {
-          return await handleAwaitInvoice(env, session, fromE164, lowered, now, text);
-        }
-        if (session.stage && session.stage.startsWith('collect_')) {
-          return await handleCollectSequential(env, session, fromE164, text, now);
-        }
-
-{
-  const looksGreet  = RX_GREET.test(lowered);
-  const isGreetOnly =
-    looksGreet &&
-    !RX_INV_Q.test(ntext) &&
-    !isSupportIntent(ntext) &&
-    lowered.replace(RX_GREET, '').trim().length < 2;
-
-  if (isGreetOnly) {
-    if (session?.data?.last_candidate) delete session.data.last_candidate;
-    if (session?.data?.pending_query) delete session.data.pending_query;
-
-    const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
-    await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
-    session.data.last_greet_at = now.toISOString();
-
-    if (session.stage !== 'idle') {
-      session.data.last_stage = session.stage;
-      session.stage = 'await_choice';
+    // Nombre por profile (prefill suave)
+    if (profileName && !session?.data?.customer?.nombre) {
+      session.data.customer = session.data.customer || {};
+      session.data.customer.nombre = toTitleCase(firstWord(profileName));
     }
-    await saveSession(env, session, now);
-    return ok('EVENT_RECEIVED');
-  }
-}
 
-// ===== Saludo (solo si es realmente un saludo) =====
-const looksGreet = RX_GREET.test(lowered);
-// Es "solo saludo" si NO contiene intención de ventas ni de soporte y es corto.
-const isGreetOnly =
-  looksGreet &&
-  !RX_INV_Q.test(ntext) &&
-  !isSupportIntent(ntext) &&
-  lowered.replace(RX_GREET, '').trim().length < 2;
+    // Idempotencia por mid
+    if (session?.data?.last_mid && session.data.last_mid === mid) {
+      return ok('EVENT_RECEIVED');
+    }
+    session.data.last_mid = mid;
 
-if (isGreetOnly) {
-  if (session?.data?.last_candidate) delete session.data.last_candidate;
-  if (session?.data?.pending_query) delete session.data.pending_query;
+    // NO-TEXTO → pedir texto (permitimos interactive->text ya mapeado)
+    if (msgType !== 'text') {
+      await sendWhatsAppText(env, fromE164, '¿Podrías escribirme con palabras lo que necesitas? Así te ayudo más rápido 🙂');
+      await saveSession(env, session, now);
+      return ok('EVENT_RECEIVED');
+    }
 
-  const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
-  await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
-  session.data.last_greet_at = now.toISOString();
+    // ====== Intención ======
+    const supportIntent = isSupportIntent(ntext) || (await intentIs(env, text, 'support'));
+    const salesIntent   = RX_INV_Q.test(ntext)   || (await intentIs(env, text, 'sales'));
+    const isGreet       = RX_GREET.test(lowered);
 
-  if (session.stage !== 'idle') {
-    session.data.last_stage = session.stage;
-    session.stage = 'await_choice';
-  }
-  await saveSession(env, session, now);
-  return ok('EVENT_RECEIVED');
-}
-// si NO es solo saludo, seguimos y dejamos que ventas/soporte procesen el texto
+    // ====== PRIORIDAD: etapas de ventas activas ANTES que saludo ======
+    if (session.stage === 'ask_qty')       return await handleAskQty(env, session, fromE164, text, lowered, ntext, now);
+    if (session.stage === 'cart_open')     return await handleCartOpen(env, session, fromE164, text, lowered, ntext, now);
+    if (session.stage === 'await_invoice') return await handleAwaitInvoice(env, session, fromE164, lowered, now, text);
+    if (session.stage && session.stage.startsWith('collect_')) {
+      return await handleCollectSequential(env, session, fromE164, text, now);
+    }
 
-
-        // Continuar/retomar
-        if (session.stage === 'await_choice') {
-          if (supportIntent) {
-            session.stage = 'sv_collect';
-            await saveSession(env, session, now);
-            return await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support', forceWelcome: true });
-          }
-          if (salesIntent) {
-            session.data.last_stage = 'idle';
-            session.stage = 'idle';
-            await saveSession(env, session, now);
-            return await startSalesFromQuery(env, session, fromE164, text, ntext, now);
-          }
-          if (isContinueish(lowered)) {
-            session.stage = session?.data?.last_stage || 'idle';
-            await saveSession(env, session, now);
-            const prompt = buildResumePrompt(session);
-            await sendWhatsAppText(env, fromE164, `Va. ${prompt}`);
-            return ok('EVENT_RECEIVED');
-          }
-          if (isStartNewish(lowered)) {
-            session.data.last_stage = 'idle';
-            session.stage = 'idle';
-            await saveSession(env, session, now);
-            await sendWhatsAppText(env, fromE164, `Perfecto, cuéntame qué necesitas (soporte, cotización, etc.). 🙂`);
-            return ok('EVENT_RECEIVED');
-          }
-          await sendWhatsAppText(env, fromE164, `¿Prefieres continuar con lo pendiente o empezamos algo nuevo?`);
-          return ok('EVENT_RECEIVED');
-        }
-
-        // Cambio de intención en caliente (prioriza soporte)
-        if (supportIntent || session.stage?.startsWith('sv_')) {
-          const handled = await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support' });
-          return handled;
-        }
-
-        // Ventas por intención
-        if (salesIntent) {
-          if (session.stage !== 'idle') {
-            await sendWhatsAppText(env, fromE164, `Te ayudo con inventario. Dejo lo otro en pausa un momento.`);
-            session.data.last_stage = session.stage;
-            session.stage = 'idle';
-            await saveSession(env, session, now);
-          }
-          const handled = await startSalesFromQuery(env, session, fromE164, text, ntext, now);
-          return handled;
-        }
-
-        // Stages de ventas
-        if (session.stage === 'ask_qty') return await handleAskQty(env, session, fromE164, text, lowered, ntext, now);
-        if (session.stage === 'cart_open') return await handleCartOpen(env, session, fromE164, text, lowered, ntext, now);
-        if (session.stage === 'await_invoice') return await handleAwaitInvoice(env, session, fromE164, lowered, now, text);
-        if (session.stage?.startsWith('collect_')) return await handleCollectSequential(env, session, fromE164, text, now);
-
-      // ===== FAQs rápidas por company_info o heurísticas =====
-      const faqAns = await maybeFAQ(env, ntext);
-      if (faqAns) {
-        await sendWhatsAppText(env, fromE164, faqAns);
+    // ====== Comandos universales (soporte) ======
+    if (/\b(cancel(a|ar).*(cita|visita|servicio))\b/i.test(lowered)) {
+      await svCancel(env, session, fromE164);
+      await saveSession(env, session, now);
+      return ok('EVENT_RECEIVED');
+    }
+    if (/\b(reprogram|mueve|cambia|modif)\w*/i.test(lowered)) {
+      const when = parseNaturalDateTime(lowered, env);
+      if (when?.start) {
+        await svReschedule(env, session, fromE164, when);
         await saveSession(env, session, now);
         return ok('EVENT_RECEIVED');
       }
-
-      // ===== Fallback IA breve =====
-      const reply = await aiSmallTalk(env, session, 'fallback', text);
-      await sendWhatsAppText(env, fromE164, reply);
+    }
+    if (/\b(cu[aá]ndo|cuando).*(cita|visita|servicio)\b/i.test(lowered)) {
+      await svWhenIsMyVisit(env, session, fromE164);
       await saveSession(env, session, now);
-      return ok('EVENT_RECEIVED');
-    } catch (e) {
-      console.error('Worker error', e);
-      try {
-        // intenta avisar al usuario de manera amable
-        const body = await safeJson(req).catch(() => ({}));
-        const value = body?.entry?.[0]?.changes?.[0]?.value;
-        const fromMsg = value?.messages?.[0]?.from;
-        const toE164 = fromMsg ? `+${fromMsg}` : (new URL(req.url).searchParams.get('to') || env.SUPPORT_PHONE_E164 || null);
-        if (toE164) {
-          await sendWhatsAppText(env, toE164, 'Tuvimos un problema procesando tu mensaje. Ya lo reviso un asesor 🙏');
-        }
-      } catch { /* no-op */ }
-      // Nunca dejamos al usuario sin respuesta
       return ok('EVENT_RECEIVED');
     }
 
+    // ====== Saludo (solo si realmente es saludo) ======
+    if (isGreet) {
+      if (session?.data?.last_candidate) delete session.data.last_candidate;
+      if (session?.data?.pending_query) delete session.data.pending_query;
+      const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
+      await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
+      session.data.last_greet_at = now.toISOString();
+
+      if (session.stage !== 'idle') {
+        session.data.last_stage = session.stage;
+        session.stage = 'await_choice';
+        await saveSession(env, session, now);
+        return ok('EVENT_RECEIVED');
+      }
+      await saveSession(env, session, now);
+      return ok('EVENT_RECEIVED');
+    }
+
+    // ====== Continuar o empezar nuevo si estaba en await_choice ======
+    if (session.stage === 'await_choice') {
+      if (supportIntent) {
+        session.stage = 'sv_collect';
+        await saveSession(env, session, now);
+        return await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support', forceWelcome: true });
+      }
+      if (salesIntent) {
+        session.data.last_stage = 'idle';
+        session.stage = 'idle';
+        await saveSession(env, session, now);
+        return await startSalesFromQuery(env, session, fromE164, text, ntext, now);
+      }
+      if (isContinueish(lowered)) {
+        session.stage = session?.data?.last_stage || 'idle';
+        await saveSession(env, session, now);
+        const prompt = buildResumePrompt(session);
+        await sendWhatsAppText(env, fromE164, `Va. ${prompt}`);
+        return ok('EVENT_RECEIVED');
+      }
+      if (isStartNewish(lowered)) {
+        session.data.last_stage = 'idle';
+        session.stage = 'idle';
+        await saveSession(env, session, now);
+        await sendWhatsAppText(env, fromE164, 'Perfecto, cuéntame qué necesitas (soporte, cotización, etc.). 🙂');
+        return ok('EVENT_RECEIVED');
+      }
+      await sendWhatsAppText(env, fromE164, '¿Prefieres continuar con lo pendiente o empezamos algo nuevo?');
+      return ok('EVENT_RECEIVED');
+    }
+
+    // ====== Cambio de intención en caliente (prioridad soporte) ======
+    if (supportIntent || session.stage?.startsWith('sv_')) {
+      return await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support' });
+    }
+
+    // ====== Ventas por intención ======
+    if (salesIntent) {
+      if (session.stage !== 'idle') {
+        await sendWhatsAppText(env, fromE164, 'Te ayudo con inventario. Dejo lo otro en pausa un momento.');
+        session.data.last_stage = session.stage;
+        session.stage = 'idle';
+        await saveSession(env, session, now);
+      }
+      return await startSalesFromQuery(env, session, fromE164, text, ntext, now);
+    }
+
+    // ====== FAQs rápidas ======
+    const faqAns = await maybeFAQ(env, ntext);
+    if (faqAns) {
+      await sendWhatsAppText(env, fromE164, faqAns);
+      await saveSession(env, session, now);
+      return ok('EVENT_RECEIVED');
+    }
+
+    // ====== Fallback IA breve ======
+    const reply = await aiSmallTalk(env, session, 'fallback', text);
+    await sendWhatsAppText(env, fromE164, reply);
+    await saveSession(env, session, now);
+    return ok('EVENT_RECEIVED');
+
+  } catch (e) {
+    console.error('Worker error', e);
+    try {
+      const body = await safeJson(req).catch(() => ({}));
+      const ctx2 = extractWhatsAppContext(body);
+      if (ctx2?.fromE164) {
+        await sendWhatsAppText(env, ctx2.fromE164, 'Tu mensaje llegó, tuve un problema momentáneo pero ya estoy encima 🙂');
+      }
+    } catch {}
+    return ok('EVENT_RECEIVED');
+  }
+}     
     // --- Rutas no coincidentes → 404 controlado (fuera del try/catch) ---
     return new Response('Not found', { status: 404 });
   }, // <-- cierra fetch
@@ -1645,6 +1596,7 @@ async function cronReminders(env){
   // Espacio para recordatorios o tareas programadas
   return { ok:true, ts: Date.now() };
 }
+
 
 
 
