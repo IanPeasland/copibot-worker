@@ -191,7 +191,7 @@ if (req.method === 'POST' && url.pathname === '/') {
       return ok('EVENT_RECEIVED');
     }
 
-    // ====== Fallback IA breve ======
+       // ===== Fallback IA breve =====
     const reply = await aiSmallTalk(env, session, 'fallback', text);
     await sendWhatsAppText(env, fromE164, reply);
     await saveSession(env, session, now);
@@ -199,16 +199,56 @@ if (req.method === 'POST' && url.pathname === '/') {
 
   } catch (e) {
     console.error('Worker error', e);
+
+    // Notificación suave al usuario (si podemos identificarlo del body)
     try {
       const body = await safeJson(req).catch(() => ({}));
       const ctx2 = extractWhatsAppContext(body);
       if (ctx2?.fromE164) {
-        await sendWhatsAppText(env, ctx2.fromE164, 'Tu mensaje llegó, tuve un problema momentáneo pero ya estoy encima 🙂');
+        await sendWhatsAppText(
+          env,
+          ctx2.fromE164,
+          'Tu mensaje llegó, tuve un problema momentáneo pero ya estoy encima 🙂'
+        );
       }
-    } catch {}
+    } catch {/* no-op */}
+
     return ok('EVENT_RECEIVED');
   }
-}     
+
+  // --- Rutas no coincidentes → 404 controlado (fuera del try/catch) ---
+  return new Response('Not found', { status: 404 });
+}, // <-- cierra método fetch
+
+// Cron (scheduled) opcional
+async scheduled(event, env, ctx) {
+  try {
+    const out = await cronReminders(env);
+    console.log('cron run', out);
+  } catch (e) {
+    console.error('cron error', e);
+  }
+}
+}; // <-- cierra export default
+
+/* ============================ Utilidades HTTP ============================ */
+async function safeJson(req) {
+  try {
+    return await req.json();
+  } catch (e) {
+    return {};
+  }
+}
+
+function ok(s = 'ok') {
+  return new Response(s, { status: 200 });
+}
+
+async function cronReminders(env) {
+  // Espacio para recordatorios o tareas programadas
+  return { ok: true, ts: Date.now() };
+}
+
     // --- Rutas no coincidentes → 404 controlado (fuera del try/catch) ---
     return new Response('Not found', { status: 404 });
   
@@ -1577,3 +1617,4 @@ async function cronReminders(env){
 }
       
 };      
+
