@@ -108,8 +108,32 @@ export default {
         const supportIntent = isSupportIntent(ntext) || (await intentIs(env, text, 'support'));
         const salesIntent = RX_INV_Q.test(ntext) || (await intentIs(env, text, 'sales'));
 
+        // ====== PRIORIDAD: stages activos de ventas antes que saludo ======
+        if (session.stage === 'ask_qty') {
+          return await handleAskQty(env, session, fromE164, text, lowered, ntext, now);
+        }
+        if (session.stage === 'cart_open') {
+          return await handleCartOpen(env, session, fromE164, text, lowered, ntext, now);
+        }
+        if (session.stage === 'await_invoice') {
+          return await handleAwaitInvoice(env, session, fromE164, lowered, now, text);
+        }
+        if (session.stage && session.stage.startsWith('collect_')) {
+          return await handleCollectSequential(env, session, fromE164, text, now);
+        }
+
+
         // Saludo
-        if (RX_GREET.test(lowered)) {
+        const isGreet = RX_GREET.test(lowered);
+// sólo saludamos si NO estamos en mitad de un flujo de ventas/soporte
+        const inFlow = session.stage === 'ask_qty' || session.stage === 'cart_open' ||
+               session.stage === 'await_invoice' || (session.stage || '').startsWith('collect_') ||
+               (session.stage || '').startsWith('sv_');
+
+        if (isGreet && !inFlow) {
+  // ... (tu saludo tal cual)
+}
+
           if (session?.data?.last_candidate) delete session.data.last_candidate;
           if (session?.data?.pending_query) delete session.data.pending_query;
 
@@ -1596,6 +1620,7 @@ async function cronReminders(env){
   // Espacio para recordatorios o tareas programadas
   return { ok:true, ts: Date.now() };
 }
+
 
 
 
