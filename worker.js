@@ -1,10 +1,9 @@
 /**
- * CopiBot – IA + Ventas + Soporte + GCal — Build R6 (2025-09)
- * Cambios R6:
- *  - Candado duro de soporte: si stage "sv_*" o intent_lock==="support", se fuerza soporte.
- *  - intent_lock='support' desde que entramos al flujo; se libera al finalizar/agendar.
- *  - Parser robusto marca/modelo; nunca deriva a inventario durante sv_collect.
- *  - Mantiene fixes: carrito mixto, “sobre pedido”, idempotencia, botones WA, etc.
+ * CopiBot – IA + Ventas + Soporte + GCal — Build R6.1 (2025-09)
+ * Cambios R6.1:
+ *  - Confirmación explícita al capturar marca/modelo en soporte.
+ *  - Pregunta siguiente con fallback seguro (nunca undefined).
+ *  - Mantiene candado de soporte, fixes de inventario y flujo de ventas.
  */
 
 /* ========================================================================== */
@@ -87,7 +86,7 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        /* ====== Comandos universales de soporte (disponibles fuera del candado) ====== */
+        /* ====== Comandos universales de soporte ====== */
         if (/\b(cancel(a|ar).*(cita|visita|servicio))\b/i.test(lowered)) {
           session.data.intent_lock = 'support';
           await svCancel(env, session, fromE164);
@@ -235,6 +234,14 @@ async function intentIs(env, text, expected){
   }catch{return false;}
 }
 
+/** IA opcional para reforzar NER de inventario */
+async function aiExtractTonerQuery(env, text){
+  if (!env.OPENAI_API_KEY && !env.OPENAI_KEY) return null;
+  const sys = `Extrae de una consulta (es-MX) sobre tóners los campos { "familia": "versant|docucolor|primelink|versalink|altalink|apeos|c70|", "color": "yellow|magenta|cyan|black|null", "subfamilia": "string|null", "cantidad": "number|null" } en JSON. No inventes.`;
+  const out = await aiCall(env, [{role:'system', content: sys},{role:'user', content: text}], {json:true});
+  try { return JSON.parse(out||'{}'); } catch { return null; }
+}
+
 /* ========================================================================== */
 /* =============================== WhatsApp ================================= */
 /* ========================================================================== */
@@ -270,7 +277,7 @@ function extractWhatsAppContext(payload) {
 async function sendWhatsAppText(env, toE164, body) {
   if (!env.WA_TOKEN || !env.PHONE_ID) { console.warn('WA env missing'); return; }
   const url = `https://graph.facebook.com/v20.0/${env.PHONE_ID}/messages`;
-  const payload = { messaging_product: 'whatsapp', to: toE164.replace(/\D/g, ''), text: { body } };
+  const payload = { messaging_product: 'whatsapp', to: toE164.replace(/\D/g, ''), text: { body: String(body ?? '') } };
   const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${env.WA_TOKEN}`, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
   if (!r.ok) console.warn('sendWhatsAppText', r.status, await r.text());
 }
@@ -609,7 +616,6 @@ function productMatchesFamily(p, family){
   const s = normalizeBase([p?.nombre, p?.sku, p?.marca, p?.compatible].join(' '));
 
   if (family==='versant'){
-    // Sólo coincidencias claras de Versant
     const hit = /\bversant\b/i.test(s) || /\b(80|180|2100|280|4100)\b/i.test(s);
     const bad = /(c60|c70|c75|docucolor|prime\s*link|primelink|altalink|versa\s*link|\b550\b|\b560\b|\b570\b)/i.test(s);
     return hit && !bad;
@@ -888,7 +894,7 @@ function svFillFromAnswer(sv, field, text){
   if (field === 'ciudad') { sv.ciudad = clean(text); return; }
   if (field === 'estado') { sv.estado = clean(text); return; }
   if (field === 'cp') { const mcp = text.match(/\b(\d{5})\b/); sv.cp = mcp?mcp[1]:clean(text); return; }
-  if (field === 'horario') { /* se calcula con parseNaturalDateTime en handleSupport */ return; }
+  if (field === 'horario') { return; }
 }
 
 async function handleSupport(env, session, toE164, text, lowered, ntext, now, intent){
@@ -898,8 +904,11 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     session.data.sv = session.data.sv || {};
     const sv = session.data.sv;
 
-    if (session.stage === 'sv_collect' && session.data.sv_need_next) {
-      svFillFromAnswer(sv, session.data.sv_need_next, text);
+    const wasCollecting = session.stage === 'sv_collect';
+    const prevNeeded = session.data.sv_need_next || null;
+
+    if (wasCollecting && prevNeeded) {
+      svFillFromAnswer(sv, prevNeeded, text);
     }
 
     Object.assign(sv, extractSvInfo(text));
@@ -940,6 +949,8 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       session.stage = 'sv_collect';
       session.data.sv_need_next = needed[0];
       await saveSession(env, session);
+
+      // Pregunta segura + ACK de marca/modelo si ya los tenemos
       const Q = {
         modelo: '¿Qué *marca y modelo* es tu impresora? (p.ej., *Xerox DocuColor 550*)',
         falla: '¿Me describes brevemente la *falla*? (p.ej., “*atasco en fusor*”, “*no imprime*”)',
@@ -951,7 +962,13 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
         nombre: '¿A nombre de quién registramos la visita?',
         email: '¿Cuál es tu *email* para enviarte confirmaciones?'
       };
-      await sendWhatsAppText(env, toE164, Q[needed[0]]);
+
+      let pre = '';
+      if (truthy(sv.marca) && truthy(sv.modelo) && needed[0] === 'falla') {
+        pre = `Anoté: *${sv.marca} ${sv.modelo}*.\n`;
+      }
+      const body = pre + (Q[needed[0]] || '¿Me ayudas con ese dato, por favor?');
+      await sendWhatsAppText(env, toE164, body);
       return ok('EVENT_RECEIVED');
     }
 
@@ -1162,9 +1179,7 @@ function clampToWindow(when, tz) {
   return { start: newStart.toISOString(), end: newEnd.toISOString() };
 }
 
-/* ========================================================================== */
-/* ============================ Google Calendar ============================= */
-/* ========================================================================== */
+/* ============================ Google Calendar ============================ */
 
 async function gcalToken(env) {
   const r = await fetch('https://oauth2.googleapis.com/token', {
@@ -1230,12 +1245,9 @@ async function findNearestFreeSlot(env, calendarId, when, tz) {
 }
 
 /* ============================ Pool calendarios + util OS ============================ */
-
 async function getCalendarPool(env) {
-  try {
-    const r = await sbGet(env, 'calendar_pool', { query: 'select=gcal_id,name,active&active=is.true' });
-    return Array.isArray(r) ? r : [];
-  } catch { return []; }
+  const r = await sbGet(env, 'calendar_pool', { query: 'select=gcal_id,name,active&active=is.true' });
+  return Array.isArray(r) ? r : [];
 }
 function pickCalendarFromPool(pool) { return pool?.[0] || null; }
 
@@ -1264,63 +1276,143 @@ async function getLastOpenOS(env, phone) {
 
 async function upsertClienteByPhone(env, phone){
   try{
-    const exist = await sbGet(env, 'cliente', { query: `select=id,telefono&telefono=eq.${phone}&limit=1` });
+    const exist = await sbGet(env, 'cliente', { query: `select=id&telefono=eq.${phone}&limit=1` });
     if (exist && exist[0]) return exist[0].id;
     const ins = await sbUpsert(env, 'cliente', [{ telefono: phone }], { onConflict: 'telefono', returning: 'representation' });
     return ins?.data?.[0]?.id || null;
-  }catch(e){ console.warn('upsertClienteByPhone', e); return null; }
+  }catch(e){ return null; }
 }
 
-/* ========================================================================== */
-/* ============================== Supabase ================================== */
-/* ========================================================================== */
+/* ================================ Supabase ================================ */
 
-function sbHeaders(env){
-  return { 'apikey': env.SUPABASE_ANON_KEY || env.SUPABASE_SERVICE_KEY, 'Authorization': `Bearer ${env.SUPABASE_SERVICE_KEY || env.SUPABASE_ANON_KEY}`, 'Content-Type':'application/json' };
-}
-async function sbGet(env, table, { query }){
+async function sbGet(env, table, { query }) {
   const url = `${env.SUPABASE_URL}/rest/v1/${table}?${query}`;
-  const r = await fetch(url, { headers: sbHeaders(env) });
-  if (!r.ok) { console.warn('sbGet', table, r.status, await r.text()); return null; }
-  return await r.json();
+  const r = await fetch(url, { headers: { apikey: env.SUPABASE_ANON_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE || env.SUPABASE_ANON_KEY}` } });
+  if (!r.ok) { console.warn('
+  if (!r.ok) { console.warn('sbGet', r.status, await r.text()); return []; }
+  try { return await r.json(); } catch { return []; }
 }
-async function sbUpsert(env, table, rows, { onConflict=null, returning='representation' }={}){
-  const url = `${env.SUPABASE_URL}/rest/v1/${table}${onConflict?`?on_conflict=${encodeURIComponent(onConflict)}`:''}`;
-  const r = await fetch(url, { method:'POST', headers: sbHeaders(env), body: JSON.stringify(rows), });
-  if (!r.ok) { console.warn('sbUpsert', table, r.status, await r.text()); return null; }
-  const data = returning==='minimal' ? null : await r.json();
-  return { data };
+
+async function sbUpsert(env, table, rows, { onConflict=null, returning='representation' } = {}) {
+  const url = new URL(`${env.SUPABASE_URL}/rest/v1/${table}`);
+  if (onConflict) url.searchParams.set('on_conflict', onConflict);
+  url.searchParams.set('return', returning);
+  const r = await fetch(url.toString(), {
+    method: 'POST',
+    headers: {
+      apikey: env.SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE || env.SUPABASE_ANON_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'resolution=merge-duplicates'
+    },
+    body: JSON.stringify(rows)
+  });
+  if (!r.ok) { console.warn('sbUpsert', r.status, await r.text()); return { data: null }; }
+  try { return { data: await r.json() }; } catch { return { data: null }; }
 }
-async function sbPatch(env, table, patch, filter){
+
+async function sbPatch(env, table, patch, filter) {
   const url = `${env.SUPABASE_URL}/rest/v1/${table}?${filter}`;
-  const r = await fetch(url, { method:'PATCH', headers: sbHeaders(env), body: JSON.stringify(patch) });
-  if (!r.ok) { console.warn('sbPatch', table, r.status, await r.text()); return null; }
+  const r = await fetch(url, {
+    method: 'PATCH',
+    headers: {
+      apikey: env.SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE || env.SUPABASE_ANON_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=minimal'
+    },
+    body: JSON.stringify(patch)
+  });
+  if (!r.ok) console.warn('sbPatch', r.status, await r.text());
+  return r.ok;
+}
+
+async function sbRpc(env, fn, args) {
+  const url = `${env.SUPABASE_URL}/rest/v1/rpc/${fn}`;
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: {
+      apikey: env.SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE || env.SUPABASE_ANON_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(args || {})
+  });
+  if (!r.ok) { console.warn('sbRpc', fn, r.status, await r.text()); return null; }
   try { return await r.json(); } catch { return null; }
 }
-async function sbRpc(env, fn, args){
-  const url = `${env.SUPABASE_URL}/rest/v1/rpc/${fn}`;
-  const r = await fetch(url, { method:'POST', headers: sbHeaders(env), body: JSON.stringify(args||{}) });
-  if (!r.ok) { console.warn('sbRpc', fn, r.status, await r.text()); return null; }
-  return await r.json();
-}
 
-async function cityFromCP(env, cp){
+/* ============================ Direcciones/Cliente ============================ */
+
+async function cityFromCP(env, cp) {
+  if (!cp) return null;
+  // intenta tabla típica "sepomex_cp" (cp, municipio, estado, ciudad)
   try {
-    const r = await sbGet(env, 'cp_mx', { query: `select=cp,ciudad,municipio,estado&cp=eq.${encodeURIComponent(cp)}&limit=1` });
-    return r && r[0] ? r[0] : null;
-  } catch { return null; }
+    const r = await sbGet(env, 'sepomex_cp', { query: `select=cp,municipio,estado,ciudad&cp=eq.${encodeURIComponent(cp)}&limit=1` });
+    if (r && r[0]) return { ciudad: r[0].ciudad || r[0].municipio, municipio: r[0].municipio, estado: r[0].estado };
+  } catch {}
+  // fallback a "sepomex" genérica (cp, asentamiento, municipio, estado)
+  try {
+    const r2 = await sbGet(env, 'sepomex', { query: `select=cp,municipio,estado,ciudad&cp=eq.${encodeURIComponent(cp)}&limit=1` });
+    if (r2 && r2[0]) return { ciudad: r2[0].ciudad || r2[0].municipio, municipio: r2[0].municipio, estado: r2[0].estado };
+  } catch {}
+  return null;
 }
 
-function parseAddressLoose(text=''){
+function parseAddressLoose(text='') {
+  const t = normalizeBase(text);
   const out = {};
-  const mcp = text.match(/\b(\d{5})\b/); if (mcp) out.cp = mcp[1];
-  const mnum = text.match(/\b(\d{1,5}[A-Z]?)\b/); if (mnum) out.numero = mnum[1];
+  const mcp = t.match(/\b(\d{5})\b/);
+  if (mcp) out.cp = mcp[1];
+
+  // número (muy laxo)
+  const mnum = t.match(/\bno\.?\s*(\d+[a-z]?)\b/i) || t.match(/\b(\d{1,5}[a-z]?)\b/i);
+  if (mnum) out.numero = out.numero || mnum[1];
+
+  // colonia (heurística por palabras comunes)
+  const col = t.match(/\bcol(onia)?\s+([a-z0-9\s\-]+?)(?=\,|\bcp\b|\b\d{5}\b|$)/i);
+  if (col) out.colonia = clean(col[2]);
+
+  // calle: toma primeras 3–4 palabras antes de "no" o antes del número
+  const calle = t.match(/\b(calle|av|avenida|blvd|boulevard)\s+([a-z0-9\s\.\-]+?)(?=\,|\bno\b|\b\d{1,5}\b|$)/i);
+  if (calle) out.calle = clean(calle[2]);
+
   return out;
 }
-function parseCustomerText(_text=''){ return {}; }
 
-/* ========================================================================== */
-/* ================================ Cron ==================================== */
-/* ========================================================================== */
+function parseCustomerText(text='') {
+  const out = {};
+  const mEmail = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  if (mEmail) out.email = mEmail[0].toLowerCase();
+  const mCp = text.match(/\b(\d{5})\b/);
+  if (mCp) out.cp = mCp[1];
+  // nombre: si viene como "soy X" o "a nombre de X"
+  const mName = text.match(/\b(soy|a nombre de)\s+([a-záéíóúñ\s\.]+)$/i);
+  if (mName) out.nombre = toTitleCase(clean(mName[2]));
+  return out;
+}
 
-async function cronReminders(_env){ return { ok:true, ts: Date.now() }; }
+/* ============================ Utilidad de prompts ============================ */
+
+function promptedRecently(session, key, ms=120000) {
+  session.data = session.data || {};
+  session.data.prompts = session.data.prompts || {};
+  const last = session.data.prompts[key] ? new Date(session.data.prompts[key]).getTime() : 0;
+  const now = Date.now();
+  const ok = now - last < ms;
+  if (!ok) session.data.prompts[key] = new Date().toISOString();
+  return ok;
+}
+
+/* ================================= Cron ==================================== */
+
+async function cronReminders(env) {
+  // espacio para recordatorios simples (p.ej., carritos abiertos o OS pendientes)
+  try {
+    // ejemplo no intrusivo: nada por ahora
+    return { ok: true };
+  } catch (e) {
+    console.warn('cronReminders', e);
+    return { ok: false, error: String(e) };
+  }
+}
