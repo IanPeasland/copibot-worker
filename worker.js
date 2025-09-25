@@ -838,29 +838,25 @@ async function createOrderFromSession(env, session, toE164) {
 /* =============================== SOPORTE ================================== */
 /* ========================================================================== */
 
-function isSupportIntent(ntext='') {
-  const t = `${ntext}`;
-  const hasProblem = /(falla(?:ndo)?|fallo|problema|descompuest[oa]|no imprime|no escanea|no copia|no prende|no enciende|se apaga|error|atasc|ator(?:a|o|e|ando|ada|ado)|atasco|se traba|mancha|l[ií]nea|linea|calidad|ruido|prioridad)/.test(t);
-  const hasDevice = /(impresora|equipo|copiadora|xerox|fujifilm|fuji\s?film|versant|versalink|altalink|docucolor|c\d{2,4}|b\d{2,4})/.test(t);
-  const phrase = /(mi|la|nuestra)\s+(impresora|equipo|copiadora)\s+(esta|est[ae]|anda|se)\s+(falla(?:ndo)?|ator(?:ando|ada|ado)|atasc(?:ada|ado)|descompuest[oa])/.test(t);
-  return phrase || (hasProblem && hasDevice) || /\b(soporte|servicio|visita)\b/.test(t);
-}
-
 function parseBrandModel(text=''){
   const t = normalizeWithAliases(text);
   let marca = null;
 
+  // Marca explícita
   if (/\bxerox\b/i.test(t)) marca = 'Xerox';
   else if (/\bfujifilm|fuji\s?film\b/i.test(t)) marca = 'Fujifilm';
 
   const norm = t.replace(/\s+/g,' ').trim();
 
+  // DocuColor ⇒ Xerox
   const mDocu = norm.match(/\bdocu\s*color\s*(550|560|570)\b/i) || norm.match(/\bdocucolor\s*(550|560|570)\b/i);
   if (mDocu) return { marca: marca || 'Xerox', modelo: `DOCUCOLOR ${mDocu[1]}` };
 
+  // Versant ⇒ Xerox
   const mVers = norm.match(/\bversant\s*(80|180|2100|280|4100)\b/i);
   if (mVers) return { marca: marca || 'Xerox', modelo: `VERSANT ${mVers[1]}` };
 
+  // VersaLink / AltaLink / PrimeLink ⇒ Xerox
   const mVL = norm.match(/\b(versalink|versa\s*link)\s*([a-z0-9\-]+)\b/i);
   if (mVL) return { marca: marca || 'Xerox', modelo: `${mVL[1].replace(/\s/,'').toUpperCase()} ${mVL[2].toUpperCase()}` };
 
@@ -870,18 +866,25 @@ function parseBrandModel(text=''){
   const mPL = norm.match(/\b(primelink|prime\s*link)\s*([a-z0-9\-]+)\b/i);
   if (mPL) return { marca: marca || 'Xerox', modelo: `${mPL[1].replace(/\s/,'').toUpperCase()} ${mPL[2].toUpperCase()}` };
 
+  // Apeos ⇒ Fujifilm
   const mApeos = norm.match(/\bapeos\s*([a-z0-9\-]+)?\b/i);
   if (mApeos) return { marca: marca || 'Fujifilm', modelo: `APEOS${mApeos[1] ? ' ' + mApeos[1].toUpperCase() : ''}`.trim() };
 
+  // C/B series (C60/C70/C75, Bxxxx, Cxxxx)
   const mSeries = norm.match(/\b([cb]\d{2,4})\b/i);
   if (mSeries) return { marca: marca || 'Xerox', modelo: mSeries[1].toUpperCase() };
 
+  // Números DocuColor si dijo docucolor
   const m550 = norm.match(/\b(550|560|570)\b/);
   if (/\bdocu\s*color\b/i.test(norm) && m550) return { marca: marca || 'Xerox', modelo: `DOCUCOLOR ${m550[1]}` };
 
+  // Sólo “docucolor”
   if (/\bdocu\s*color\b/i.test(norm)) return { marca: marca || 'Xerox', modelo: 'DOCUCOLOR' };
+
+  // Sólo “versant”
   if (/\bversant\b/i.test(norm)) return { marca: marca || 'Xerox', modelo: 'VERSANT' };
 
+  // Nada concluyente
   return { marca, modelo: null };
 }
 
@@ -927,7 +930,11 @@ function svFillFromAnswer(sv, field, text){
   }
   if (field === 'falla') { sv.falla = clean(text); return; }
   if (field === 'nombre') { sv.nombre = clean(text); return; }
-  if (field === 'email') { const em = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i); sv.email = em ? em[0].toLowerCase() : clean(text).toLowerCase(); return; }
+  if (field === 'email') {
+    const em = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+    sv.email = em ? em[0].toLowerCase() : clean(text).toLowerCase();
+    return;
+  }
   if (field === 'calle') { sv.calle = clean(text); return; }
   if (field === 'numero') { const mnum = text.match(/\b(\d+[A-Z]?)\b/); sv.numero = mnum?mnum[1]:clean(text); return; }
   if (field === 'colonia') { sv.colonia = clean(text); return; }
@@ -942,6 +949,8 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     session.data = session.data || {};
     const beforeStage = session.stage;
     const beforeLock = session?.data?.intent_lock;
+
+    // 🔒 Mantener soporte bloqueado durante todo el flujo
     session.data.intent_lock = 'support';
     session.data.sv = session.data.sv || {};
     const sv = session.data.sv;
@@ -949,24 +958,31 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     const wasCollecting = session.stage === 'sv_collect';
     const prevNeeded = session.data.sv_need_next || null;
 
+    // Mapear respuesta anterior (R6.3 FIX)
     if (wasCollecting && prevNeeded) {
       svFillFromAnswer(sv, prevNeeded, text);
     }
 
+    // Completar con extractores (no pisar válidos)
     const extra = extractSvInfo(text);
-    for (const k of Object.keys(extra)) { if (!truthy(sv[k])) sv[k] = extra[k]; }
+    for (const k of Object.keys(extra)) {
+      if (!truthy(sv[k])) sv[k] = extra[k];
+    }
 
+    // Parse horario natural si aún no hay
     if (!sv.when) {
       const dt = parseNaturalDateTime(lowered, env);
       if (dt?.start) sv.when = dt;
     }
 
+    // Bienvenida (una sola vez)
     if (!sv._welcomed || intent?.forceWelcome) {
       sv._welcomed = true;
-      await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
+      await saveSessionMulti(env, session, session.from, toE164, session.fromDigits); // guardar antes de enviar
       await sendWhatsAppText(env, toE164, `Lamento la falla 😕. Dime por favor la *marca y el modelo* del equipo y una breve *descripción* del problema.`);
     }
 
+    // Consejos rápidos
     const quick = quickHelp(ntext);
     if (quick && !sv.quick_advice_sent) {
       sv.quick_advice_sent = true;
@@ -975,11 +991,13 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     }
     sv.prioridad = sv.prioridad || (intent?.severity || (quick ? 'baja' : 'media'));
 
+    // Prefill con datos de cliente (si existen)
     await preloadCustomerIfAny(env, session);
     const c = session.data.customer || {};
     if (!sv.nombre && truthy(c.nombre)) sv.nombre = c.nombre;
     if (!sv.email && truthy(c.email)) sv.email = c.email;
 
+    // Calcular faltantes
     const needed = [];
     if (!(truthy(sv.marca) && truthy(sv.modelo))) needed.push('modelo');
     if (!truthy(sv.falla)) needed.push('falla');
@@ -991,11 +1009,11 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     if (!truthy(sv.nombre)) needed.push('nombre');
     if (!truthy(sv.email)) needed.push('email');
 
+    // Si faltan datos, colectar uno por uno
     if (needed.length) {
       session.stage = 'sv_collect';
       session.data.sv_need_next = needed[0];
       await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
-      dlog(env, '[support.collect]', { ask: needed[0], marca: sv.marca, modelo: sv.modelo });
 
       const Q = {
         modelo: '¿Qué *marca y modelo* es tu impresora? (p.ej., *Xerox DocuColor 550*)',
@@ -1010,19 +1028,27 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       };
 
       let pre = '';
-      if (truthy(sv.marca) && truthy(sv.modelo) && needed[0] === 'falla') pre = `Anoté: *${sv.marca} ${sv.modelo}*.\n`;
+      if (truthy(sv.marca) && truthy(sv.modelo) && needed[0] === 'falla') {
+        pre = `Anoté: *${sv.marca} ${sv.modelo}*.\n`;
+      }
       const body = pre + (Q[needed[0]] || '¿Me ayudas con ese dato, por favor?');
       await sendWhatsAppText(env, toE164, body);
       return ok('EVENT_RECEIVED');
     }
 
-    // ——— Agendar ———
+    // ——— Agendar (confirmación por WhatsApp / con GCal si hay credenciales) ———
     const tz = env.TZ || 'America/Mexico_City';
     const chosen = clampToWindow(sv.when, tz);
 
     const cliente_id = await upsertClienteByPhone(env, session.from);
-    try { await ensureClienteFields(env, cliente_id, { nombre: sv.nombre, email: sv.email, calle: sv.calle, numero: sv.numero, colonia: sv.colonia, ciudad: sv.ciudad, estado: sv.estado, cp: sv.cp }); } catch {}
+    try {
+      await ensureClienteFields(env, cliente_id, {
+        nombre: sv.nombre, email: sv.email, calle: sv.calle, numero: sv.numero,
+        colonia: sv.colonia, ciudad: sv.ciudad, estado: sv.estado, cp: sv.cp
+      });
+    } catch {}
 
+    // Pool de calendarios + creación de evento
     let pool = [];
     try { pool = await getCalendarPool(env) || []; } catch(e){ console.warn('[GCal] pool', e); }
     const cal = pickCalendarFromPool(pool);
@@ -1040,20 +1066,32 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       } catch (e) { console.warn('[GCal] create error', e); }
     }
 
+    // Crear OS en Supabase (CRÍTICO: marca/modelo correctos)
     dlog(env, '[support.final]', { marca: sv.marca, modelo: sv.modelo, falla: sv.falla });
-    let osId = null; let estado = event ? 'agendado' : 'pendiente';
+    let osId = null;
+    let estado = event ? 'agendado' : 'pendiente';
     try {
       const osBody = [{
-        cliente_id, marca: sv.marca || null, modelo: sv.modelo || null, falla_descripcion: sv.falla || null,
-        prioridad: sv.prioridad || 'media', estado,
-        ventana_inicio: new Date(slot.start).toISOString(), ventana_fin: new Date(slot.end).toISOString(),
-        gcal_event_id: event?.id || null, calendar_id: cal?.gcal_id || null,
-        calle: sv.calle || null, numero: sv.numero || null, colonia: sv.colonia || null, ciudad: sv.ciudad || null, estado: sv.estado || null, cp: sv.cp || null,
+        cliente_id,
+        marca: sv.marca || null,
+        modelo: sv.modelo || null,
+        falla_descripcion: sv.falla || null,
+        prioridad: sv.prioridad || 'media',
+        estado,
+        ventana_inicio: new Date(slot.start).toISOString(),
+        ventana_fin: new Date(slot.end).toISOString(),
+        gcal_event_id: event?.id || null,
+        calendar_id: cal?.gcal_id || null,
+        calle: sv.calle || null, numero: sv.numero || null, colonia: sv.colonia || null,
+        ciudad: sv.ciudad || null, estado: sv.estado || null, cp: sv.cp || null,
         created_at: new Date().toISOString()
-      }]];
+      }];
       const os = await sbUpsert(env, 'orden_servicio', osBody, { returning: 'representation' });
       osId = os?.data?.[0]?.id || null;
-    } catch (e) { console.warn('[Supabase] OS upsert', e); estado = 'pendiente'; }
+    } catch (e) {
+      console.warn('[Supabase] OS upsert', e);
+      estado = 'pendiente';
+    }
 
     if (event) {
       await sendWhatsAppText(
@@ -1069,7 +1107,9 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
 
     session.data.sv.os_id = osId;
     session.data.sv.gcal_event_id = event?.id || null;
-    session.data.intent_lock = null; // liberar al final
+
+    // Liberar lock al final
+    session.data.intent_lock = null;
 
     await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
     return ok('EVENT_RECEIVED');
@@ -1135,30 +1175,6 @@ async function svWhenIsMyVisit(env, session, toE164) {
   await sendWhatsAppText(env, toE164, `Tu próxima visita: *${fmtDate(os.ventana_inicio, tz)}*, de *${fmtTime(os.ventana_inicio, tz)}* a *${fmtTime(os.ventana_fin, tz)}*. Estado: ${os.estado}.`);
 }
 
-/* ========================================================================== */
-/* ============================== FAQs rápidas ============================== */
-/* ========================================================================== */
-
-async function maybeFAQ(env, ntext) {
-  try {
-    const like = encodeURIComponent(`%${ntext.slice(0, 60)}%`);
-    const r = await sbGet(env, 'company_info', { query: `select=key,content,tags&or=(key.ilike.${like},content.ilike.${like})&limit=1` });
-    if (r && r[0]?.content) return r[0].content;
-  } catch {}
-  if (/\b(qu[ié]nes?\s+son|sobre\s+ustedes|qu[eé]\s+es\s+cp(\s+digital)?|h[aá]blame\s+de\s+ustedes)\b/i.test(ntext)) {
-    return '¡Hola! Somos *CP Digital*. Ayudamos a empresas con consumibles y refacciones para impresoras Xerox y Fujifilm, y brindamos visitas de soporte técnico. Cotizamos, vendemos con o sin factura y agendamos servicio en tu horario 🙂';
-  }
-  if (/\b(horario|horarios|a\s+qu[eé]\s+hora)\b/i.test(ntext)) {
-    return 'Horario de visitas: *10:00–15:00* (lun–vie). Entregas y atención por WhatsApp todo el día.';
-  }
-  if (/\b(d[oó]nde\s+est[aá]n|ubicaci[oó]n|direcci[oó]n)\b/i.test(ntext)) {
-    return 'Tenemos presencia en Guanajuato (León y Celaya) y coordinamos entregas/servicios a nivel nacional.';
-  }
-  if (/\b(contacto|whats(app)?|tel[eé]fono|llamar|correo|email)\b/i.test(ntext)) {
-    return `Puedes escribirnos por aquí o al WhatsApp de soporte: ${env.SUPPORT_WHATSAPP || env.SUPPORT_PHONE_E164 || 'disponible en tu ficha de cliente'}.`;
-  }
-  return null;
-}
 
 
 /* ========================================================================== */
@@ -1437,3 +1453,4 @@ function promptedRecently(session, key, ms){
 async function cronReminders(env){
   return { ok: true };
 }
+
