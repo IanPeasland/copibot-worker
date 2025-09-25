@@ -214,17 +214,26 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // Fallback IA breve
-        const reply = await aiSmallTalk(env, session, 'fallback', text);
-        await sendWhatsAppText(env, fromE164, reply);
-        await saveSession(env, session, now);
-        return ok('EVENT_RECEIVED');
-      }
+      // ===== Fallback IA breve =====
+      const reply = await aiSmallTalk(env, session, 'fallback', text);
+      await sendWhatsAppText(env, fromE164, reply);
+      await saveSession(env, session, now);
+      return ok('EVENT_RECEIVED');
 
-    // … (rutas anteriores GET /, POST /, POST /cron)
+    } // <-- cierra el if (req.method === 'POST' && url.pathname === '/')
+
+    // — Rutas no coincidentes (GET/POST) → 404 controlado
     return new Response('Not found', { status: 404 });
+
   } catch (e) {
     console.error('Worker error', e);
+    // No dejar al usuario sin respuesta
+    try { 
+      const fromE164 = '+' + (extractWhatsAppContext(await safeJson(req))?.from || '');
+      if (fromE164.replace(/\D/g,'')) {
+        await sendWhatsAppText(env, fromE164, 'Tu mensaje me llegó, estoy teniendo un detalle técnico y te respondo enseguida 🙏');
+      }
+    } catch {}
     return ok('EVENT_RECEIVED');
   }
 }
@@ -1622,6 +1631,7 @@ async function cronReminders(env){
   // Espacio para recordatorios o tareas programadas
   return { ok:true, ts: Date.now() };
 }
+
 
 
 
