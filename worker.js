@@ -1570,27 +1570,10 @@ function buildResumePrompt(session){
 async function safeJson(req){ try{ return await req.json(); }catch{ return {}; } }
 function ok(s='ok'){ return new Response(s, { status: 200 }); }
 
-/* ============================ Supabase REST helpers ============================ */
-/**
- * sbGet:
- *   - GET sobre tabla/vista con query string ya armado (select, filtros, order, limit…)
- * sbUpsert:
- *   - POST con Prefer merge-duplicates (on_conflict), return configurable
- * sbPatch:
- *   - PATCH con filtro por query (ej: id=eq.123)
- * sbRpc:
- *   - POST a /rpc/<fn> con params JSON
- * Requiere: SUPABASE_URL, SUPABASE_ANON_KEY.
- */
 
-/* ============================ Cron / Recordatorios ============================ */
-/**
- * cronReminders:
- * - Hook para envíos de seguimiento (demo).
- * - Retorna objeto con ts para trazabilidad.
- * - Endpoint: POST /cron (x-cron-secret)
- */
 async function cronReminders(env){
   // Espacio para recordatorios o tareas programadas
   return { ok:true, ts: Date.now() };
 }
+      
+};      
