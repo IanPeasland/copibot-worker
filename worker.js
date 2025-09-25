@@ -766,16 +766,6 @@ async function findBestProduct(env, queryText, opts = {}) {
   return null;
 }
 
-
-function extractColorWord(text=''){
-  const t = normalizeWithAliases(text);
-  if (/\b(amarillo|yellow)\b/i.test(t)) return 'yellow';
-  if (/\bmagenta\b/i.test(t)) return 'magenta';
-  if (/\b(cyan|cian)\b/i.test(t)) return 'cyan';
-  if (/\b(negro|black|bk|k)\b/i.test(t)) return 'black';
-  return null;
-}
-
 function enrichQueryFromAI(q, ai){
   if (!ai) return q;
   let out = q;
@@ -1606,5 +1596,6 @@ async function cronReminders(env){
   // Espacio para recordatorios o tareas programadas
   return { ok:true, ts: Date.now() };
 }
+
 
 
