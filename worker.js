@@ -331,26 +331,142 @@ async function notifySupport(env, body) {
 }
 
 /* ========================================================================== */
-/* =========================== Sesión (KV) ================================== */
+/* ============================ Sesión (Supabase) ============================ */
 /* ========================================================================== */
 
-async function loadSessionMulti(env, from, fromE164){
-  try{
-    const a = await env.COPIBOT_KV.get(`sess:${fromE164}`, 'json');
-    if (a) return a;
-    const b = await env.COPIBOT_KV.get(`sess:${from}`, 'json');
-    return b || { from, stage:'idle', data:{} };
-  }catch{
-    return { from, stage:'idle', data:{} };
+/**
+ * Migramos la sesión a Supabase (tabla wa_session) para no depender de KV.
+ * - Mantiene API: loadSessionMulti / saveSessionMulti (no cambies llamadas).
+ * - TTL lógico: 90 días (limpieza en cronReminders).
+ *
+ * Esquema esperado (ya lo tienes, pero por si acaso):
+ *
+ * CREATE TABLE IF NOT EXISTS public.wa_session (
+ *   phone       text PRIMARY KEY,
+ *   data        jsonb NOT NULL DEFAULT '{}'::jsonb,
+ *   stage       text  NOT NULL DEFAULT 'idle',
+ *   updated_at  timestamptz NOT NULL DEFAULT now()
+ * );
+ * CREATE INDEX IF NOT EXISTS idx_wa_session_updated_at ON public.wa_session(updated_at);
+ */
+
+const SESS_TTL_DAYS = 90;
+
+// Cache de proceso (fallback mínimo por request burst). No garantiza cross-instance.
+// Expira a los ~5 minutos para no causar efectos raros entre despliegues.
+const MEM_CACHE = new Map();
+const MEM_TTL_MS = 5 * 60 * 1000;
+
+function memGet(key) {
+  const it = MEM_CACHE.get(key);
+  if (!it) return null;
+  if (Date.now() - it.t > MEM_TTL_MS) { MEM_CACHE.delete(key); return null; }
+  return it.v;
+}
+function memSet(key, val) { MEM_CACHE.set(key, { v: val, t: Date.now() }); }
+
+/**
+ * Normaliza una sesión base.
+ */
+function blankSession(from) {
+  return { from, stage: 'idle', data: {} };
+}
+
+/**
+ * Carga por cualquiera de las dos llaves (from / fromE164).
+ * Devuelve un objeto sesión siempre (aunque no exista en BD).
+ */
+async function loadSessionMulti(env, from, fromE164) {
+  try {
+    const k1 = `sess:${fromE164}`;
+    const k2 = `sess:${from}`;
+
+    // 1) Intenta cache en memoria
+    const mem = memGet(k1) || memGet(k2);
+    if (mem) return mem;
+
+    // 2) Lee Supabase por phone = fromE164 o from (el que venga con +)
+    const phone = String(fromE164 || from || '').trim();
+    if (!phone) return blankSession(from);
+
+    const q = `select=phone,data,stage,updated_at&phone=eq.${encodeURIComponent(phone)}&limit=1`;
+    const row = await sbGet(env, 'wa_session', { query: q });
+    if (row && row[0]) {
+      const sess = {
+        from,
+        stage: row[0].stage || 'idle',
+        data: row[0].data || {},
+      };
+      memSet(k1, sess);
+      memSet(k2, sess);
+      return sess;
+    }
+
+    // 3) Si no existe, crea default en memoria (no escribe aún)
+    const fresh = blankSession(from);
+    memSet(k1, fresh); memSet(k2, fresh);
+    return fresh;
+  } catch (e) {
+    console.warn('[session] loadSessionMulti error', e);
+    // En peor caso, sesión efímera.
+    return blankSession(from);
   }
 }
-async function saveSessionMulti(env, sess, from, fromE164){
-  try{
-    const val = JSON.stringify(sess);
-    await env.COPIBOT_KV.put(`sess:${from}`, val, { expirationTtl: 60*60*24*7 });
-    await env.COPIBOT_KV.put(`sess:${fromE164}`, val, { expirationTtl: 60*60*24*7 });
-  }catch{}
+
+/**
+ * Guarda/upsertea la sesión en Supabase con updated_at=now()
+ * y también la sibila en la cache de proceso.
+ */
+async function saveSessionMulti(env, session, from, fromE164) {
+  try {
+    const phone = String(fromE164 || from || '').trim();
+    if (!phone) return;
+
+    const payload = [{
+      phone,
+      data: session?.data || {},
+      stage: session?.stage || 'idle',
+      updated_at: new Date().toISOString()
+    }];
+
+    // upsert por PK phone
+    await sbUpsert(env, 'wa_session', payload, { onConflict: 'phone', returning: 'minimal' });
+
+    // cache
+    const k1 = `sess:${fromE164}`;
+    const k2 = `sess:${from}`;
+    memSet(k1, session);
+    memSet(k2, session);
+  } catch (e) {
+    console.warn('[session] saveSessionMulti error', e);
+  }
 }
+
+/* ========================================================================== */
+/* ============================ Limpieza (cron) ============================== */
+/* ========================================================================== */
+
+/**
+ * El cronReminders ya existe en tu worker; aquí sólo agregamos
+ * una mini-limpieza de sesiones > 90 días para no crecer indefinidamente.
+ * Llama a esta función dentro de cronReminders(env).
+ */
+async function cleanupOldSessions(env) {
+  try {
+    // Elimina lógicamente: si tienes RLS estricta, puedes cambiar por un UPDATE a estado "archivado" o similar.
+    // Aquí usamos RPC para no habilitar DELETE abierto; si no tienes RPC, usa PATCH con policy.
+    // Como fallback simple: UPDATE y deja que un job de mantenimiento las borre.
+    const sql =
+      `delete from wa_session where updated_at < now() - interval '${SESS_TTL_DAYS} days';`;
+    await sbRpc(env, 'exec_sql', { sql }).catch(() => null);
+  } catch (e) {
+    console.warn('[session] cleanupOldSessions', e);
+  }
+}
+
+// Si no tienes la función RPC exec_sql, omite el borrado (no es crítico).
+// También puedes crearla así (opcional):
+// CREATE OR REPLACE FUNCTION public.exec_sql(sql text) RETURNS void AS $$ BEGIN EXECUTE sql; END; $$ LANGUAGE plpgsql SECURITY DEFINER;
 
 /* ========================================================================== */
 /* ============================== Ventas ==================================== */
@@ -1414,6 +1530,7 @@ async function cronReminders(env){
   // - Recordar pedidos con estado “nuevo” > 48h.
   return { ok: true, ts: new Date().toISOString() };
 }
+
 
 
 
