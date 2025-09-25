@@ -37,12 +37,29 @@ export default {
         return ok(`cron ok ${JSON.stringify(out)}`);
       }
 
-      // --- WhatsApp webhook principal ---
-      if (req.method === 'POST' && url.pathname === '/') {
-        const payload = await safeJson(req);
-        const ctx = extractWhatsAppContext(payload);
-        if (!ctx) return ok('EVENT_RECEIVED');
+// --- WhatsApp webhook principal ---
+if (req.method === 'POST' && url.pathname === '/') {
+  const payload = await safeJson(req);
+  const ctx = extractWhatsAppContext(payload);
+  if (!ctx) return ok('EVENT_RECEIVED');
 
+  // Desestructura ctx ANTES de usar variables en debug
+  const { mid, from, fromE164, profileName, textRaw, msgType } = ctx;
+  const originalText = (textRaw || '').trim();
+  const lowered = originalText.toLowerCase();
+  const ntext = normalizeWithAliases(originalText);
+
+  // ——— DEBUG WEBHOOK (salida temprana) ———
+  if (env.DEBUG_WEBHOOK && String(env.DEBUG_WEBHOOK).toLowerCase() === 'true') {
+    try {
+      await sendWhatsAppText(env, fromE164, `✅ webhook ok: "${(textRaw || '').slice(0, 50)}"`);
+    } catch (e) {
+      console.error('[debug] sendWhatsAppText error', e);
+    }
+    await saveSessionMulti(env, session, from, fromE164);
+    return ok('EVENT_RECEIVED');
+  }
+  
         const { mid, from, fromE164, profileName, textRaw, msgType } = ctx;
         const originalText = (textRaw || '').trim();
         const lowered = originalText.toLowerCase();
@@ -1530,6 +1547,7 @@ async function cronReminders(env){
   // - Recordar pedidos con estado “nuevo” > 48h.
   return { ok: true, ts: new Date().toISOString() };
 }
+
 
 
 
