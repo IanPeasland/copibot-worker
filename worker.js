@@ -1,9 +1,10 @@
 /**
- * CopiBot – IA + Ventas + Soporte + GCal — Build R6.1 (2025-09)
- * Cambios R6.1:
- *  - Confirmación explícita al capturar marca/modelo en soporte.
- *  - Pregunta siguiente con fallback seguro (nunca undefined).
- *  - Mantiene candado de soporte, fixes de inventario y flujo de ventas.
+ * CopiBot – IA + Ventas + Soporte + GCal — Build R6.2 (2025-09)
+ * Cambios R6.2:
+ *  - Sesión dual-key (from & fromE164) para no perder sv_collect / candados.
+ *  - Regla dura: texto con marca+modelo (sin palabras de compra) => soporte.
+ *  - ACK explícito de marca/modelo en soporte y prompts seguros.
+ *  - Flujo de ventas mantiene nota “sobre pedido” sin cortar copy de producto.
  */
 
 /* ========================================================================== */
@@ -47,7 +48,7 @@ export default {
 
         // ===== Session =====
         const now = new Date();
-        let session = await loadSession(env, from);
+        let session = await loadSessionMulti(env, from, fromE164); // 👈 dual-key
         session.data = session.data || {};
         session.stage = session.stage || 'idle';
         session.from = from;
@@ -65,14 +66,35 @@ export default {
         // NO-TEXTO (excepto interactive -> ya se mapea a text)
         if (msgType !== 'text') {
           await sendWhatsAppText(env, fromE164, `¿Podrías escribirme con palabras lo que necesitas? Así te ayudo más rápido 🙂`);
-          await saveSession(env, session);
+          await saveSessionMulti(env, session, from, fromE164);
           return ok('EVENT_RECEIVED');
         }
 
         /* ============================================================
-         *  PRIMERA BARRERA: SOPORTE TIENE PRIORIDAD (Candado duro)
+         *  BARRERA 0: si veníamos en Soporte, Soporte tiene prioridad
          * ============================================================ */
         if (session.stage?.startsWith('sv_') || session?.data?.intent_lock === 'support') {
+          const handled = await handleSupport(env, session, fromE164, originalText, lowered, ntext, now, { intent: 'support' });
+          return handled;
+        }
+
+        /* ============================================================
+         *  REGLA DURA: si el texto parece Marca+Modelo (sin “tóner”)
+         *  => Forzamos soporte (aunque no haya dicho falla).
+         * ============================================================ */
+        const SALES_WORDS = /\b(toner|t[óo]ner|cartucho|developer|refacci[oó]n|precio)\b/i;
+        const pmGuard = parseBrandModel(ntext);
+        if (pmGuard?.modelo && !SALES_WORDS.test(ntext)) {
+          session.data.intent_lock = 'support';
+          // (si venía de cero, abre etapa de recolección)
+          if (!session.stage?.startsWith('sv_')) {
+            session.stage = 'sv_collect';
+            session.data.sv_need_next = 'falla';
+            session.data.sv = session.data.sv || {};
+            if (pmGuard.marca) session.data.sv.marca = pmGuard.marca;
+            if (pmGuard.modelo) session.data.sv.modelo = pmGuard.modelo;
+          }
+          await saveSessionMulti(env, session, from, fromE164);
           const handled = await handleSupport(env, session, fromE164, originalText, lowered, ntext, now, { intent: 'support' });
           return handled;
         }
@@ -82,7 +104,7 @@ export default {
           const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
           await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
           session.data.last_greet_at = now.toISOString();
-          await saveSession(env, session);
+          await saveSessionMulti(env, session, from, fromE164);
           return ok('EVENT_RECEIVED');
         }
 
@@ -90,7 +112,7 @@ export default {
         if (/\b(cancel(a|ar).*(cita|visita|servicio))\b/i.test(lowered)) {
           session.data.intent_lock = 'support';
           await svCancel(env, session, fromE164);
-          await saveSession(env, session);
+          await saveSessionMulti(env, session, from, fromE164);
           return ok('EVENT_RECEIVED');
         }
         if (/\b(reprogram|mueve|cambia|modif)\w*/i.test(lowered)) {
@@ -98,22 +120,22 @@ export default {
           if (when?.start) {
             session.data.intent_lock = 'support';
             await svReschedule(env, session, fromE164, when);
-            await saveSession(env, session);
+            await saveSessionMulti(env, session, from, fromE164);
             return ok('EVENT_RECEIVED');
           }
         }
         if (/\b(cu[aá]ndo|cuando).*(cita|visita|servicio)\b/i.test(lowered)) {
           session.data.intent_lock = 'support';
           await svWhenIsMyVisit(env, session, fromE164);
-          await saveSession(env, session);
+          await saveSessionMulti(env, session, from, fromE164);
           return ok('EVENT_RECEIVED');
         }
 
         /* =================== Intenciones =================== */
         const supportIntent = isSupportIntent(ntext) || (await intentIs(env, originalText, 'support'));
         if (supportIntent) {
-          session.data.intent_lock = 'support';             // 🔒 fijamos candado
-          await saveSession(env, session);
+          session.data.intent_lock = 'support'; // 🔒 fijamos candado
+          await saveSessionMulti(env, session, from, fromE164);
           const handled = await handleSupport(env, session, fromE164, originalText, lowered, ntext, now, { intent: 'support' });
           return handled;
         }
@@ -136,14 +158,14 @@ export default {
         const faqAns = await maybeFAQ(env, ntext);
         if (faqAns) {
           await sendWhatsAppText(env, fromE164, faqAns);
-          await saveSession(env, session);
+          await saveSessionMulti(env, session, from, fromE164);
           return ok('EVENT_RECEIVED');
         }
 
         // ===== Fallback IA =====
         const reply = await aiSmallTalk(env, session, 'fallback', originalText);
         await sendWhatsAppText(env, fromE164, reply);
-        await saveSession(env, session);
+        await saveSessionMulti(env, session, from, fromE164);
         return ok('EVENT_RECEIVED');
       }
 
@@ -292,12 +314,22 @@ async function notifySupport(env, body) {
 /* =========================== Sesión (KV) ================================== */
 /* ========================================================================== */
 
-async function loadSession(env, id){
-  try{ const r = await env.COPIBOT_KV.get(`sess:${id}`, 'json'); return r || { from:id, stage:'idle', data:{} }; }
-  catch{ return { from:id, stage:'idle', data:{} }; }
+async function loadSessionMulti(env, from, fromE164){
+  try{
+    const a = await env.COPIBOT_KV.get(`sess:${fromE164}`, 'json');
+    if (a) return a;
+    const b = await env.COPIBOT_KV.get(`sess:${from}`, 'json');
+    return b || { from, stage:'idle', data:{} };
+  }catch{
+    return { from, stage:'idle', data:{} };
+  }
 }
-async function saveSession(env, sess){
-  try{ await env.COPIBOT_KV.put(`sess:${sess.from}`, JSON.stringify(sess), { expirationTtl: 60*60*24*7 }); }catch{}
+async function saveSessionMulti(env, sess, from, fromE164){
+  try{
+    const val = JSON.stringify(sess);
+    await env.COPIBOT_KV.put(`sess:${from}`, val, { expirationTtl: 60*60*24*7 });
+    await env.COPIBOT_KV.put(`sess:${fromE164}`, val, { expirationTtl: 60*60*24*7 });
+  }catch{}
 }
 
 /* ========================================================================== */
@@ -345,14 +377,14 @@ async function handleAskQty(env, session, toE164, text, lowered, ntext, now){
   const cand = session.data?.last_candidate;
   if (!cand) {
     session.stage = 'cart_open';
-    await saveSession(env, session);
+    await saveSessionMulti(env, session, session.from, toE164);
     await sendWhatsAppText(env, toE164, 'No alcancé a ver el artículo. ¿Lo repetimos o buscas otro? 🙂');
     return ok('EVENT_RECEIVED');
   }
   const qty = parseQty(lowered, 1);
   addWithStockSplit(session, cand, qty);
   session.stage = 'cart_open';
-  await saveSession(env, session);
+  await saveSessionMulti(env, session, session.from, toE164);
   const s = numberOrZero(cand.stock);
   const bo = Math.max(0, qty - Math.min(s, qty));
   const nota = bo>0 ? `\n(De ${qty}, ${Math.min(s,qty)} en stock y ${bo} sobre pedido)` : '';
@@ -372,7 +404,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
       addWithStockSplit(session, session.data.last_candidate, 1);
     }
     session.stage = 'await_invoice';
-    await saveSession(env, session);
+    await saveSessionMulti(env, session, session.from, toE164);
     await sendWhatsAppText(env, toE164, `Perfecto 🙌 ¿La cotizamos *con factura* o *sin factura*?`);
     return ok('EVENT_RECEIVED');
   }
@@ -382,7 +414,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     const c = session.data?.last_candidate;
     if (c) {
       session.stage = 'ask_qty';
-      await saveSession(env, session);
+      await saveSessionMulti(env, session, session.from, toE164);
       const s = numberOrZero(c.stock);
       await sendWhatsAppText(env, toE164, `De acuerdo. ¿Cuántas *piezas* necesitas? (hay ${s} en stock; el resto iría *sobre pedido*)`);
       return ok('EVENT_RECEIVED');
@@ -391,7 +423,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
 
   if (RX_WANT_QTY.test(lowered)) {
     session.stage = 'ask_qty';
-    await saveSession(env, session);
+    await saveSessionMulti(env, session, session.from, toE164);
     const c = session.data?.last_candidate;
     const s = numberOrZero(c?.stock);
     await sendWhatsAppText(env, toE164, `Perfecto. ¿Cuántas *piezas* en total? (hay ${s} en stock; el resto iría *sobre pedido*)`);
@@ -409,7 +441,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     if (best) {
       session.data.last_candidate = best;
       session.stage = 'ask_qty';
-      await saveSession(env, session);
+      await saveSessionMulti(env, session, session.from, toE164);
       const s = numberOrZero(best.stock);
       await sendWhatsAppText(env, toE164, `${renderProducto(best)}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; hay ${s} en stock y el resto sería *sobre pedido*.`);
       return ok('EVENT_RECEIVED');
@@ -419,19 +451,19 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
       if (hints.family && ((env.STRICT_FAMILY_MATCH||'').toString().toLowerCase() !== 'true')) {
         session.stage = 'await_compatibles';
         session.data.pending_query = enrichedQ;
-        await saveSession(env, session);
+        await saveSessionMulti(env, session, session.from, toE164);
         await sendWhatsAppText(env, toE164, `Ese modelo está *sobre pedido* o sin disponibilidad. ¿Quieres que te muestre opciones *compatibles* en otra línea?`);
         return ok('EVENT_RECEIVED');
       }
       await sendWhatsAppText(env, toE164, `No encontré una coincidencia directa 😕. ¿Busco otra opción o lo revisa un asesor?`);
       await notifySupport(env, `Inventario sin match. ${toE164}: ${text}`);
-      await saveSession(env, session);
+      await saveSessionMulti(env, session, session.from, toE164);
       return ok('EVENT_RECEIVED');
     }
   }
 
   await sendWhatsAppText(env, toE164, `Te leo 🙂. Puedo agregar el artículo visto, buscar otro o *finalizar* si ya está completo.`);
-  await saveSession(env, session);
+  await saveSessionMulti(env, session, session.from, toE164);
   return ok('EVENT_RECEIVED');
 }
 
@@ -451,7 +483,7 @@ function enrichQueryFromAI(q, ai){
 async function handleAwaitInvoice(env, session, toE164, lowered, now, originalText='') {
   if (/\b(no|gracias|todo bien)\b/i.test(lowered)) {
     session.stage = 'idle';
-    await saveSession(env, session);
+    await saveSessionMulti(env, session, session.from, toE164);
     await sendWhatsAppText(env, toE164, `Perfecto, quedo al pendiente. Si necesitas algo más, aquí estoy 🙂`);
     return ok('EVENT_RECEIVED');
   }
@@ -468,7 +500,7 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now, originalTe
     if (!promptedRecently(session, 'invoice', 3*60*1000)) {
       await sendWhatsAppText(env, toE164, `Por cierto, ¿la quieres *con factura* o *sin factura*?`);
     }
-    await saveSession(env, session);
+    await saveSessionMulti(env, session, session.from, toE164);
     return ok('EVENT_RECEIVED');
   }
 
@@ -479,7 +511,7 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now, originalTe
     const need = firstMissing(list, session.data.customer);
     if (need) {
       session.stage = `collect_${need}`;
-      await saveSession(env, session);
+      await saveSessionMulti(env, session, session.from, toE164);
       await sendWhatsAppText(env, toE164, `¿${LABEL[need]}?`);
       return ok('EVENT_RECEIVED');
     }
@@ -493,7 +525,7 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now, originalTe
     }
     session.stage = 'idle';
     session.data.cart = [];
-    await saveSession(env, session);
+    await saveSessionMulti(env, session, session.from, toE164);
     await sendWhatsAppText(env, toE164, `¿Te ayudo con algo más en este momento? (Sí / No)`);
     return ok('EVENT_RECEIVED');
   }
@@ -501,7 +533,7 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now, originalTe
   if (!promptedRecently(session, 'invoice', 2*60*1000)) {
     await sendWhatsAppText(env, toE164, `¿La quieres con factura o sin factura?`);
   }
-  await saveSession(env, session);
+  await saveSessionMulti(env, session, session.from, toE164);
   return ok('EVENT_RECEIVED');
 }
 
@@ -536,25 +568,25 @@ async function handleCollectSequential(env, session, toE164, text, now){
       c.estado = info.estado || c.estado;
     }
   }
-  await saveSession(env, session);
+  await saveSessionMulti(env, session, session.from, toE164);
   const nextField = firstMissing(list, c);
   if (nextField){
     session.stage = `collect_${nextField}`;
-    await saveSession(env, session);
+    await saveSessionMulti(env, session, session.from, toE164);
     await sendWhatsAppText(env, toE164, `¿${LABEL[nextField]}?`);
     return ok('EVENT_RECEIVED');
   }
   const res = await createOrderFromSession(env, session, toE164);
   if (res?.ok) {
     await sendWhatsAppText(env, toE164, `¡Listo! Generé tu solicitud 🙌\n*Total estimado:* ${formatMoneyMXN(res.total)} + IVA\nUn asesor te confirmará entrega y forma de pago.`);
-    await notifySupport(env, `Nuevo pedido #${res.pedido_id ?? '—'}\nCliente: ${c.nombre} (${toE164})`);
+    await notifySupport(env, `Nuevo pedido #${c.nombre ? c.nombre : ''} (${toE164})`);
   } else {
     await sendWhatsAppText(env, toE164, `Creé tu solicitud y la pasé a un asesor humano para confirmar detalles. 🙌`);
     await notifySupport(env, `Pedido (parcial) ${toE164}. Error: ${res?.error || 'N/A'}`);
   }
   session.stage = 'idle';
   session.data.cart = [];
-  await saveSession(env, session);
+  await saveSessionMulti(env, session, session.from, toE164);
   await sendWhatsAppText(env, toE164, `¿Puedo ayudarte con algo más? (Sí / No)`);
   return ok('EVENT_RECEIVED');
 }
@@ -708,7 +740,7 @@ async function startSalesFromQuery(env, session, toE164, text, ntext, now){
   if (!best && hints.family) {
     session.stage = 'await_compatibles';
     session.data.pending_query = enrichedQ;
-    await saveSession(env, session);
+    await saveSessionMulti(env, session, session.from, toE164);
     await sendWhatsAppText(env, toE164, `Ese modelo está *sobre pedido* o sin disponibilidad. ¿Quieres que te muestre opciones *compatibles* en otra línea?`);
     return ok('EVENT_RECEIVED');
   }
@@ -717,7 +749,7 @@ async function startSalesFromQuery(env, session, toE164, text, ntext, now){
     session.stage = 'ask_qty';
     session.data.cart = session.data.cart || [];
     session.data.last_candidate = best;
-    await saveSession(env, session);
+    await saveSessionMulti(env, session, session.from, toE164);
     const s = numberOrZero(best.stock);
     await sendWhatsAppText(
       env, toE164,
@@ -727,7 +759,7 @@ async function startSalesFromQuery(env, session, toE164, text, ntext, now){
   } else {
     await sendWhatsAppText(env, toE164, `No encontré una coincidencia directa 😕. Te conecto con un asesor…`);
     await notifySupport(env, `Inventario sin match. +${session.from}: ${text}`);
-    await saveSession(env, session);
+    await saveSessionMulti(env, session, session.from, toE164);
     return ok('EVENT_RECEIVED');
   }
 }
@@ -815,33 +847,51 @@ async function createOrderFromSession(env, session, toE164) {
 function parseBrandModel(text=''){
   const t = normalizeWithAliases(text);
   let marca = null;
+
+  // Marca explícita
   if (/\bxerox\b/i.test(t)) marca = 'Xerox';
   else if (/\bfujifilm|fuji\s?film\b/i.test(t)) marca = 'Fujifilm';
 
   const norm = t.replace(/\s+/g,' ').trim();
 
-  const mDocu = norm.match(/\bdocucolor\s*(550|560|570)\b/i);
+  // Modelos que IMPLICAN marca
+  // DocuColor ⇒ Xerox
+  const mDocu = norm.match(/\bdocu\s*color\s*(550|560|570)\b/i) || norm.match(/\bdocucolor\s*(550|560|570)\b/i);
   if (mDocu) return { marca: marca || 'Xerox', modelo: `DOCUCOLOR ${mDocu[1]}` };
 
+  // Versant ⇒ Xerox
   const mVers = norm.match(/\bversant\s*(80|180|2100|280|4100)\b/i);
   if (mVers) return { marca: marca || 'Xerox', modelo: `VERSANT ${mVers[1]}` };
 
-  const mVL = norm.match(/\b(versalink|versa ?link)\s*([a-z0-9\-]+)\b/i);
+  // VersaLink / AltaLink / PrimeLink ⇒ Xerox
+  const mVL = norm.match(/\b(versalink|versa\s*link)\s*([a-z0-9\-]+)\b/i);
   if (mVL) return { marca: marca || 'Xerox', modelo: `${mVL[1].replace(/\s/,'').toUpperCase()} ${mVL[2].toUpperCase()}` };
 
-  const mAL = norm.match(/\b(altalink|alta ?link)\s*([a-z0-9\-]+)\b/i);
+  const mAL = norm.match(/\b(altalink|alta\s*link)\s*([a-z0-9\-]+)\b/i);
   if (mAL) return { marca: marca || 'Xerox', modelo: `${mAL[1].replace(/\s/,'').toUpperCase()} ${mAL[2].toUpperCase()}` };
 
-  const mPL = norm.match(/\b(primelink|prime ?link)\s*([a-z0-9\-]+)\b/i);
+  const mPL = norm.match(/\b(primelink|prime\s*link)\s*([a-z0-9\-]+)\b/i);
   if (mPL) return { marca: marca || 'Xerox', modelo: `${mPL[1].replace(/\s/,'').toUpperCase()} ${mPL[2].toUpperCase()}` };
 
+  // Apeos ⇒ Fujifilm
+  const mApeos = norm.match(/\bapeos\s*([a-z0-9\-]+)?\b/i);
+  if (mApeos) return { marca: marca || 'Fujifilm', modelo: `APEOS${mApeos[1] ? ' ' + mApeos[1].toUpperCase() : ''}`.trim() };
+
+  // C60/C70/C75 ⇒ Xerox Color CXX (seguimos dejando la marca si no viene)
   const mSeries = norm.match(/\b([cb]\d{2,4})\b/i);
-  if (mSeries) return { marca, modelo: mSeries[1].toUpperCase() };
+  if (mSeries) return { marca: marca || 'Xerox', modelo: mSeries[1].toUpperCase() };
 
+  // Números DocuColor sin palabra (550/560/570) si venía “docucolor” afuera
   const m550 = norm.match(/\b(550|560|570)\b/);
-  if (!marca && /\bxerox\b/i.test(norm)) marca = 'Xerox';
-  if (/\bdocucolor\b/i.test(norm) && m550) return { marca: marca || 'Xerox', modelo: `DOCUCOLOR ${m550[1]}` };
+  if (/\bdocu\s*color\b/i.test(norm) && m550) return { marca: marca || 'Xerox', modelo: `DOCUCOLOR ${m550[1]}` };
 
+  // Si sólo dijo “docucolor” sin número, asumimos Xerox y dejamos modelo parcial
+  if (/\bdocu\s*color\b/i.test(norm)) return { marca: marca || 'Xerox', modelo: 'DOCUCOLOR' };
+
+  // Si sólo dijo “versant” sin número
+  if (/\bversant\b/i.test(norm)) return { marca: marca || 'Xerox', modelo: 'VERSANT' };
+
+  // Nada concluyente
   return { marca, modelo: null };
 }
 
@@ -948,7 +998,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     if (needed.length) {
       session.stage = 'sv_collect';
       session.data.sv_need_next = needed[0];
-      await saveSession(env, session);
+      await saveSessionMulti(env, session, session.from, toE164);
 
       // Pregunta segura + ACK de marca/modelo si ya los tenemos
       const Q = {
@@ -1030,7 +1080,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     // liberamos candado
     session.data.intent_lock = null;
 
-    await saveSession(env, session);
+    await saveSessionMulti(env, session, session.from, toE164);
     return ok('EVENT_RECEIVED');
 
   } catch (e) {
@@ -1288,30 +1338,29 @@ async function upsertClienteByPhone(env, phone){
 async function sbGet(env, table, { query }) {
   const url = `${env.SUPABASE_URL}/rest/v1/${table}?${query}`;
   const r = await fetch(url, { headers: { apikey: env.SUPABASE_ANON_KEY, Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE || env.SUPABASE_ANON_KEY}` } });
-    if (!r.ok) { console.warn('sbGet', r.status, await r.text()); return []; }
-  try { return await r.json(); } catch { return []; }
+  if (!r.ok) { console.warn('sbGet', r.status, await r.text()); return null; }
+  return await r.json();
 }
 
-async function sbUpsert(env, table, rows, { onConflict=null, returning='representation' } = {}) {
-  const url = new URL(`${env.SUPABASE_URL}/rest/v1/${table}`);
-  if (onConflict) url.searchParams.set('on_conflict', onConflict);
-  url.searchParams.set('return', returning);
-  const r = await fetch(url.toString(), {
+async function sbUpsert(env, table, rows, { onConflict, returning='representation' } = {}) {
+  const url = `${env.SUPABASE_URL}/rest/v1/${table}${onConflict ? `?on_conflict=${encodeURIComponent(onConflict)}` : ''}`;
+  const r = await fetch(url, {
     method: 'POST',
     headers: {
       apikey: env.SUPABASE_ANON_KEY,
       Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE || env.SUPABASE_ANON_KEY}`,
       'Content-Type': 'application/json',
-      Prefer: 'resolution=merge-duplicates'
+      Prefer: `resolution=merge-duplicates,return=${returning}`
     },
     body: JSON.stringify(rows)
   });
-  if (!r.ok) { console.warn('sbUpsert', r.status, await r.text()); return { data: null }; }
-  try { return { data: await r.json() }; } catch { return { data: null }; }
+  if (!r.ok) { console.warn('sbUpsert', r.status, await r.text()); return null; }
+  const data = returning==='minimal' ? null : await r.json();
+  return { data };
 }
 
-async function sbPatch(env, table, patch, filter) {
-  const url = `${env.SUPABASE_URL}/rest/v1/${table}?${filter}`;
+async function sbPatch(env, table, patch, where) {
+  const url = `${env.SUPABASE_URL}/rest/v1/${table}?${where}`;
   const r = await fetch(url, {
     method: 'PATCH',
     headers: {
@@ -1323,7 +1372,6 @@ async function sbPatch(env, table, patch, filter) {
     body: JSON.stringify(patch)
   });
   if (!r.ok) console.warn('sbPatch', r.status, await r.text());
-  return r.ok;
 }
 
 async function sbRpc(env, fn, args) {
@@ -1337,81 +1385,68 @@ async function sbRpc(env, fn, args) {
     },
     body: JSON.stringify(args || {})
   });
-  if (!r.ok) { console.warn('sbRpc', fn, r.status, await r.text()); return null; }
-  try { return await r.json(); } catch { return null; }
+  if (!r.ok) { console.warn('sbRpc', r.status, await r.text()); return null; }
+  return await r.json();
 }
 
-/* ============================ Direcciones/Cliente ============================ */
+/* ============================== Dirección/CP ============================== */
 
-async function cityFromCP(env, cp) {
+function parseCustomerText(text=''){
+  const t = text;
+  const out = {};
+  const em = t.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+  if (em) out.email = em[0].toLowerCase();
+  const cp = t.match(/\b(\d{5})\b/);
+  if (cp) out.cp = cp[1];
+  const num = t.match(/\b(\d+[A-Z]?)\b/);
+  if (num) out.numero = num[1];
+  return out;
+}
+
+function parseAddressLoose(text=''){
+  const out = {};
+  // colonia: “Col. Centro”, “colonia Centro”
+  const mCol = text.match(/\bcol(?:\.|onia)?\s+([a-z0-9\-\sáéíóúñ]+)\b/i);
+  if (mCol) out.colonia = clean(mCol[1]);
+  // calle: “calle Reforma”, “en Reforma #123”
+  const mCal1 = text.match(/\bcalle\s+([a-z0-9\-\sáéíóúñ]+)\b/i);
+  if (mCal1) out.calle = clean(mCal1[1]);
+  const mCal2 = text.match(/\ben\s+([a-z0-9\-\sáéíóúñ]+)\s+#?\d+\b/i);
+  if (!out.calle && mCal2) out.calle = clean(mCal2[1]);
+  // ciudad/estado (muy suelto)
+  const mCd = text.match(/\b(le[oó]n|celaya|irapuato|gto\.?|guanajuato|quer[eé]taro|cdmx|ciudad de m[eé]xico)\b/i);
+  if (mCd) out.ciudad = toTitleCase(mCd[1].normalize('NFD').replace(/[\u0300-\u036f]/g,''));
+  const mSt = text.match(/\b(guanajuato|quer[eé]taro|jalisco|michoac[aá]n|estado de m[eé]xico)\b/i);
+  if (mSt) out.estado = toTitleCase(mSt[1].normalize('NFD').replace(/[\u0300-\u036f]/g,''));
+  return out;
+}
+
+async function cityFromCP(env, cp){
   if (!cp) return null;
-  // intenta tabla típica "sepomex_cp" (cp, municipio, estado, ciudad)
-  try {
-    const r = await sbGet(env, 'sepomex_cp', { query: `select=cp,municipio,estado,ciudad&cp=eq.${encodeURIComponent(cp)}&limit=1` });
-    if (r && r[0]) return { ciudad: r[0].ciudad || r[0].municipio, municipio: r[0].municipio, estado: r[0].estado };
-  } catch {}
-  // fallback a "sepomex" genérica (cp, asentamiento, municipio, estado)
-  try {
-    const r2 = await sbGet(env, 'sepomex', { query: `select=cp,municipio,estado,ciudad&cp=eq.${encodeURIComponent(cp)}&limit=1` });
-    if (r2 && r2[0]) return { ciudad: r2[0].ciudad || r2[0].municipio, municipio: r2[0].municipio, estado: r2[0].estado };
-  } catch {}
+  // intenta tabla configurable o comunes
+  const tables = (env.CP_TABLE || 'sepomex_cp_v,cp_mx').split(',');
+  for (const t of tables){
+    try{
+      const r = await sbGet(env, t.trim(), { query: `select=cp,ciudad,municipio,estado&cp=eq.${encodeURIComponent(cp)}&limit=1` });
+      if (r && r[0]) return r[0];
+    }catch{}
+  }
   return null;
 }
 
-function parseAddressLoose(text='') {
-  const t = normalizeBase(text);
-  const out = {};
-  const mcp = t.match(/\b(\d{5})\b/);
-  if (mcp) out.cp = mcp[1];
+/* ============================== Cron/Utiles =============================== */
 
-  // número (muy laxo)
-  const mnum = t.match(/\bno\.?\s*(\d+[a-z]?)\b/i) || t.match(/\b(\d{1,5}[a-z]?)\b/i);
-  if (mnum) out.numero = out.numero || mnum[1];
-
-  // colonia (heurística por palabras comunes)
-  const col = t.match(/\bcol(onia)?\s+([a-z0-9\s\-]+?)(?=\,|\bcp\b|\b\d{5}\b|$)/i);
-  if (col) out.colonia = clean(col[2]);
-
-  // calle: toma primeras 3–4 palabras antes de "no" o antes del número
-  const calle = t.match(/\b(calle|av|avenida|blvd|boulevard)\s+([a-z0-9\s\.\-]+?)(?=\,|\bno\b|\b\d{1,5}\b|$)/i);
-  if (calle) out.calle = clean(calle[2]);
-
-  return out;
-}
-
-function parseCustomerText(text='') {
-  const out = {};
-  const mEmail = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
-  if (mEmail) out.email = mEmail[0].toLowerCase();
-  const mCp = text.match(/\b(\d{5})\b/);
-  if (mCp) out.cp = mCp[1];
-  // nombre: si viene como "soy X" o "a nombre de X"
-  const mName = text.match(/\b(soy|a nombre de)\s+([a-záéíóúñ\s\.]+)$/i);
-  if (mName) out.nombre = toTitleCase(clean(mName[2]));
-  return out;
-}
-
-/* ============================ Utilidad de prompts ============================ */
-
-function promptedRecently(session, key, ms=120000) {
+function promptedRecently(session, key, ms){
   session.data = session.data || {};
-  session.data.prompts = session.data.prompts || {};
-  const last = session.data.prompts[key] ? new Date(session.data.prompts[key]).getTime() : 0;
   const now = Date.now();
-  const ok = now - last < ms;
-  if (!ok) session.data.prompts[key] = new Date().toISOString();
-  return ok;
+  const lastKey = `last_prompt_${key}`;
+  const last = Number(session.data[lastKey] || 0);
+  if (now - last < ms) return true;
+  session.data[lastKey] = now;
+  return false;
 }
 
-/* ================================= Cron ==================================== */
-
-async function cronReminders(env) {
-  // espacio para recordatorios simples (p.ej., carritos abiertos o OS pendientes)
-  try {
-    // ejemplo no intrusivo: nada por ahora
-    return { ok: true };
-  } catch (e) {
-    console.warn('cronReminders', e);
-    return { ok: false, error: String(e) };
-  }
+async function cronReminders(env){
+  // Placeholder sencillo (puedes ampliarlo con recordatorios de OS/pedidos)
+  return { ok: true };
 }
