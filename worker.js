@@ -211,7 +211,6 @@ if (req.method === 'POST' && url.pathname === '/') {
 }     
     // --- Rutas no coincidentes → 404 controlado (fuera del try/catch) ---
     return new Response('Not found', { status: 404 });
-  }, // <-- cierra fetch
 };
   
 /* ============================ Regex / Intents ============================ */
@@ -1596,6 +1595,7 @@ async function cronReminders(env){
   // Espacio para recordatorios o tareas programadas
   return { ok:true, ts: Date.now() };
 }
+
 
 
 
