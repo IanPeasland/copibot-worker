@@ -1,6 +1,6 @@
 /**
  * CopiBot – Conversacional con IA + Ventas + Soporte Técnico + GCal + Supabase + KV
- * Build: “Borbón-R7” (completo)
+ * Build: “Borbón-R7” (completo) - VERSIÓN CORREGIDA
  */
 
 export default {
@@ -44,6 +44,19 @@ export default {
     if (req.method === 'POST' && url.pathname === '/') {
       try {
         const payload = await safeJson(req);
+        
+        // DEBUG TEMPORAL: Eco inmediato
+        const ctxDebug = extractWhatsAppContext(payload);
+        if (ctxDebug?.fromE164) {
+          console.log('📱 WA IN:', { 
+            from: ctxDebug.fromE164, 
+            msgType: ctxDebug.msgType, 
+            text: ctxDebug.textRaw?.substring(0, 50) 
+          });
+          // Eco temporal para pruebas - COMENTAR LUEGO
+          await sendWhatsAppText(env, ctxDebug.fromE164, `✅ Recibí: "${ctxDebug.textRaw || '(sin texto)'}"`);
+        }
+        
         const ctx = extractWhatsAppContext(payload);
         if (!ctx) return ok('EVENT_RECEIVED');
 
@@ -128,7 +141,7 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // ===== Menú “continuar o nuevo” =====
+        // ===== Menú "continuar o nuevo" =====
         if (session.stage === 'await_choice') {
           if (supportIntent) {
             session.stage = 'sv_collect';
@@ -218,6 +231,75 @@ export default {
     }
   }
 }; // export default
+
+// ===== FUNCIONES CRÍTICAS FALTANTES - AGREGADAS =====
+
+function extractWhatsAppContext(payload) {
+  try {
+    const entry = payload?.entry?.[0];
+    const changes = entry?.changes?.[0];
+    const value = changes?.value;
+    const message = value?.messages?.[0];
+    
+    if (!message) return null;
+
+    const from = message.from;
+    const fromE164 = `+${from}`;
+    const mid = message.id;
+    const profileName = value?.contacts?.[0]?.profile?.name || '';
+    
+    let textRaw = '';
+    let msgType = 'unknown';
+    
+    if (message.text) {
+      textRaw = message.text.body || '';
+      msgType = 'text';
+    } else if (message.interactive) {
+      if (message.interactive.type === 'button_reply') {
+        textRaw = message.interactive.button_reply?.title || '';
+        msgType = 'interactive_button';
+      } else if (message.interactive.type === 'list_reply') {
+        textRaw = message.interactive.list_reply?.title || '';
+        msgType = 'interactive_list';
+      }
+    }
+
+    return {
+      from,
+      fromE164,
+      mid,
+      profileName,
+      textRaw,
+      msgType
+    };
+  } catch (e) {
+    console.warn('extractWhatsAppContext error', e);
+    return null;
+  }
+}
+
+async function maybeFAQ(env, ntext) {
+  const faqs = {
+    'horario': 'Horario de atención: Lunes a Viernes 9:00-18:00, Sábados 9:00-14:00',
+    'ubicacion': 'Estamos en Av. Tecnológico #123, Industrial, Monterrey, NL',
+    'contacto': 'Tel: 81 1234 5678 | Email: ventas@cpdigital.com.mx',
+    'empresa': 'CP Digital - Especialistas en equipos de impresión Xerox y Fujifilm'
+  };
+  
+  const patterns = {
+    'horario': /\b(horario|hora|atencion|abierto|cierra|abre)\b/i,
+    'ubicacion': /\b(donde|ubicacion|direccion|sucursal|local|tienda)\b/i,
+    'contacto': /\b(contacto|telefono|tel|email|correo|whatsapp)\b/i,
+    'empresa': /\b(empresa|quienes|somos|compania|negocio)\b/i
+  };
+  
+  for (const [key, pattern] of Object.entries(patterns)) {
+    if (pattern.test(ntext)) {
+      return faqs[key];
+    }
+  }
+  return null;
+}
 
 /* ============================ Regex / Intents ============================ */
 const RX_GREET = /^(hola+|buen[oa]s|qué onda|que tal|saludos|hey|buen dia|buenas|holi+)\b/i;
@@ -1111,12 +1193,12 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       await saveSession(env, session, now);
       const Q = {
         modelo: '¿Qué *marca y modelo* es tu impresora? (p.ej., *Xerox DocuColor 550* o *Xerox Versant 180*)',
-        falla: '¿Me describes brevemente la *falla*? (p.ej., “*atasco en fusor*”, “*no imprime*”)',
+        falla: '¿Me describes brevemente la *falla*? (p.ej., "*atasco en fusor*", "*no imprime*")',
         calle: '¿En qué *calle* está el equipo?',
         numero: '¿Qué *número* es?',
         colonia: '¿*Colonia*?',
         cp: '¿*Código Postal* (5 dígitos)?',
-        horario: '¿Qué día y hora te viene bien entre *10:00 y 15:00*? (ej: “*mañana 12:30*”)',
+        horario: '¿Qué día y hora te viene bien entre *10:00 y 15:00*? (ej: "*mañana 12:30*")',
         nombre: '¿A nombre de quién registramos la visita?',
         email: '¿Cuál es tu *email* para enviarte confirmaciones?'
       };
@@ -1452,4 +1534,3 @@ function json(obj){ return new Response(JSON.stringify(obj), { status:200, heade
 async function cronReminders(env){
   return { ok:true, ts: Date.now() };
 }
-
