@@ -9,6 +9,10 @@
  *  - Limpieza de duplicados y orden único de funciones para evitar errores de build.
  */
 
+/* ========================================================================== */
+/* =============================== Export =================================== */
+/* ========================================================================== */
+
 export default {
   async fetch(req, env) {
     try {
@@ -46,7 +50,7 @@ export default {
 
         // ===== Session =====
         const now = new Date();
-        let session = await loadSessionMulti(env, from, fromE164); // 👈 dual-key
+        let session = await loadSessionMulti(env, from, fromE164); // dual-key
         session.data = session.data || {};
         session.stage = session.stage || 'idle';
         session.from = from;
@@ -69,6 +73,18 @@ export default {
         }
 
         /* ============================================================
+         *  SALUDO TEMPRANO (failsafe)
+         *  Se ejecuta ANTES de cualquier otra lógica para garantizar respuesta.
+         * ============================================================ */
+        if (RX_GREET.test(lowered)) {
+          const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
+          await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
+          session.data.last_greet_at = now.toISOString();
+          await saveSessionMulti(env, session, from, fromE164);
+          return ok('EVENT_RECEIVED');
+        }
+
+        /* ============================================================
          *  BARRERA 0: si veníamos en Soporte, Soporte tiene prioridad
          * ============================================================ */
         if (session.stage?.startsWith('sv_') || session?.data?.intent_lock === 'support') {
@@ -77,8 +93,7 @@ export default {
         }
 
         /* ============================================================
-         *  REGLA DURA: si el texto parece Marca+Modelo (sin “tóner”)
-         *  => Forzamos soporte (aunque no haya dicho falla).
+         *  REGLA DURA: Marca+Modelo (sin palabras de compra) => soporte
          * ============================================================ */
         const SALES_WORDS = /\b(toner|t[óo]ner|cartucho|developer|refacci[oó]n|precio)\b/i;
         const pmGuard = parseBrandModel(ntext);
@@ -94,15 +109,6 @@ export default {
           await saveSessionMulti(env, session, from, fromE164);
           const handled = await handleSupport(env, session, fromE164, originalText, lowered, ntext, now, { intent: 'support' });
           return handled;
-        }
-
-        /* =================== Saludo =================== */
-        if (RX_GREET.test(lowered)) {
-          const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
-          await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
-          session.data.last_greet_at = now.toISOString();
-          await saveSessionMulti(env, session, from, fromE164);
-          return ok('EVENT_RECEIVED');
         }
 
         /* ====== Comandos universales de soporte ====== */
@@ -131,7 +137,7 @@ export default {
         /* =================== Intenciones =================== */
         const supportIntent = isSupportIntent(ntext) || (await intentIs(env, originalText, 'support'));
         if (supportIntent) {
-          session.data.intent_lock = 'support'; // 🔒 fijamos candado
+          session.data.intent_lock = 'support';
           await saveSessionMulti(env, session, from, fromE164);
           const handled = await handleSupport(env, session, fromE164, originalText, lowered, ntext, now, { intent: 'support' });
           return handled;
@@ -145,7 +151,7 @@ export default {
           return handled;
         }
 
-        // ===== Stages de ventas (si quedaron activos) =====
+        // ===== Stages de ventas activos =====
         if (session.stage === 'ask_qty') return await handleAskQty(env, session, fromE164, originalText, lowered, ntext, now);
         if (session.stage === 'cart_open') return await handleCartOpen(env, session, fromE164, originalText, lowered, ntext, now);
         if (session.stage === 'await_invoice') return await handleAwaitInvoice(env, session, fromE164, lowered, now, originalText);
@@ -169,6 +175,19 @@ export default {
       return new Response('Not found', { status: 404 });
     } catch (e) {
       console.error('Worker error', e);
+      // Failsafe: intentar responder algo al usuario si podemos.
+      try {
+        const reqClone = await req.clone().text().catch(()=>null);
+        // Intentamos tomar el phone rápido del body por si es el webhook de WhatsApp
+        let to = null;
+        try {
+          const j = reqClone ? JSON.parse(reqClone) : null;
+          const v = j?.entry?.[0]?.changes?.[0]?.value;
+          const m = v?.messages?.[0];
+          if (m?.from) to = `+${m.from}`;
+        } catch {}
+        if (to) await sendWhatsAppText(env, to, 'Tuvimos un problema momentáneo al procesar tu mensaje. ¿Puedes repetirlo, por favor? 🙏');
+      } catch {}
       return ok('EVENT_RECEIVED');
     }
   },
@@ -177,6 +196,7 @@ export default {
     try { await cronReminders(env); } catch (e) { console.error('cron error', e); }
   }
 };
+
 
 /* ========================================================================== */
 /* ============================ Constantes/Regex ============================ */
@@ -1394,6 +1414,7 @@ async function cronReminders(env){
   // - Recordar pedidos con estado “nuevo” > 48h.
   return { ok: true, ts: new Date().toISOString() };
 }
+
 
 
 
