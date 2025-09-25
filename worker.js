@@ -706,8 +706,6 @@ async function startSalesFromQuery(env, session, toE164, text, ntext, now){
   }
 }
 
-}
-
 /* ========================================================================== */
 /* =============== Inventario: normalización, hints y matching ============== */
 /* ========================================================================== */
@@ -1603,4 +1601,5 @@ async function cronReminders(env){
   // - Recordar pedidos con estado “nuevo” > 48h.
   return { ok: true, ts: new Date().toISOString() };
 }
+
 
