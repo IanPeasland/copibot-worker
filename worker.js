@@ -342,7 +342,7 @@ function fmtTime(d, tz){
 }
 function formatMoneyMXN(n){
   const v=Number(n||0);
-  try{ return new Intl.NumberFormat('es-MX',{style:'currency',currency:'MXN',maximumFractionDigits:2}.format(v) }
+  try{ return new Intl.NumberFormat('es-MX',{style:'currency',currency:'MXN',maximumFractionDigits:2}.format(v) )
   catch{ return `$${v.toFixed(2)}`; }
 }
 function numberOrZero(n){ const v=Number(n||0); return Number.isFinite(v)?v:0; }
@@ -1559,5 +1559,6 @@ function json(obj){ return new Response(JSON.stringify(obj), { status:200, heade
 async function cronReminders(env){
   return { ok:true, ts: Date.now() };
 }
+
 
 
