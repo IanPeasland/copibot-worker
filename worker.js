@@ -1594,16 +1594,3 @@ async function cronReminders(env){
   // Espacio para recordatorios o tareas programadas
   return { ok:true, ts: Date.now() };
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
