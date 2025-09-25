@@ -386,94 +386,6 @@ async function saveSessionMulti(env, sess, from, fromE164, fromDigits){
   }catch(e){ console.warn('saveSessionMulti', e); }
 }
 
-
-/* ========================================================================== */
-/* ============================ Constantes/Regex ============================ */
-/* ========================================================================== */
-
-const RX_GREET = /^(hola+|buen[oa]s|qué onda|que tal|saludos|hey|buen dia|buenas|holi+)\b/i;
-const RX_INV_Q = /(toner|t[óo]ner|cartucho|developer|refacci[oó]n|precio|docucolor|versant|versalink|altalink|primelink|apeos|c\d{2,4}|b\d{2,4}|magenta|amarillo|cyan|cian|negro|yellow|black|bk|k)\b/i;
-
-function isSupportIntent(ntext='') {
-  const t = `${ntext}`;
-  const hasProblem = /(falla(?:ndo)?|fallo|problema|descompuest[oa]|no imprime|no escanea|no copia|no prende|no enciende|se apaga|error|atasc|ator(?:a|o|e|ando|ada|ado)|atasco|se traba|mancha|l[ií]nea|linea|calidad|ruido|prioridad|mantenimiento)/.test(t);
-  const hasDevice  = /(impresora|equipo|copiadora|xerox|fujifilm|fuji\s?film|versant|versalink|altalink|docucolor|primelink|apeos|c\d{2,4}|b\d{2,4})/.test(t);
-  const phrase     = /(mi|la|nuestra)\s+(impresora|equipo|copiadora)\s+(esta|est[ae]|anda|se)\s+(falla(?:ndo)?|ator(?:ando|ada|ado)|atasc(?:ada|ado)|descompuest[oa])/.test(t);
-  return phrase || (hasProblem && hasDevice) || /\b(soporte|servicio|visita|t[eé]cnico)\b/.test(t);
-}
-
-/* ========================================================================== */
-/* =============================== Helpers base ============================= */
-/* ========================================================================== */
-
-const firstWord = (s='') => (s||'').trim().split(/\s+/)[0] || '';
-const toTitleCase = (s='') => s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : '';
-function normalizeBase(s=''){ return s.normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/\s+/g,' ').trim().toLowerCase(); }
-function clean(s=''){ return String(s||'').replace(/\s+/g,' ').trim(); }
-function truthy(v){ return v!==null && v!==undefined && String(v).trim()!==''; }
-function ok(s='ok'){ return new Response(s, { status: 200 }); }
-async function safeJson(req){ try{ return await req.json(); }catch{ return {}; } }
-function dlog(env, ...args){ if ((env.DEBUG||'').toString().toLowerCase()==='true') console.log(...args); }
-
-function fmtDate(d, tz){
-  try{ return new Intl.DateTimeFormat('es-MX',{dateStyle:'full',timeZone:tz}).format(new Date(d)); }
-  catch{ return new Date(d).toLocaleDateString('es-MX'); }
-}
-function fmtTime(d, tz){
-  try{ return new Intl.DateTimeFormat('es-MX',{timeStyle:'short',timeZone:tz}).format(new Date(d)); }
-  catch{ const x=new Date(d); return `${x.getHours()}:${String(x.getMinutes()).padStart(2,'0')}`; }
-}
-function formatMoneyMXN(n){ const v=Number(n||0); try{ return new Intl.NumberFormat('es-MX',{style:'currency',currency:'MXN',maximumFractionDigits:2}).format(v); }catch{ return `$${v.toFixed(2)}`; } }
-function numberOrZero(n){ const v=Number(n||0); return Number.isFinite(v)?v:0; }
-function priceWithIVA(n){ const v=Number(n||0); return `${formatMoneyMXN(v)} + IVA`; }
-
-/* ========================================================================== */
-/* ================================= IA ===================================== */
-/* ========================================================================== */
-
-async function aiCall(env, messages, {json=false}={}) {
-  const OPENAI_KEY = env.OPENAI_API_KEY || env.OPENAI_KEY;
-  const MODEL = env.LLM_MODEL || env.OPENAI_NLU_MODEL || env.OPENAI_FALLBACK_MODEL || 'gpt-4o-mini';
-  if (!OPENAI_KEY) return null;
-  const body = { model: MODEL, messages, temperature: json ? 0 : 0.3, ...(json ? { response_format: { type: "json_object" } } : {}) };
-  const r = await fetch('https://api.openai.com/v1/chat/completions', {
-    method:'POST',
-    headers:{ 'Authorization':`Bearer ${OPENAI_KEY}`, 'Content-Type':'application/json' },
-    body: JSON.stringify(body)
-  });
-  if (!r.ok) { console.warn('aiCall', r.status, await r.text()); return null; }
-  const j = await r.json();
-  return j?.choices?.[0]?.message?.content || '';
-}
-
-async function aiSmallTalk(env, session, mode='general', userText=''){
-  const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
-  const sys = `Eres CopiBot de CP Digital (es-MX). Estilo breve, humano y claro. Máximo 1 emoji. No inventes precios ni horarios.`;
-  const prompt = mode==='fallback'
-    ? `El usuario dijo: """${userText}""". Responde breve y ofrece inventario o soporte si aplica.`
-    : `El usuario dijo: """${userText}""". Responde breve.`;
-  const out = await aiCall(env, [{role:'system', content: sys}, {role:'user', content: prompt}], {});
-  return out || (`Hola${nombre?`, ${nombre}`:''} 👋 ¿En qué te ayudo?`);
-}
-
-async function intentIs(env, text, expected){
-  try{
-    const sys = `Devuelve JSON {"intent":"support|sales|faq|smalltalk"} en es-MX, una sola palabra, sin explicaciones.`;
-    const out = await aiCall(env, [{role:'system', content: sys},{role:'user', content: text}], {json:true});
-    const j = JSON.parse(out||'{}'); return j?.intent === expected;
-  }catch{return false;}
-}
-
-/** IA opcional para reforzar NER de inventario */
-async function aiExtractTonerQuery(env, text){
-  if (!env.OPENAI_API_KEY && !env.OPENAI_KEY) return null;
-  const sys = `Extrae de una consulta (es-MX) sobre tóners los campos en JSON:
-{"familia":"versant|docucolor|primelink|versalink|altalink|apeos|c70|null","color":"yellow|magenta|cyan|black|null","subfamilia":"string|null","cantidad":"number|null"}.
-No inventes si no está explícito.`;
-  const out = await aiCall(env, [{role:'system', content: sys},{role:'user', content: text}], {json:true});
-  try { return JSON.parse(out||'{}'); } catch { return null; }
-}
-
 /* ========================================================================== */
 /* =============== Normalización / Aliases / Hints de modelo ================ */
 /* ========================================================================== */
@@ -1901,5 +1813,6 @@ async function cronReminders(env){
     return { ok:false, error: String(e) };
   }
 }
+
 
 
