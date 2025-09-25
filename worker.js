@@ -542,7 +542,7 @@ async function findBestProduct(env, queryText, opts = {}) {
 }
 
 /* ========================================================================== */
-/* ============================ Carrito y ventas ============================ */
+/* ============================== Ventas ==================================== */
 /* ========================================================================== */
 
 const RX_WANT_QTY = /\b(quiero|ocupo|me llevo|pon|agrega|añade|mete|dame|manda|env[ií]ame|p[oó]n)\s+(\d+)\b/i;
@@ -573,57 +573,35 @@ function addWithStockSplit(session, product, qty){
   if (rest > 0) pushCart(session, product, rest, true);
 }
 
-/** Enriquecer consulta desde IA NER */
-function enrichQueryFromAI(q, ai){
-  if (!ai) return q;
-  let out = q;
-  if (ai.familia && !new RegExp(`\\b${ai.familia}\\b`).test(out)) out += ` ${ai.familia}`;
-  if (ai.color && !new RegExp(`\\b(${ai.color}|amarillo|magenta|cyan|cian|negro|black|bk|k|yellow)\\b`).test(out)) {
-    const map = {yellow:'amarillo', magenta:'magenta', cyan:'cyan', black:'negro'};
-    out += ` ${map[ai.color] || ai.color}`;
-  }
-  if (ai.subfamilia && !out.includes(ai.subfamilia)) out += ` ${ai.subfamilia}`;
-  if (ai.cantidad && !/\b\d+\b/.test(out)) out += ` ${ai.cantidad}`;
-  return out;
-}
-
-
-/* ========================================================================== */
-/* ======================= Ventas: flujo completo (handlers) ================= */
-/* ========================================================================== */
-
-/* Captura UNO A UNO (ventas) */
-const FLOW_FACT = ['nombre','rfc','email','calle','numero','colonia','cp'];
-const FLOW_SHIP = ['nombre','email','calle','numero','colonia','cp'];
-const LABEL = { nombre:'Nombre / Razón Social', rfc:'RFC', email:'Email', calle:'Calle', numero:'Número', colonia:'Colonia', cp:'Código Postal' };
-
-function firstMissing(list, c={}){ for (const k of list){ if (!truthy(c[k])) return k; } return null; }
-
-function parseCustomerFragment(field, text){
-  const t = text || '';
-  if (field==='nombre') return clean(t);
-  if (field==='rfc'){ const m = t.match(/\b([A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3})\b/i); return m ? m[1].toUpperCase() : clean(t).toUpperCase(); }
-  if (field==='email'){ const m = t.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i); return m ? m[0].toLowerCase() : clean(t).toLowerCase(); }
-  if (field==='numero'){ const m = t.match(/\b(\d+[A-Z]?)\b/i); return m ? m[1] : clean(t); }
-  if (field==='cp'){ const m = t.match(/\b(\d{5})\b/); return m ? m[1] : clean(t); }
-  return clean(t);
+/** 
+ * Render de producto orientado a conversión:
+ * - Si stock=0, NO mostramos “0 pzas”, sólo “Entrega: sobre pedido”.
+ * - Siempre mantenemos el copy de producto y el precio.
+ */
+function renderProducto(p) {
+  const precio = priceWithIVA(p.precio);
+  const sku = p.sku ? `\nSKU: ${p.sku}` : '';
+  const marca = p.marca ? `\nMarca: ${p.marca}` : '';
+  const s = numberOrZero(p.stock);
+  const stockLine = s > 0 ? `${s} pzas en stock` : `Entrega: *sobre pedido* (confirmamos tiempo)`;
+  return `1. ${p.nombre}${marca}${sku}\n${precio}\n${stockLine}\n\nEste suele ser el indicado para tu equipo.`;
 }
 
 async function handleAskQty(env, session, toE164, text, lowered, ntext, now){
   const cand = session.data?.last_candidate;
   if (!cand) {
     session.stage = 'cart_open';
-    await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
+    await saveSessionMulti(env, session, session.from, toE164);
     await sendWhatsAppText(env, toE164, 'No alcancé a ver el artículo. ¿Lo repetimos o buscas otro? 🙂');
     return ok('EVENT_RECEIVED');
   }
   const qty = parseQty(lowered, 1);
   addWithStockSplit(session, cand, qty);
   session.stage = 'cart_open';
-  await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
+  await saveSessionMulti(env, session, session.from, toE164);
   const s = numberOrZero(cand.stock);
   const bo = Math.max(0, qty - Math.min(s, qty));
-  const nota = bo>0 ? `\n(De ${qty}, ${Math.min(s,qty)} en stock y ${bo} sobre pedido)` : '';
+  const nota = bo>0 ? `\n(De ${qty}, ${Math.min(s,qty)} en stock y ${bo} *sobre pedido*)` : '';
   await sendWhatsAppText(env, toE164, `Añadí 🛒\n• ${cand.nombre} x ${qty} ${priceWithIVA(cand.precio)}${nota}\n\n¿Deseas agregar algo más o *finalizamos*?`);
   return ok('EVENT_RECEIVED');
 }
@@ -640,7 +618,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
       addWithStockSplit(session, session.data.last_candidate, 1);
     }
     session.stage = 'await_invoice';
-    await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
+    await saveSessionMulti(env, session, session.from, toE164);
     await sendWhatsAppText(env, toE164, `Perfecto 🙌 ¿La cotizamos *con factura* o *sin factura*?`);
     return ok('EVENT_RECEIVED');
   }
@@ -650,7 +628,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     const c = session.data?.last_candidate;
     if (c) {
       session.stage = 'ask_qty';
-      await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
+      await saveSessionMulti(env, session, session.from, toE164);
       const s = numberOrZero(c.stock);
       await sendWhatsAppText(env, toE164, `De acuerdo. ¿Cuántas *piezas* necesitas? (hay ${s} en stock; el resto iría *sobre pedido*)`);
       return ok('EVENT_RECEIVED');
@@ -659,7 +637,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
 
   if (RX_WANT_QTY.test(lowered)) {
     session.stage = 'ask_qty';
-    await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
+    await saveSessionMulti(env, session, session.from, toE164);
     const c = session.data?.last_candidate;
     const s = numberOrZero(c?.stock);
     await sendWhatsAppText(env, toE164, `Perfecto. ¿Cuántas *piezas* en total? (hay ${s} en stock; el resto iría *sobre pedido*)`);
@@ -677,7 +655,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     if (best) {
       session.data.last_candidate = best;
       session.stage = 'ask_qty';
-      await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
+      await saveSessionMulti(env, session, session.from, toE164);
       const s = numberOrZero(best.stock);
       await sendWhatsAppText(env, toE164, `${renderProducto(best)}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; hay ${s} en stock y el resto sería *sobre pedido*.`);
       return ok('EVENT_RECEIVED');
@@ -687,118 +665,163 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
       if (hints.family && ((env.STRICT_FAMILY_MATCH||'').toString().toLowerCase() !== 'true')) {
         session.stage = 'await_compatibles';
         session.data.pending_query = enrichedQ;
-        await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
-        await sendWhatsAppText(env, toE164, `Ese modelo está *sobre pedido* o sin disponibilidad. ¿Quieres que te muestre opciones *compatibles* en otra línea?`);
+        await saveSessionMulti(env, session, session.from, toE164);
+        await sendWhatsAppText(env, toE164, `Ese modelo está *sobre pedido* o sin disponibilidad directa. ¿Te muestro opciones *compatibles* en otra línea?`);
         return ok('EVENT_RECEIVED');
       }
       await sendWhatsAppText(env, toE164, `No encontré una coincidencia directa 😕. ¿Busco otra opción o lo revisa un asesor?`);
       await notifySupport(env, `Inventario sin match. ${toE164}: ${text}`);
-      await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
+      await saveSessionMulti(env, session, session.from, toE164);
       return ok('EVENT_RECEIVED');
     }
   }
 
   await sendWhatsAppText(env, toE164, `Te leo 🙂. Puedo agregar el artículo visto, buscar otro o *finalizar* si ya está completo.`);
-  await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
+  await saveSessionMulti(env, session, session.from, toE164);
   return ok('EVENT_RECEIVED');
 }
 
-/** Paso de facturación / envío */
-async function handleAwaitInvoice(env, session, toE164, lowered, now, originalText='') {
-  if (/\b(no|gracias|todo bien)\b/i.test(lowered)) {
-    session.stage = 'idle';
-    await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
-    await sendWhatsAppText(env, toE164, `Perfecto, quedo al pendiente. Si necesitas algo más, aquí estoy 🙂`);
-    return ok('EVENT_RECEIVED');
+function enrichQueryFromAI(q, ai){
+  if (!ai) return q;
+  let out = q;
+  if (ai.familia && !new RegExp(`\\b${ai.familia}\\b`).test(out)) out += ` ${ai.familia}`;
+  if (ai.color && !new RegExp(`\\b(${ai.color}|amarillo|magenta|cyan|cian|negro|black|bk|k|yellow)\\b`).test(out)) {
+    const map = {yellow:'amarillo', magenta:'magenta', cyan:'cyan', black:'negro'};
+    out += ` ${map[ai.color] || ai.color}`;
   }
-
-  const saysNo = /\b(sin(\s+factura)?|sin|no)\b/i.test(lowered);
-  const saysYes = !saysNo && /\b(s[ií]|sí|si|con(\s+factura)?|con|factura)\b/i.test(lowered);
-
-  session.data = session.data || {};
-  session.data.customer = session.data.customer || {};
-
-  if (!saysYes && !saysNo && /hola|cómo estás|como estas|gracias/i.test(lowered)) {
-    const friendly = await aiSmallTalk(env, session, 'general', originalText);
-    await sendWhatsAppText(env, toE164, friendly);
-    if (!promptedRecently(session, 'invoice', 3*60*1000)) {
-      await sendWhatsAppText(env, toE164, `Por cierto, ¿la quieres *con factura* o *sin factura*?`);
-    }
-    await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
-    return ok('EVENT_RECEIVED');
-  }
-
-  if (saysYes || saysNo) {
-    session.data.requires_invoice = !!saysYes;
-    await preloadCustomerIfAny(env, session);
-    const list = session.data.requires_invoice ? FLOW_FACT : FLOW_SHIP;
-    const need = firstMissing(list, session.data.customer);
-    if (need) {
-      session.stage = `collect_${need}`;
-      await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
-      await sendWhatsAppText(env, toE164, `¿${LABEL[need]}?`);
-      return ok('EVENT_RECEIVED');
-    }
-    const res = await createOrderFromSession(env, session, toE164);
-    if (res?.ok) {
-      await sendWhatsAppText(env, toE164, `¡Listo! Generé tu solicitud 🙌\n*Total estimado:* ${formatMoneyMXN(res.total)} + IVA\nUn asesor te confirmará entrega y forma de pago.`);
-      await notifySupport(env, `Nuevo pedido #${res.pedido_id ?? '—'}\nCliente: ${session.data.customer?.nombre || 'N/D'} (${toE164})\nFactura: ${session.data.requires_invoice ? 'Sí' : 'No'}`);
-    } else {
-      await sendWhatsAppText(env, toE164, `Creé tu solicitud y la pasé a un asesor para confirmar detalles. 🙌`);
-      await notifySupport(env, `Pedido (parcial) ${toE164}. Revisar en Supabase.\nError: ${res?.error || 'N/A'}`);
-    }
-    session.stage = 'idle';
-    session.data.cart = [];
-    await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
-    await sendWhatsAppText(env, toE164, `¿Te ayudo con algo más en este momento? (Sí / No)`);
-    return ok('EVENT_RECEIVED');
-  }
-
-  if (!promptedRecently(session, 'invoice', 2*60*1000)) {
-    await sendWhatsAppText(env, toE164, `¿La quieres con factura o sin factura?`);
-  }
-  await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
-  return ok('EVENT_RECEIVED');
+  if (ai.subfamilia && !out.includes(ai.subfamilia)) out += ` ${ai.subfamilia}`;
+  if (ai.cantidad && !/\b\d+\b/.test(out)) out += ` ${ai.cantidad}`;
+  return out;
 }
 
-async function handleCollectSequential(env, session, toE164, text, now){
-  session.data = session.data || {};
-  session.data.customer = session.data.customer || {};
-  const c = session.data.customer;
-  const list = session.data.requires_invoice ? FLOW_FACT : FLOW_SHIP;
-  const field = session.stage.replace('collect_','');
-  c[field] = parseCustomerFragment(field, text);
-  if (field==='cp' && !c.ciudad) {
-    const info = await cityFromCP(env, c.cp);
-    if (info) {
-      c.ciudad = info.ciudad || info.municipio || c.ciudad;
-      c.estado = info.estado || c.estado;
-    }
-  }
-  await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
-  const nextField = firstMissing(list, c);
-  if (nextField){
-    session.stage = `collect_${nextField}`;
-    await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
-    await sendWhatsAppText(env, toE164, `¿${LABEL[nextField]}?`);
-    return ok('EVENT_RECEIVED');
-  }
-  const res = await createOrderFromSession(env, session, toE164);
-  if (res?.ok) {
-    await sendWhatsAppText(env, toE164, `¡Listo! Generé tu solicitud 🙌\n*Total estimado:* ${formatMoneyMXN(res.total)} + IVA\nUn asesor te confirmará entrega y forma de pago.`);
-    await notifySupport(env, `Nuevo pedido #${c.nombre ? c.nombre : ''} (${toE164})`);
-  } else {
-    await sendWhatsAppText(env, toE164, `Creé tu solicitud y la pasé a un asesor humano para confirmar detalles. 🙌`);
-    await notifySupport(env, `Pedido (parcial) ${toE164}. Error: ${res?.error || 'N/A'}`);
-  }
-  session.stage = 'idle';
-  session.data.cart = [];
-  await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
-  await sendWhatsAppText(env, toE164, `¿Puedo ayudarte con algo más? (Sí / No)`);
-  return ok('EVENT_RECEIVED');
+/* =============== Inventario & Pedido (búsqueda) =============== */
+
+function extractModelHints(text='') {
+  const t = normalizeWithAliases(text);
+  const out = {};
+  // —— Familia
+  if (/\bversant\b/.test(t) || /\b(80|180|2100|280|4100)\b/.test(t)) out.family = 'versant';
+  else if (/\bversa[-\s]?link\b/.test(t)) out.family = 'versalink';
+  else if (/\balta[-\s]?link\b/.test(t)) out.family = 'altalink';
+  else if (/\bdocu(color)?\b/.test(t) || /\b(550|560|570)\b/.test(t)) out.family = 'docucolor';
+  else if (/\bprime\s*link\b/.test(t) || /\bprimelink\b/.test(t)) out.family = 'primelink';
+  else if (/\bapeos\b/.test(t)) out.family = 'apeos';
+  else if (/\bc(60|70|75)\b/.test(t)) out.family = 'c70';
+
+  // —— Color
+  if (/\b(amarillo|yellow)\b/.test(t)) out.color = 'yellow';
+  else if (/\bmagenta\b/.test(t)) out.color = 'magenta';
+  else if (/\b(cyan|cian)\b/.test(t)) out.color = 'cyan';
+  else if (/\b(negro|black|bk|k)\b/.test(t)) out.color = 'black';
+
+  return out;
 }
 
-/** Entrada a ventas desde consulta libre */
+function productHasColor(p, colorCode){
+  if (!colorCode) return true;
+  const s = `${normalizeBase([p?.nombre, p?.sku, p?.marca].join(' '))}`;
+  const map = {
+    yellow:[/\bamarillo\b/i, /\byellow\b/i, /(^|[\s\-_\/])y($|[\s\-_\/])/i, /(^|[\s\-_\/])ylw($|[\s\-_\/])/i],
+    magenta:[/\bmagenta\b/i, /(^|[\s\-_\/])m($|[\s\-_\/])/i],
+    cyan:[/\bcyan\b/i, /\bcian\b/i, /(^|[\s\-_\/])c($|[\s\-_\/])/i],
+    black:[/\bnegro\b/i, /\bblack\b/i, /(^|[\s\-_\/])k($|[\s\-_\/])/i, /(^|[\s\-_\/])bk($|[\s\-_\/])/i],
+  };
+  const arr = map[colorCode] || [];
+  return arr.some(rx => rx.test(p?.nombre) || rx.test(p?.sku) || rx.test(s));
+}
+
+function productMatchesFamily(p, family){
+  if (!family) return true;
+  const s = normalizeBase([p?.nombre, p?.sku, p?.marca, p?.compatible].join(' '));
+
+  if (family==='versant'){
+    const hit = /\bversant\b/i.test(s) || /\b(80|180|2100|280|4100)\b/i.test(s);
+    const bad = /(c60|c70|c75|docucolor|prime\s*link|primelink|altalink|versa\s*link|\b550\b|\b560\b|\b570\b)/i.test(s);
+    return hit && !bad;
+  }
+  if (family==='docucolor'){
+    const hit = /\b(docucolor|550\/560\/570|550|560|570)\b/i.test(s);
+    const bad = /(versant|primelink|altalink|versalink|c60|c70|c75|2100|180|280|4100)\b/i.test(s);
+    return hit && !bad;
+  }
+  if (family==='c70') return /\bc(60|70|75)\b/i.test(s) || s.includes('c60') || s.includes('c70') || s.includes('c75');
+  if (family==='primelink') return /\bprime\s*link\b/i.test(s) || /\bprimelink\b/i.test(s);
+  if (family==='versalink') return /\bversa\s*link\b/i.test(s) || /\bversalink\b/i.test(s);
+  if (family==='altalink') return /\balta\s*link\b/i.test(s) || /\baltalink\b/i.test(s);
+  if (family==='apeos') return /\bapeos\b/i.test(s);
+  return s.includes(family);
+}
+
+/** 
+ * findBestProduct:
+ * - Siempre permite elegir aunque stock sea 0 (luego se parte en stock/sobre pedido).
+ * - Prioriza stock>0; si todos son 0, igual devuelve el más barato.
+ */
+async function findBestProduct(env, queryText, opts = {}) {
+  const hints = extractModelHints(queryText);
+  const colorCode = hints.color || extractColorWord(queryText);
+
+  const pick = (arr) => {
+    if (!Array.isArray(arr) || !arr.length) return null;
+    let pool = colorCode ? arr.filter(p => productHasColor(p, colorCode)) : arr.slice();
+
+    if (hints.family && !opts.ignoreFamily) {
+      pool = pool.filter(p => productMatchesFamily(p, hints.family));
+      if (!pool.length) return null;
+    }
+
+    // Prioriza con-stock, pero si no hay, regresa el mejor aunque sea sobre pedido
+    pool.sort((a,b) => {
+      const sa = numberOrZero(a.stock) > 0 ? 1 : 0;
+      const sb = numberOrZero(b.stock) > 0 ? 1 : 0;
+      if (sa !== sb) return sb - sa;
+      return numberOrZero(a.precio||0) - numberOrZero(b.precio||0);
+    });
+
+    return pool[0] || null;
+  };
+
+  try {
+    const res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 30 }) || [];
+    const best = pick(res);
+    if (best) return best;
+  } catch {}
+
+  if (hints.family && !opts.ignoreFamily) {
+    try {
+      const like = encodeURIComponent(`%${hints.family}%`);
+      const r = await sbGet(env, 'producto_stock_v', {
+        query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&or=(nombre.ilike.${like},sku.ilike.${like},marca.ilike.${like},compatible.ilike.${like})&order=stock.desc.nullslast,precio.asc&limit=200`
+      }) || [];
+      const best = pick(r);
+      if (best) return best;
+      return null;
+    } catch {}
+  }
+
+  if (!hints.family || opts.ignoreFamily) {
+    try {
+      const like = encodeURIComponent(`%toner%`);
+      const r = await sbGet(env, 'producto_stock_v', {
+        query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&or=(nombre.ilike.${like},sku.ilike.${like})&order=stock.desc.nullslast,precio.asc&limit=200`
+      }) || [];
+      const best = pick(r);
+      if (best) return best;
+    } catch {}
+  }
+
+  return null;
+}
+
+function extractColorWord(text=''){
+  const t = normalizeWithAliases(text);
+  if (/\b(amarillo|yellow)\b/i.test(t)) return 'yellow';
+  if (/\bmagenta\b/i.test(t)) return 'magenta';
+  if (/\b(cyan|cian)\b/i.test(t)) return 'cyan';
+  if (/\b(negro|black|bk|k)\b/i.test(t)) return 'black';
+  return null;
+}
+
 async function startSalesFromQuery(env, session, toE164, text, ntext, now){
   const extracted = await aiExtractTonerQuery(env, ntext).catch(()=>null);
   const enrichedQ = enrichQueryFromAI(ntext, extracted);
@@ -809,8 +832,8 @@ async function startSalesFromQuery(env, session, toE164, text, ntext, now){
   if (!best && hints.family) {
     session.stage = 'await_compatibles';
     session.data.pending_query = enrichedQ;
-    await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
-    await sendWhatsAppText(env, toE164, `Ese modelo está *sobre pedido* o sin disponibilidad. ¿Quieres que te muestre opciones *compatibles* en otra línea?`);
+    await saveSessionMulti(env, session, session.from, toE164);
+    await sendWhatsAppText(env, toE164, `Ese modelo está *sobre pedido* o sin disponibilidad directa. ¿Quieres que te muestre opciones *compatibles* en otra línea?`);
     return ok('EVENT_RECEIVED');
   }
 
@@ -818,7 +841,7 @@ async function startSalesFromQuery(env, session, toE164, text, ntext, now){
     session.stage = 'ask_qty';
     session.data.cart = session.data.cart || [];
     session.data.last_candidate = best;
-    await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
+    await saveSessionMulti(env, session, session.from, toE164);
     const s = numberOrZero(best.stock);
     await sendWhatsAppText(
       env, toE164,
@@ -828,10 +851,11 @@ async function startSalesFromQuery(env, session, toE164, text, ntext, now){
   } else {
     await sendWhatsAppText(env, toE164, `No encontré una coincidencia directa 😕. Te conecto con un asesor…`);
     await notifySupport(env, `Inventario sin match. +${session.from}: ${text}`);
-    await saveSessionMulti(env, session, session.from, toE164, session.fromDigits);
+    await saveSessionMulti(env, session, session.from, toE164);
     return ok('EVENT_RECEIVED');
   }
 }
+
 
 /* ========================================================================== */
 /* ============================ Cliente / Pedido ============================ */
@@ -1813,6 +1837,7 @@ async function cronReminders(env){
     return { ok:false, error: String(e) };
   }
 }
+
 
 
 
