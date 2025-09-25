@@ -191,30 +191,35 @@ if (req.method === 'POST' && url.pathname === '/') {
       return ok('EVENT_RECEIVED');
     }
 
-       // ===== Fallback IA breve =====
-    const reply = await aiSmallTalk(env, session, 'fallback', text);
-    await sendWhatsAppText(env, fromE164, reply);
-    await saveSession(env, session, now);
-    return ok('EVENT_RECEIVED');
+// ===== Fallback IA breve =====
+const reply = await aiSmallTalk(env, session, 'fallback', text);
+await sendWhatsAppText(env, fromE164, reply);
+await saveSession(env, session, now);
+return ok('EVENT_RECEIVED');
 
-  } catch (e) {
-    console.error('Worker error', e);
+// --- Rutas no coincidentes → 404 controlado (dentro del try)
+return new Response('Not found', { status: 404 });
 
-    // Notificación suave al usuario (si podemos identificarlo del body)
-    try {
-      const body = await safeJson(req).catch(() => ({}));
-      const ctx2 = extractWhatsAppContext(body);
-      if (ctx2?.fromE164) {
-        await sendWhatsAppText(
-          env,
-          ctx2.fromE164,
-          'Tu mensaje llegó, tuve un problema momentáneo pero ya estoy encima 🙂'
-        );
-      }
-    } catch {/* no-op */}
+} catch (e) {
+  console.error('Worker error', e);
 
-    return ok('EVENT_RECEIVED');
-  }
+  // Notificación suave al usuario (si podemos identificarlo) y salida 200
+  try {
+    const body = await safeJson(req).catch(() => ({}));
+    const ctx2 = extractWhatsAppContext(body);
+    if (ctx2?.fromE164) {
+      await sendWhatsAppText(
+        env,
+        ctx2.fromE164,
+        'Tu mensaje llegó, tuve un problema momentáneo pero ya estoy encima 🙂'
+      );
+    }
+  } catch {/* no-op */}
+
+  return ok('EVENT_RECEIVED');  // <-- regresamos 200 al webhook
+} // <-- cierra try/catch del método fetch
+}, // <-- cierra método fetch dentro de export default (nota la coma)
+
 
       // --- Rutas no coincidentes → 404 controlado (fuera del try/catch) ---
       return new Response('Not found', { status: 404 });
@@ -1633,6 +1638,7 @@ async function cronReminders(env){
 }
       
 };      
+
 
 
 
