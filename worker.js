@@ -221,12 +221,14 @@ export default {
         return ok('EVENT_RECEIVED');
       }
 
-      return new Response('Not found', { status: 404 });
-    } catch (e) {
-      console.error('Worker error', e);
-      return ok('EVENT_RECEIVED');
-    }
-  },
+    // … (rutas anteriores GET /, POST /, POST /cron)
+    return new Response('Not found', { status: 404 });
+  } catch (e) {
+    console.error('Worker error', e);
+    return ok('EVENT_RECEIVED');
+  }
+}
+
 
   async scheduled(event, env, ctx) {
     try {
@@ -1620,6 +1622,7 @@ async function cronReminders(env){
   // Espacio para recordatorios o tareas programadas
   return { ok:true, ts: Date.now() };
 }
+
 
 
 
