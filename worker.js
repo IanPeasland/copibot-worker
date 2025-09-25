@@ -1572,61 +1572,6 @@ function ok(s='ok'){ return new Response(s, { status: 200 }); }
  *   - POST a /rpc/<fn> con params JSON
  * Requiere: SUPABASE_URL, SUPABASE_ANON_KEY.
  */
-async function sbGet(env, table, { query }){
-  const url = `${env.SUPABASE_URL}/rest/v1/${table}?${query}`;
-  const r = await fetch(url, {
-    headers: {
-      apikey: env.SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${env.SUPABASE_ANON_KEY}`
-    }
-  });
-  if (!r.ok) { console.warn('sbGet', table, await r.text()); return null; }
-  return await r.json();
-}
-async function sbUpsert(env, table, rows, { onConflict, returning='representation' }={}){
-  const url = `${env.SUPABASE_URL}/rest/v1/${table}${onConflict?`?on_conflict=${onConflict}`:''}`;
-  const r = await fetch(url, {
-    method:'POST',
-    headers: {
-      apikey: env.SUPABASE_ANON_KEY,
-      Authorization:`Bearer ${env.SUPABASE_ANON_KEY}`,
-      'Content-Type':'application/json',
-      Prefer:`resolution=merge-duplicates,return=${returning}`
-    },
-    body: JSON.stringify(rows)
-  });
-  if (!r.ok) { console.warn('sbUpsert', table, await r.text()); return null; }
-  const data = returning==='minimal' ? null : await r.json();
-  return { data };
-}
-async function sbPatch(env, table, patch, filter){
-  const url = `${env.SUPABASE_URL}/rest/v1/${table}?${filter}`;
-  const r = await fetch(url, {
-    method:'PATCH',
-    headers: {
-      apikey: env.SUPABASE_ANON_KEY,
-      Authorization:`Bearer ${env.SUPABASE_ANON_KEY}`,
-      'Content-Type':'application/json',
-      Prefer:'return=minimal'
-    },
-    body: JSON.stringify(patch)
-  });
-  if (!r.ok) console.warn('sbPatch', table, await r.text());
-}
-async function sbRpc(env, fn, params){
-  const url = `${env.SUPABASE_URL}/rest/v1/rpc/${fn}`;
-  const r = await fetch(url, {
-    method:'POST',
-    headers: {
-      apikey: env.SUPABASE_ANON_KEY,
-      Authorization:`Bearer ${env.SUPABASE_ANON_KEY}`,
-      'Content-Type':'application/json'
-    },
-    body: JSON.stringify(params||{})
-  });
-  if (!r.ok) { console.warn('sbRpc', fn, await r.text()); return null; }
-  return await r.json();
-}
 
 /* ============================ Cron / Recordatorios ============================ */
 /**
@@ -1639,3 +1584,4 @@ async function cronReminders(env){
   // Espacio para recordatorios o tareas programadas
   return { ok:true, ts: Date.now() };
 }
+
