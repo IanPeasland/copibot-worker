@@ -1,247 +1,214 @@
 /**
- * CopiBot – Conversacional con IA (OpenAI) + Ventas + Soporte Técnico + GCal
- * Build “Borbón-R6” (estable)
- *
- * Cambios clave vs R5:
- * - Ventas NUNCA se queda callado: siempre devuelve la mejor coincidencia
- *   (si stock=0 => muestra “sobre pedido”) y pasa a ask_qty.
- * - Mantiene wa_sessions (KV COPIBOT_KV) con TTL 7 días.
- * - Idempotencia por last_mid.
- * - Sin botones: todo por texto.
+ * CopiBot – Conversacional con IA + Ventas + Soporte Técnico + GCal + Supabase + KV
+ * Build: “Borbón-R7” (completo)
  */
 
 export default {
   async fetch(req, env) {
-    try {
-      const url = new URL(req.url);
+    const url = new URL(req.url);
 
-      // Verificación WhatsApp
-      if (req.method === 'GET' && url.pathname === '/') {
-        const mode = url.searchParams.get('hub.mode');
-        const token = url.searchParams.get('hub.verify_token');
-        const challenge = url.searchParams.get('hub.challenge');
-        if (mode === 'subscribe' && token === env.VERIFY_TOKEN) {
-          return new Response(challenge, { status: 200 });
-        }
-        return new Response('Forbidden', { status: 403 });
+    // ===== Verificación webhook de WhatsApp (GET /) =====
+    if (req.method === 'GET' && url.pathname === '/') {
+      const mode = url.searchParams.get('hub.mode');
+      const token = url.searchParams.get('hub.verify_token');
+      const challenge = url.searchParams.get('hub.challenge');
+      if (mode === 'subscribe' && token === env.VERIFY_TOKEN) {
+        return new Response(challenge, { status: 200 });
       }
-
-      // Salud rápida
-      if (req.method === 'GET' && url.pathname === '/health') {
-        const have = {
-          WA_TOKEN: !!env.WA_TOKEN,
-          PHONE_ID: !!env.PHONE_ID,
-          VERIFY_TOKEN: !!env.VERIFY_TOKEN,
-          SUPABASE_URL: !!env.SUPABASE_URL,
-          SUPABASE_ANON_KEY: !!env.SUPABASE_ANON_KEY,
-          TZ: env.TZ || 'America/Mexico_City'
-        };
-        return json({ ok: true, have, now: new Date().toISOString() });
-      }
-
-      // Cron manual
-      if (req.method === 'POST' && url.pathname === '/cron') {
-        const sec = req.headers.get('x-cron-secret') || url.searchParams.get('secret');
-        if (!sec || sec !== env.CRON_SECRET) return new Response('Forbidden', { status: 403 });
-        const out = await cronReminders(env);
-        return ok(`cron ok ${JSON.stringify(out)}`);
-      }
-
-// --- WhatsApp webhook principal ---
-if (req.method === 'POST' && url.pathname === '/') {
-  try {
-    const payload = await safeJson(req);
-    const ctx = extractWhatsAppContext(payload);
-    if (!ctx) return ok('EVENT_RECEIVED');
-
-    const { mid, from, fromE164, profileName, textRaw, msgType } = ctx;
-    const text = (textRaw || '').trim();
-    const lowered = text.toLowerCase();
-    const ntext = normalizeWithAliases(text);
-
-    // ====== Sesión ======
-    const now = new Date();
-    let session = await loadSession(env, from);
-    session.data = session.data || {};
-    session.stage = session.stage || 'idle';
-    session.from = from;
-
-    // Nombre por profile (prefill suave)
-    if (profileName && !session?.data?.customer?.nombre) {
-      session.data.customer = session.data.customer || {};
-      session.data.customer.nombre = toTitleCase(firstWord(profileName));
+      return new Response('Forbidden', { status: 403 });
     }
 
-    // Idempotencia por mid
-    if (session?.data?.last_mid && session.data.last_mid === mid) {
-      return ok('EVENT_RECEIVED');
-    }
-    session.data.last_mid = mid;
-
-    // NO-TEXTO → pedir texto (permitimos interactive->text ya mapeado)
-    if (msgType !== 'text') {
-      await sendWhatsAppText(env, fromE164, '¿Podrías escribirme con palabras lo que necesitas? Así te ayudo más rápido 🙂');
-      await saveSession(env, session, now);
-      return ok('EVENT_RECEIVED');
-    }
-
-    // ====== Intención ======
-    const supportIntent = isSupportIntent(ntext) || (await intentIs(env, text, 'support'));
-    const salesIntent   = RX_INV_Q.test(ntext)   || (await intentIs(env, text, 'sales'));
-    const isGreet       = RX_GREET.test(lowered);
-
-    // ====== PRIORIDAD: etapas de ventas activas ANTES que saludo ======
-    if (session.stage === 'ask_qty')       return await handleAskQty(env, session, fromE164, text, lowered, ntext, now);
-    if (session.stage === 'cart_open')     return await handleCartOpen(env, session, fromE164, text, lowered, ntext, now);
-    if (session.stage === 'await_invoice') return await handleAwaitInvoice(env, session, fromE164, lowered, now, text);
-    if (session.stage && session.stage.startsWith('collect_')) {
-      return await handleCollectSequential(env, session, fromE164, text, now);
+    // ===== Healthcheck rápido =====
+    if (req.method === 'GET' && url.pathname === '/health') {
+      const have = {
+        WA_TOKEN: !!env.WA_TOKEN,
+        PHONE_ID: !!env.PHONE_ID,
+        VERIFY_TOKEN: !!env.VERIFY_TOKEN,
+        SUPABASE_URL: !!env.SUPABASE_URL,
+        SUPABASE_ANON_KEY: !!env.SUPABASE_ANON_KEY,
+        GCAL_REFRESH_TOKEN: !!env.GCAL_REFRESH_TOKEN,
+        TZ: env.TZ || 'America/Mexico_City'
+      };
+      return json({ ok: true, have, now: new Date().toISOString() });
     }
 
-    // ====== Comandos universales (soporte) ======
-    if (/\b(cancel(a|ar).*(cita|visita|servicio))\b/i.test(lowered)) {
-      await svCancel(env, session, fromE164);
-      await saveSession(env, session, now);
-      return ok('EVENT_RECEIVED');
-    }
-    if (/\b(reprogram|mueve|cambia|modif)\w*/i.test(lowered)) {
-      const when = parseNaturalDateTime(lowered, env);
-      if (when?.start) {
-        await svReschedule(env, session, fromE164, when);
-        await saveSession(env, session, now);
-        return ok('EVENT_RECEIVED');
-      }
-    }
-    if (/\b(cu[aá]ndo|cuando).*(cita|visita|servicio)\b/i.test(lowered)) {
-      await svWhenIsMyVisit(env, session, fromE164);
-      await saveSession(env, session, now);
-      return ok('EVENT_RECEIVED');
+    // ===== Cron manual =====
+    if (req.method === 'POST' && url.pathname === '/cron') {
+      const sec = req.headers.get('x-cron-secret') || url.searchParams.get('secret');
+      if (!sec || sec !== env.CRON_SECRET) return new Response('Forbidden', { status: 403 });
+      const out = await cronReminders(env);
+      return ok(`cron ok ${JSON.stringify(out)}`);
     }
 
-    // ====== Saludo (solo si realmente es saludo) ======
-    if (isGreet) {
-      if (session?.data?.last_candidate) delete session.data.last_candidate;
-      if (session?.data?.pending_query) delete session.data.pending_query;
-      const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
-      await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
-      session.data.last_greet_at = now.toISOString();
-
-      if (session.stage !== 'idle') {
-        session.data.last_stage = session.stage;
-        session.stage = 'await_choice';
-        await saveSession(env, session, now);
-        return ok('EVENT_RECEIVED');
-      }
-      await saveSession(env, session, now);
-      return ok('EVENT_RECEIVED');
-    }
-
-    // ====== Continuar o empezar nuevo si estaba en await_choice ======
-    if (session.stage === 'await_choice') {
-      if (supportIntent) {
-        session.stage = 'sv_collect';
-        await saveSession(env, session, now);
-        return await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support', forceWelcome: true });
-      }
-      if (salesIntent) {
-        session.data.last_stage = 'idle';
-        session.stage = 'idle';
-        await saveSession(env, session, now);
-        return await startSalesFromQuery(env, session, fromE164, text, ntext, now);
-      }
-      if (isContinueish(lowered)) {
-        session.stage = session?.data?.last_stage || 'idle';
-        await saveSession(env, session, now);
-        const prompt = buildResumePrompt(session);
-        await sendWhatsAppText(env, fromE164, `Va. ${prompt}`);
-        return ok('EVENT_RECEIVED');
-      }
-      if (isStartNewish(lowered)) {
-        session.data.last_stage = 'idle';
-        session.stage = 'idle';
-        await saveSession(env, session, now);
-        await sendWhatsAppText(env, fromE164, 'Perfecto, cuéntame qué necesitas (soporte, cotización, etc.). 🙂');
-        return ok('EVENT_RECEIVED');
-      }
-      await sendWhatsAppText(env, fromE164, '¿Prefieres continuar con lo pendiente o empezamos algo nuevo?');
-      return ok('EVENT_RECEIVED');
-    }
-
-    // ====== Cambio de intención en caliente (prioridad soporte) ======
-    if (supportIntent || session.stage?.startsWith('sv_')) {
-      return await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support' });
-    }
-
-    // ====== Ventas por intención ======
-    if (salesIntent) {
-      if (session.stage !== 'idle') {
-        await sendWhatsAppText(env, fromE164, 'Te ayudo con inventario. Dejo lo otro en pausa un momento.');
-        session.data.last_stage = session.stage;
-        session.stage = 'idle';
-        await saveSession(env, session, now);
-      }
-      return await startSalesFromQuery(env, session, fromE164, text, ntext, now);
-    }
-
-    // ====== FAQs rápidas ======
-    const faqAns = await maybeFAQ(env, ntext);
-    if (faqAns) {
-      await sendWhatsAppText(env, fromE164, faqAns);
-      await saveSession(env, session, now);
-      return ok('EVENT_RECEIVED');
-    }
-
-// ===== Fallback IA breve =====
-const reply = await aiSmallTalk(env, session, 'fallback', text);
-await sendWhatsAppText(env, fromE164, reply);
-await saveSession(env, session, now);
-return ok('EVENT_RECEIVED');
-
-// --- Rutas no coincidentes → 404 controlado (dentro del try)
-return new Response('Not found', { status: 404 });
-
-} catch (e) {
-  console.error('Worker error', e);
-
-  // Notificación suave al usuario (si podemos identificarlo) y salida 200
-  try {
-    const body = await safeJson(req).catch(() => ({}));
-    const ctx2 = extractWhatsAppContext(body);
-    if (ctx2?.fromE164) {
-      await sendWhatsAppText(
-        env,
-        ctx2.fromE164,
-        'Tu mensaje llegó, tuve un problema momentáneo pero ya estoy encima 🙂'
-      );
-    }
-  } catch {/* no-op */}
-
-  return ok('EVENT_RECEIVED');  // <-- regresamos 200 al webhook
-} // <-- cierra try/catch del método fetch
-}, // <-- cierra método fetch dentro de export default (nota la coma)
-
-
-      // --- Rutas no coincidentes → 404 controlado (fuera del try/catch) ---
-      return new Response('Not found', { status: 404 });
-    } catch (e) {
-      console.error('Worker error', e);
-      // Fail-safe: intenta rescatar el remitente y avisa que sí llegó el msg
+    // ===== Webhook principal de WhatsApp =====
+    if (req.method === 'POST' && url.pathname === '/') {
       try {
-        const body = await safeJson(req).catch(() => ({}));
-        const ctz = extractWhatsAppContext(body);
-        if (ctz?.fromE164) {
-          await sendWhatsAppText(
-            env,
-            ctz.fromE164,
-            'Tu mensaje llegó, tuve un problema momentáneo pero ya estoy encima 🙂'
-          );
-        }
-      } catch {}
-      return new Response('EVENT_RECEIVED', { status: 200 });
-    }
-  }, // <-- cierra método fetch dentro del export default
+        const payload = await safeJson(req);
+        const ctx = extractWhatsAppContext(payload);
+        if (!ctx) return ok('EVENT_RECEIVED');
 
-  // Cron (scheduled) opcional
+        const { mid, from, fromE164, profileName, textRaw, msgType } = ctx;
+        const text = (textRaw || '').trim();
+        const lowered = text.toLowerCase();
+        const ntext = normalizeWithAliases(text);
+
+        // Sesión
+        const now = new Date();
+        let session = await loadSession(env, from);
+        session.data = session.data || {};
+        session.stage = session.stage || 'idle';
+        session.from = from;
+
+        if (profileName && !session?.data?.customer?.nombre) {
+          session.data.customer = session.data.customer || {};
+          session.data.customer.nombre = toTitleCase(firstWord(profileName));
+        }
+
+        // Idempotencia por MID
+        if (session?.data?.last_mid && session.data.last_mid === mid) {
+          return ok('EVENT_RECEIVED');
+        }
+        session.data.last_mid = mid;
+
+        // Si no es texto → pedimos texto
+        if (msgType !== 'text') {
+          await sendWhatsAppText(env, fromE164, '¿Podrías describirme con palabras lo que necesitas? Así te ayudo más rápido 🙂');
+          await saveSession(env, session, now);
+          return ok('EVENT_RECEIVED');
+        }
+
+        // Intenciones
+        const supportIntent = isSupportIntent(ntext) || (await intentIs(env, text, 'support'));
+        const salesIntent   = RX_INV_Q.test(ntext)   || (await intentIs(env, text, 'sales'));
+        const isGreet       = RX_GREET.test(lowered);
+
+        // ===== Prioridad: etapas de ventas activas ANTES que saludo =====
+        if (session.stage === 'ask_qty')       return await handleAskQty(env, session, fromE164, text, lowered, ntext, now);
+        if (session.stage === 'cart_open')     return await handleCartOpen(env, session, fromE164, text, lowered, ntext, now);
+        if (session.stage === 'await_invoice') return await handleAwaitInvoice(env, session, fromE164, lowered, now, text);
+        if (session.stage && session.stage.startsWith('collect_')) {
+          return await handleCollectSequential(env, session, fromE164, text, now);
+        }
+
+        // ===== Comandos universales de soporte =====
+        if (/\b(cancel(a|ar).*(cita|visita|servicio))\b/i.test(lowered)) {
+          await svCancel(env, session, fromE164);
+          await saveSession(env, session, now);
+          return ok('EVENT_RECEIVED');
+        }
+        if (/\b(reprogram|mueve|cambia|modif)\w*/i.test(lowered)) {
+          const when = parseNaturalDateTime(lowered, env);
+          if (when?.start) {
+            await svReschedule(env, session, fromE164, when);
+            await saveSession(env, session, now);
+            return ok('EVENT_RECEIVED');
+          }
+        }
+        if (/\b(cu[aá]ndo|cuando).*(cita|visita|servicio)\b/i.test(lowered)) {
+          await svWhenIsMyVisit(env, session, fromE164);
+          await saveSession(env, session, now);
+          return ok('EVENT_RECEIVED');
+        }
+
+        // ===== Saludo genuino =====
+        if (isGreet) {
+          if (session?.data?.last_candidate) delete session.data.last_candidate;
+          if (session?.data?.pending_query) delete session.data.pending_query;
+          const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
+          await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
+          session.data.last_greet_at = now.toISOString();
+
+          if (session.stage !== 'idle') {
+            session.data.last_stage = session.stage;
+            session.stage = 'await_choice';
+            await saveSession(env, session, now);
+            return ok('EVENT_RECEIVED');
+          }
+          await saveSession(env, session, now);
+          return ok('EVENT_RECEIVED');
+        }
+
+        // ===== Menú “continuar o nuevo” =====
+        if (session.stage === 'await_choice') {
+          if (supportIntent) {
+            session.stage = 'sv_collect';
+            await saveSession(env, session, now);
+            return await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support', forceWelcome: true });
+          }
+          if (salesIntent) {
+            session.data.last_stage = 'idle';
+            session.stage = 'idle';
+            await saveSession(env, session, now);
+            return await startSalesFromQuery(env, session, fromE164, text, ntext, now);
+          }
+          if (isContinueish(lowered)) {
+            session.stage = session?.data?.last_stage || 'idle';
+            await saveSession(env, session, now);
+            const prompt = buildResumePrompt(session);
+            await sendWhatsAppText(env, fromE164, `Va. ${prompt}`);
+            return ok('EVENT_RECEIVED');
+          }
+          if (isStartNewish(lowered)) {
+            session.data.last_stage = 'idle';
+            session.stage = 'idle';
+            await saveSession(env, session, now);
+            await sendWhatsAppText(env, fromE164, 'Perfecto, cuéntame qué necesitas (soporte, cotización, etc.). 🙂');
+            return ok('EVENT_RECEIVED');
+          }
+          await sendWhatsAppText(env, fromE164, '¿Prefieres continuar con lo pendiente o empezamos algo nuevo?');
+          return ok('EVENT_RECEIVED');
+        }
+
+        // ===== Cambio a soporte si aplica =====
+        if (supportIntent || session.stage?.startsWith('sv_')) {
+          return await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support' });
+        }
+
+        // ===== Ventas por intención =====
+        if (salesIntent) {
+          if (session.stage !== 'idle') {
+            await sendWhatsAppText(env, fromE164, 'Te ayudo con inventario. Dejo lo otro en pausa un momento.');
+            session.data.last_stage = session.stage;
+            session.stage = 'idle';
+            await saveSession(env, session, now);
+          }
+          return await startSalesFromQuery(env, session, fromE164, text, ntext, now);
+        }
+
+        // ===== FAQs rápidas =====
+        const faqAns = await maybeFAQ(env, ntext);
+        if (faqAns) {
+          await sendWhatsAppText(env, fromE164, faqAns);
+          await saveSession(env, session, now);
+          return ok('EVENT_RECEIVED');
+        }
+
+        // ===== Fallback IA breve =====
+        const reply = await aiSmallTalk(env, session, 'fallback', text);
+        await sendWhatsAppText(env, fromE164, reply);
+        await saveSession(env, session, now);
+        return ok('EVENT_RECEIVED');
+
+      } catch (e) {
+        console.error('Worker error', e);
+
+        // Notificación amable al usuario y salida 200
+        try {
+          const body = await safeJson(req).catch(() => ({}));
+          const ctx2 = extractWhatsAppContext(body);
+          if (ctx2?.fromE164) {
+            await sendWhatsAppText(env, ctx2.fromE164, 'Tu mensaje llegó, tuve un problema momentáneo pero ya estoy encima 🙂');
+          }
+        } catch {}
+        return ok('EVENT_RECEIVED');
+      }
+    }
+
+    // Cualquier otra ruta
+    return new Response('Not found', { status: 404 });
+  }, // fetch
+
+  // ===== CRON opcional =====
   async scheduled(event, env, ctx) {
     try {
       const out = await cronReminders(env);
@@ -250,29 +217,8 @@ return new Response('Not found', { status: 404 });
       console.error('cron error', e);
     }
   }
-}; // <-- cierra export default (objeto completo)
+}; // export default
 
-/* ============================ Utilidades HTTP ============================ */
-async function safeJson(req) {
-  try {
-    return await req.json();
-  } catch (e) {
-    return {};
-  }
-}
-
-function ok(s = 'ok') {
-  return new Response(s, { status: 200 });
-}
-
-async function cronReminders(env) {
-  // Espacio para recordatorios o tareas programadas
-  return { ok: true, ts: Date.now() };
-}
-
-    // --- Rutas no coincidentes → 404 controlado (fuera del try/catch) ---
-    return new Response('Not found', { status: 404 });
-  
 /* ============================ Regex / Intents ============================ */
 const RX_GREET = /^(hola+|buen[oa]s|qué onda|que tal|saludos|hey|buen dia|buenas|holi+)\b/i;
 const RX_INV_Q = /(toner|t[óo]ner|cartucho|developer|refacci[oó]n|precio|docucolor|versant|versalink|altalink|apeos|c\d{2,4}|b\d{2,4}|magenta|amarillo|cyan|negro|yellow|black|bk|k)\b/i;
@@ -280,18 +226,17 @@ const RX_INV_Q = /(toner|t[óo]ner|cartucho|developer|refacci[oó]n|precio|docuc
 function isContinueish(t){ return /\b(continuar|continuemos|seguir|retomar|reanudar|continuo|contin[uú]o)\b/i.test(t); }
 function isStartNewish(t){ return /\b(empezar|nuevo|desde cero|otra cosa|otro|iniciar|empecemos)\b/i.test(t); }
 
-/** Determinista intención soporte (con ntext normalizado) */
 function isSupportIntent(ntext='') {
   const t = `${ntext}`;
   const hasProblem = /(falla(?:ndo)?|fallo|problema|descompuest[oa]|no imprime|no escanea|no copia|no prende|no enciende|se apaga|error|atasc|ator(?:a|o|e|ando|ada|ado)|atasco|se traba|mancha|l[ií]nea|linea|calidad|ruido|marca c[oó]digo|c[oó]digo)/.test(t);
-  const hasDevice = /(impresora|equipo|copiadora|xerox|fujifilm|fuji\s?film|versant|versalink|altalink|docucolor|c\d{2,4}|b\d{2,4})/.test(t);
-  const phrase = /(mi|la|nuestra)\s+(impresora|equipo|copiadora)\s+(esta|est[ae]|anda|se)\s+(falla(?:ndo)?|ator(?:ando|ada|ado)|atasc(?:ada|ado)|descompuest[oa])/.test(t);
+  const hasDevice  = /(impresora|equipo|copiadora|xerox|fujifilm|fuji\s?film|versant|versalink|altalink|docucolor|c\d{2,4}|b\d{2,4})/.test(t);
+  const phrase     = /(mi|la|nuestra)\s+(impresora|equipo|copiadora)\s+(esta|est[ae]|anda|se)\s+(falla(?:ndo)?|ator(?:ando|ada|ado)|atasc(?:ada|ado)|descompuest[oa])/.test(t);
   return phrase || (hasProblem && hasDevice) || /\b(soporte|servicio|visita)\b/.test(t);
 }
 
 const RX_NEG_NO = /\b(no|nel|ahorita no)\b/i;
-const RX_DONE = /\b(es(ta)?\s*todo|ser[ií]a\s*todo|nada\s*m[aá]s|con\s*eso|as[ií]\s*est[aá]\s*bien|ya\s*qued[oó]|listo|finaliza(r|mos)?|termina(r)?)\b/i;
-const RX_YES = /\b(s[ií]|sí|si|claro|va|dale|sale|correcto|ok|seguim(?:os)?|contin[uú]a(?:r)?|adelante|afirmativo|de acuerdo|me sirve)\b/i;
+const RX_DONE   = /\b(es(ta)?\s*todo|ser[ií]a\s*todo|nada\s*m[aá]s|con\s*eso|as[ií]\s*est[aá]\s*bien|ya\s*qued[oó]|listo|finaliza(r|mos)?|termina(r)?)\b/i;
+const RX_YES    = /\b(s[ií]|sí|si|claro|va|dale|sale|correcto|ok|seguim(?:os)?|contin[uú]a(?:r)?|adelante|afirmativo|de acuerdo|me sirve)\b/i;
 
 function isYesish(t){ return RX_YES.test(t); }
 function isNoish(t){ return RX_NEG_NO.test(t) || RX_DONE.test(t); }
@@ -354,12 +299,9 @@ async function aiCall(env, messages, {json=false}={}) {
 async function aiSmallTalk(env, session, mode='general', userText=''){
   const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
   const sys = `Eres CopiBot de CP Digital (es-MX). Responde con calidez humana, breve y claro. Máx. 1 emoji. Evita listas salvo necesidad.`;
-  let prompt = '';
-  if (mode === 'fallback') {
-    prompt = `El usuario dijo: """${userText}""". Responde breve, útil y amable. Si no hay contexto, ofrece inventario o soporte.`;
-  } else {
-    prompt = `El usuario dijo: """${userText}""". Responde breve y amable.`;
-  }
+  const prompt = mode==='fallback'
+    ? `El usuario dijo: """${userText}""". Responde breve, útil y amable. Si no hay contexto, ofrece inventario o soporte.`
+    : `El usuario dijo: """${userText}""". Responde breve y amable.`;
   const out = await aiCall(env, [{role:'system', content: sys}, {role:'user', content: prompt}], {});
   return out || (`Hola${nombre?`, ${nombre}`:''} 👋 ¿En qué te puedo ayudar?`);
 }
@@ -403,42 +345,6 @@ async function notifySupport(env, body) {
   const to = env.SUPPORT_WHATSAPP || env.SUPPORT_PHONE_E164;
   if (!to) return;
   await sendWhatsAppText(env, to, `🛎️ *Soporte*\n${body}`);
-}
-
-/**
- * Extrae contexto del webhook de WA.
- * - Soporta text
- * - Soporta interactive.button_reply/list_reply → lo convierte a textRaw
- * - Detecta tipos no-texto para respuesta amable (worker ya responde)
- */
-function extractWhatsAppContext(payload) {
-  try {
-    const value = payload?.entry?.[0]?.changes?.[0]?.value;
-    const msg = value?.messages?.[0];
-    if (!msg) return null;
-
-    let textRaw = '';
-    let msgType = 'text';
-
-    if (msg.type === 'text') {
-      textRaw = msg.text?.body || '';
-      msgType = 'text';
-    } else if (msg.type === 'interactive' && msg.interactive?.type === 'button_reply') {
-      textRaw = msg.interactive?.button_reply?.title || msg.interactive?.button_reply?.id || '';
-      msgType = 'text';
-    } else if (msg.type === 'interactive' && msg.interactive?.type === 'list_reply') {
-      textRaw = msg.interactive?.list_reply?.title || msg.interactive?.list_reply?.id || '';
-      msgType = 'text';
-    } else {
-      msgType = 'media';
-    }
-
-    const from = msg.from;
-    const fromE164 = `+${from}`;
-    const mid = msg.id || `${Date.now()}_${Math.random()}`;
-    const profileName = value?.contacts?.[0]?.profile?.name || '';
-    return { msg, from, fromE164, mid, textRaw, profileName, msgType };
-  } catch { return null; }
 }
 
 /* ============================ Ventas / Carrito ============================ */
@@ -536,11 +442,10 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
   if (RX_ADD_ITEM.test(lowered) || RX_INV_Q.test(ntext)) {
     const cleanQ = lowered.replace(RX_ADD_ITEM, '').trim() || ntext;
 
-    // Intento de NER con IA si ambiguo
     const extracted = await aiExtractTonerQuery(env, cleanQ).catch(()=>null);
     const enrichedQ = enrichQueryFromAI(cleanQ, extracted);
 
-    const best = await findBestProduct(env, enrichedQ); // familia+color = duro
+    const best = await findBestProduct(env, enrichedQ);
     if (best) {
       session.data.last_candidate = best;
       session.stage = 'ask_qty';
@@ -549,7 +454,6 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
       await sendWhatsAppText(env, toE164, `${renderProducto(best)}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; hay ${s} en stock y el resto sería *sobre pedido*.`);
       return ok('EVENT_RECEIVED');
     } else {
-      // Mostrar “sobre pedido” si hay familia clara aunque no haya stock
       const hints = extractModelHints(enrichedQ);
       if (hints.family) {
         session.data.last_candidate = {
@@ -636,7 +540,7 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now, originalTe
 /* Captura UNO A UNO (ventas) */
 const FLOW_FACT = ['nombre','rfc','email','calle','numero','colonia','cp'];
 const FLOW_SHIP = ['nombre','email','calle','numero','colonia','cp'];
-const LABEL = { nombre:'Nombre / Razón Social', rfc:'RFC', email:'Email', calle:'Calle', numero:'Número', colonia:'Colonia', cp:'Código Postal' };
+const LABEL     = { nombre:'Nombre / Razón Social', rfc:'RFC', email:'Email', calle:'Calle', numero:'Número', colonia:'Colonia', cp:'Código Postal' };
 
 function firstMissing(list, c={}){ for (const k of list){ if (!truthy(c[k])) return k; } return null; }
 
@@ -696,7 +600,7 @@ function extractModelHints(text='') {
   const t = normalizeWithAliases(text);
   const out = {};
 
-  // —— Familia (determinista)
+  // Familia
   if (/\bversant\b/i.test(t) || /\b(80|180|2100|280|4100)\b/i.test(t)) out.family = 'versant';
   else if (/\bdocu\s*color\b/i.test(t) || /\b(550|560|570)\b/.test(t)) out.family = 'docucolor';
   else if (/\bprime\s*link\b/i.test(t) || /\bprimelink\b/i.test(t)) out.family = 'primelink';
@@ -705,7 +609,7 @@ function extractModelHints(text='') {
   else if (/\bapeos\b/i.test(t)) out.family = 'apeos';
   else if (/\bc(60|70|75)\b/i.test(t)) out.family = 'c70';
 
-  // —— Color
+  // Color
   const c = extractColorWord(t);
   if (c) out.color = c;
 
@@ -742,8 +646,8 @@ function productMatchesFamily(p, family){
   if (family==='c70') return /\bc(60|70|75)\b/i.test(s) || s.includes('c60') || s.includes('c70') || s.includes('c75');
   if (family==='primelink') return /\bprime\s*link\b/i.test(s) || /\bprimelink\b/i.test(s);
   if (family==='versalink') return /\bversa\s*link\b/i.test(s) || /\bversalink\b/i.test(s);
-  if (family==='altalink') return /\balta\s*link\b/i.test(s) || /\baltalink\b/i.test(s);
-  if (family==='apeos') return /\bapeos\b/i.test(s);
+  if (family==='altalink')  return /\balta\s*link\b/i.test(s) || /\baltalink\b/i.test(s);
+  if (family==='apeos')     return /\bapeos\b/i.test(s);
   return s.includes(family);
 }
 
@@ -756,7 +660,7 @@ function extractColorWord(text=''){
   return null;
 }
 
-/* === findBestProduct: estricta por familia y color, con fallbacks fuertes === */
+/* === findBestProduct === */
 async function findBestProduct(env, queryText, opts = {}) {
   const hints = extractModelHints(queryText);
   const colorCode = hints.color || extractColorWord(queryText);
@@ -766,10 +670,9 @@ async function findBestProduct(env, queryText, opts = {}) {
     if (!Array.isArray(arr) || !arr.length) return null;
     let pool = arr.slice();
 
-    // Filtro duro por familia y color
+    // Filtros duros
     if (hints.family && !opts.ignoreFamily) pool = pool.filter(p => productMatchesFamily(p, hints.family));
     if (colorCode) pool = pool.filter(p => productHasColor(p, colorCode));
-
     if (!pool.length) return null;
 
     // Priorizar stock >0, luego precio
@@ -782,7 +685,7 @@ async function findBestProduct(env, queryText, opts = {}) {
     return pool[0] || null;
   };
 
-  // 1) RPC (si existe)
+  // 1) RPC similitud
   try {
     const res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 40 }) || [];
     const pick1 = scoreAndPick(res);
@@ -792,12 +695,11 @@ async function findBestProduct(env, queryText, opts = {}) {
     if (debug) console.log('[INV] RPC error', e);
   }
 
-  // 2) Vista por familia (traemos candidatos por familia y luego filtramos color en JS)
+  // 2) Vista por familia
   if (hints.family && !opts.ignoreFamily) {
     try {
       const likeFam = encodeURIComponent(`%${hints.family}%`);
       const r = await sbGet(env, 'producto_stock_v', {
-        // Tipicamente tus nombres ya contienen "TONER ... VERSANT XX", esto trae suficientes candidatos
         query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&or=(nombre.ilike.${likeFam},sku.ilike.${likeFam},marca.ilike.${likeFam},compatible.ilike.${likeFam})&order=stock.desc.nullslast,precio.asc&limit=200`
       }) || [];
       const pick2 = scoreAndPick(r);
@@ -808,7 +710,7 @@ async function findBestProduct(env, queryText, opts = {}) {
     }
   }
 
-  // 3) Fallback fuerte: traemos un lote amplio de TONER y filtramos TODO en JS
+  // 3) Broad scan "toner"
   try {
     const likeToner = encodeURIComponent(`%toner%`);
     const r2 = await sbGet(env, 'producto_stock_v', {
@@ -821,7 +723,6 @@ async function findBestProduct(env, queryText, opts = {}) {
     if (debug) console.log('[INV] broad scan error', e);
   }
 
-  // 4) No hay nada claro
   return null;
 }
 
@@ -842,7 +743,6 @@ async function startSalesFromQuery(env, session, toE164, text, ntext, now){
   const extracted = await aiExtractTonerQuery(env, ntext).catch(()=>null);
   const enrichedQ = enrichQueryFromAI(ntext, extracted);
   const best = await findBestProduct(env, enrichedQ);
-
   const hints = extractModelHints(enrichedQ);
 
   if (best) {
@@ -851,14 +751,10 @@ async function startSalesFromQuery(env, session, toE164, text, ntext, now){
     session.data.last_candidate = best;
     await saveSession(env, session, now);
     const s = numberOrZero(best.stock);
-    await sendWhatsAppText(
-      env, toE164,
-      `${renderProducto(best)}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; hay ${s} en stock y el resto sería *sobre pedido*.`
-    );
+    await sendWhatsAppText(env, toE164, `${renderProducto(best)}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; hay ${s} en stock y el resto sería *sobre pedido*.`);
     return ok('EVENT_RECEIVED');
   }
 
-  // Sin best, pero con familia → ofrecer “sobre pedido” y pasar a ask_qty
   if (!best && hints.family) {
     session.data.last_candidate = {
       id: null, sku: null,
@@ -886,19 +782,15 @@ async function preloadCustomerIfAny(env, session){
     const r = await sbGet(env, 'cliente', {
       query: `select=nombre,rfc,email,calle,numero,colonia,ciudad,estado,cp&telefono=eq.${session.from}&limit=1`
     });
-    if (r && r[0]) {
-      session.data.customer = { ...(session.data.customer||{}), ...r[0] };
-    }
+    if (r && r[0]) session.data.customer = { ...(session.data.customer||{}), ...r[0] };
   }catch(e){ console.warn('preloadCustomerIfAny', e); }
 }
 
 async function ensureClienteFields(env, cliente_id, c){
   try{
     const patch = {};
-    ['nombre','rfc','email','calle','mero','colonia','ciudad','estado','cp'].forEach(k=>{
-      // typo-safe: aceptar "numero" y normalizar a número
-      const key = (k==='mero' ? 'numero' : k);
-      if (truthy(c[key])) patch[key]=c[key];
+    ['nombre','rfc','email','calle','numero','colonia','ciudad','estado','cp'].forEach(k=>{
+      if (truthy(c[k])) patch[k]=c[k];
     });
     if (Object.keys(patch).length>0) {
       await sbPatch(env, 'cliente', patch, `id=eq.${cliente_id}`);
@@ -913,7 +805,7 @@ async function createOrderFromSession(env, session, toE164) {
     const c = session.data.customer || {};
     let cliente_id = null;
 
-    // Buscar cliente por teléfono o email
+    // Buscar cliente
     try {
       const exist = await sbGet(env, 'cliente', {
         query: `select=id,telefono,email&or=(telefono.eq.${session.from},email.eq.${encodeURIComponent(c.email || '')})&limit=1`
@@ -965,7 +857,7 @@ async function createOrderFromSession(env, session, toE164) {
     }));
     await sbUpsert(env, 'pedido_item', items, { returning: 'minimal' });
 
-    // Decremento de stock por RPC (hasta stock actual; lo demás es sobre pedido)
+    // Decremento de stock por RPC
     for (const it of cart) {
       const sku = it.product?.sku;
       if (!sku) continue;
@@ -975,9 +867,7 @@ async function createOrderFromSession(env, session, toE164) {
         });
         const current = numberOrZero(row?.[0]?.stock);
         const toDec = Math.min(current, Number(it.qty||0));
-        if (toDec > 0) {
-          await sbRpc(env, 'decrement_stock', { in_sku: sku, in_by: toDec });
-        }
+        if (toDec > 0) await sbRpc(env, 'decrement_stock', { in_sku: sku, in_by: toDec });
       } catch(e){ console.warn('stock dec', e); }
     }
 
@@ -989,14 +879,10 @@ async function createOrderFromSession(env, session, toE164) {
 }
 
 /* ============================ Supabase Helpers ============================ */
-
 async function sbGet(env, table, { query }){
   const url = `${env.SUPABASE_URL}/rest/v1/${table}?${query}`;
   const r = await fetch(url, {
-    headers: {
-      apikey: env.SUPABASE_ANON_KEY,
-      Authorization: `Bearer ${env.SUPABASE_ANON_KEY}`
-    }
+    headers: { apikey: env.SUPABASE_ANON_KEY, Authorization: `Bearer ${env.SUPABASE_ANON_KEY}` }
   });
   if (!r.ok) { console.warn('sbGet', table, await r.text()); return null; }
   return await r.json();
@@ -1051,7 +937,6 @@ async function sbRpc(env, fn, params){
 
 /* ============================ SOPORTE ============================ */
 
-/** Parser robusto de marca/modelo (Xerox/Fujifilm + familias típicas) */
 function parseBrandModel(text=''){
   const t = normalizeWithAliases(text);
   let marca = null;
@@ -1059,16 +944,12 @@ function parseBrandModel(text=''){
   else if (/\bfujifilm|fuji\s?film\b/i.test(t)) marca = 'Fujifilm';
 
   const norm = t.replace(/\s+/g,' ').trim();
-
-  // DocuColor 550/560/570
   const mDocu = norm.match(/\bdocu ?color\s*(550|560|570)\b/i);
   if (mDocu) return { marca: marca || 'Xerox', modelo: `DOCUCOLOR ${mDocu[1]}` };
 
-  // Versant 80/180/2100/280/4100
   const mVers = norm.match(/\bversant\s*(80|180|2100|280|4100)\b/i);
   if (mVers) return { marca: marca || 'Xerox', modelo: `VERSANT ${mVers[1]}` };
 
-  // VersaLink / AltaLink / PrimeLink + sufijo
   const mVL = norm.match(/\b(versalink|versa ?link)\s*([a-z0-9\-]+)\b/i);
   if (mVL) return { marca: marca || 'Xerox', modelo: `${mVL[1].replace(/\s/,'').toUpperCase()} ${mVL[2].toUpperCase()}` };
 
@@ -1078,11 +959,9 @@ function parseBrandModel(text=''){
   const mPL = norm.match(/\b(primelink|prime ?link)\s*([a-z0-9\-]+)\b/i);
   if (mPL) return { marca: marca || 'Xerox', modelo: `${mPL[1].replace(/\s/,'').toUpperCase()} ${mPL[2].toUpperCase()}` };
 
-  // Series C/B (C60/C70/C75, Bxxx/Cxxx)
   const mSeries = norm.match(/\b([cb]\d{2,4})\b/i);
   if (mSeries) return { marca, modelo: mSeries[1].toUpperCase() };
 
-  // Failsafe DocuColor con número suelto
   const m550 = norm.match(/\b(550|560|570)\b/);
   if (!marca && /\bxerox\b/i.test(norm)) marca = 'Xerox';
   if (/\bdocu ?color\b/i.test(norm) && m550) return { marca: marca || 'Xerox', modelo: `DOCUCOLOR ${m550[1]}` };
@@ -1096,7 +975,6 @@ function extractSvInfo(text) {
   if (/xerox/i.test(t)) out.marca = 'Xerox';
   else if (/fujifilm|fuji\s?film/i.test(t)) out.marca = 'Fujifilm';
 
-  // Modelo por familias
   const pm = parseBrandModel(text);
   if (pm.marca && !out.marca) out.marca = pm.marca;
   if (pm.modelo) out.modelo = pm.modelo;
@@ -1124,22 +1002,22 @@ function extractSvInfo(text) {
 }
 
 function svFillFromAnswer(sv, field, text, env){
-  const pm = parseBrandModel(text); // parser robusto
+  const pm = parseBrandModel(text);
   if (field === 'modelo') {
     if (pm.marca) sv.marca = pm.marca;
     if (pm.modelo) sv.modelo = pm.modelo;
-    if (!sv.modelo) sv.modelo = clean(text); // fallback
+    if (!sv.modelo) sv.modelo = clean(text);
     return;
   }
-  if (field === 'falla') { sv.falla = clean(text); return; }
-  if (field === 'nombre') { sv.nombre = clean(text); return; }
-  if (field === 'email') { const em = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i); sv.email = em ? em[0].toLowerCase() : clean(text).toLowerCase(); return; }
-  if (field === 'calle') { sv.calle = clean(text); return; }
-  if (field === 'numero') { const mnum = text.match(/\b(\d+[A-Z]?)\b/); sv.numero = mnum?mnum[1]:clean(text); return; }
+  if (field === 'falla')   { sv.falla = clean(text); return; }
+  if (field === 'nombre')  { sv.nombre = clean(text); return; }
+  if (field === 'email')   { const em = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i); sv.email = em ? em[0].toLowerCase() : clean(text).toLowerCase(); return; }
+  if (field === 'calle')   { sv.calle = clean(text); return; }
+  if (field === 'numero')  { const mnum = text.match(/\b(\d+[A-Z]?)\b/); sv.numero = mnum?mnum[1]:clean(text); return; }
   if (field === 'colonia') { sv.colonia = clean(text); return; }
-  if (field === 'ciudad') { sv.ciudad = clean(text); return; }
-  if (field === 'estado') { sv.estado = clean(text); return; }
-  if (field === 'cp') { const mcp = text.match(/\b(\d{5})\b/); sv.cp = mcp?mcp[1]:clean(text); return; }
+  if (field === 'ciudad')  { sv.ciudad = clean(text); return; }
+  if (field === 'estado')  { sv.estado = clean(text); return; }
+  if (field === 'cp')      { const mcp = text.match(/\b(\d{5})\b/); sv.cp = mcp?mcp[1]:clean(text); return; }
   if (field === 'horario') { const dt = parseNaturalDateTime(text, env); if (dt?.start) sv.when = dt; return; }
 }
 
@@ -1171,13 +1049,13 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     session.data.sv = session.data.sv || {};
     const sv = session.data.sv;
 
-    // Captura lo que se esperaba (si estábamos en sv_collect)
+    // Captura lo esperado si veníamos en sv_collect
     if (session.stage === 'sv_collect' && session.data.sv_need_next) {
       svFillFromAnswer(sv, session.data.sv_need_next, text, env);
       await saveSession(env, session, now);
     }
 
-    // Enriquecer con lo que venga en texto
+    // Enriquecer con lo que venga
     const mined = extractSvInfo(text);
     if (!sv.marca && mined.marca) sv.marca = mined.marca;
     if (!sv.modelo && mined.modelo) sv.modelo = mined.modelo;
@@ -1209,7 +1087,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     if (!sv.nombre && truthy(c.nombre)) sv.nombre = c.nombre;
     if (!sv.email && truthy(c.email)) sv.email = c.email;
 
-    // Re-calcular faltantes después de capturar
+    // Faltantes
     const needed = [];
     if (!(truthy(sv.marca) && truthy(sv.modelo))) {
       const pmNow = parseBrandModel(text);
@@ -1218,14 +1096,14 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     }
     if (!(truthy(sv.marca) && truthy(sv.modelo))) needed.push('modelo');
 
-    if (!truthy(sv.falla)) needed.push('falla');
-    if (!truthy(sv.calle)) needed.push('calle');
+    if (!truthy(sv.falla))  needed.push('falla');
+    if (!truthy(sv.calle))  needed.push('calle');
     if (!truthy(sv.numero)) needed.push('numero');
-    if (!truthy(sv.colonia)) needed.push('colonia');
-    if (!truthy(sv.cp)) needed.push('cp');
-    if (!sv.when?.start) needed.push('horario');
+    if (!truthy(sv.colonia))needed.push('colonia');
+    if (!truthy(sv.cp))     needed.push('cp');
+    if (!sv.when?.start)    needed.push('horario');
     if (!truthy(sv.nombre)) needed.push('nombre');
-    if (!truthy(sv.email)) needed.push('email');
+    if (!truthy(sv.email))  needed.push('email');
 
     if (needed.length) {
       session.stage = 'sv_collect';
@@ -1246,7 +1124,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
       return ok('EVENT_RECEIVED');
     }
 
-    // === Agendar (GCal) + crear OS ===
+    // === Agenda (GCal) + OS ===
     let pool = [];
     try { pool = await getCalendarPool(env) || []; } catch(e){ console.warn('[GCal] pool', e); }
     const cal = pickCalendarFromPool(pool);
@@ -1279,14 +1157,13 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
         gcal_event_id: event?.id || null, calendar_id: cal?.gcal_id || null,
         calle: sv.calle || null, numero: sv.numero || null, colonia: sv.colonia || null, ciudad: sv.ciudad || null, estado: sv.estado || null, cp: sv.cp || null,
         created_at: new Date().toISOString()
-      }];
+      }]];
       const os = await sbUpsert(env, 'orden_servicio', osBody, { returning: 'representation' });
       osId = os?.data?.[0]?.id || null;
     } catch (e) { console.warn('[Supabase] OS upsert', e); estado = 'pendiente'; }
 
     if (event) {
-      await sendWhatsAppText(
-        env, toE164,
+      await sendWhatsAppText(env, toE164,
         `¡Listo! Agendé tu visita 🙌\n*${fmtDate(slot.start, tz)}*, de *${fmtTime(slot.start, tz)}* a *${fmtTime(slot.end, tz)}*\nDirección: ${sv.calle} ${sv.numero}, ${sv.colonia}, ${sv.cp} ${sv.ciudad || ''}\nTécnico asignado: ${calName || 'por confirmar'}.\n\nSi necesitas reprogramar o cancelar, dímelo con confianza.`
       );
       session.stage = 'sv_scheduled';
@@ -1336,31 +1213,9 @@ async function svReschedule(env, session, toE164, when) {
 
 async function svWhenIsMyVisit(env, session, toE164) {
   const os = await getLastOpenOS(env, session.from);
-  if (!os) { await sendWhatsAppText(env, toE164, `No veo una visita programada. ¿Agendamos una?`); return; }
   const tz = env.TZ || 'America/Mexico_City';
+  if (!os) { await sendWhatsAppText(env, toE164, `No veo una visita programada. ¿Agendamos una?`); return; }
   await sendWhatsAppText(env, toE164, `Tu próxima visita: *${fmtDate(os.ventana_inicio, tz)}*, de *${fmtTime(os.ventana_inicio, tz)}* a *${fmtTime(os.ventana_fin, tz)}*. Estado: ${os.estado}.`);
-}
-
-/* ============================ FAQs ============================ */
-async function maybeFAQ(env, ntext) {
-  try {
-    const like = encodeURIComponent(`%${ntext.slice(0, 60)}%`);
-    const r = await sbGet(env, 'company_info', { query: `select=key,content,tags&or=(key.ilike.${like},content.ilike.${like})&limit=1` });
-    if (r && r[0]?.content) return r[0].content;
-  } catch {}
-  if (/\b(qu[ié]nes?\s+son|sobre\s+ustedes|qu[eé]\s+es\s+cp(\s+digital)?|h[aá]blame\s+de\s+ustedes)\b/i.test(ntext)) {
-    return '¡Hola! Somos *CP Digital*. Ayudamos a empresas con consumibles y refacciones para impresoras Xerox y Fujifilm, y brindamos visitas de soporte técnico. Cotizamos, vendemos con o sin factura y agendamos servicio en tu horario 🙂';
-  }
-  if (/\b(horario|horarios|a\s+qu[eé]\s+hora)\b/i.test(ntext)) {
-    return 'Horario de visitas: *10:00–15:00* (lun–vie). Entregas y atención por WhatsApp todo el día.';
-  }
-  if (/\b(d[oó]nde\s+est[aá]n|ubicaci[oó]n|direcci[oó]n)\b/i.test(ntext)) {
-    return 'Tenemos presencia en Guanajuato (León y Celaya) y coordinamos entregas/servicios a nivel nacional.';
-  }
-  if (/\b(contacto|whats(app)?|tel[eé]fono|llamar|correo|email)\b/i.test(ntext)) {
-    return `Puedes escribirnos por aquí o al WhatsApp de soporte: ${env.SUPPORT_WHATSAPP || env.SUPPORT_PHONE_E164 || 'disponible en tu ficha de cliente'}.`;
-  }
-  return null;
 }
 
 /* ============================ Google Calendar ============================ */
@@ -1467,13 +1322,6 @@ async function upsertClienteByPhone(env, phone) {
 }
 
 /* ============================ Fechas & Horarios ============================ */
-/**
- * parseNaturalDateTime:
- * - Entiende hoy/mañana/días de semana (lun–dom).
- * - Horas “12:30”, “2pm”, “14”, “mediodía”.
- * - Devuelve { start, end } en ISO (duración 60 min).
- * - Usa TZ env.TZ || 'America/Mexico_City'.
- */
 function parseNaturalDateTime(text, env) {
   const tz = env.TZ || 'America/Mexico_City';
   const base = new Date(new Date().toLocaleString('en-US', { timeZone: tz }));
@@ -1490,7 +1338,7 @@ function parseNaturalDateTime(text, env) {
         const today = base.getDay();
         const want = i%7;
         let delta = (want - today + 7) % 7;
-        if (delta===0) delta = 7; // siguiente ocurrencia si “hoy” ya pasó
+        if (delta===0) delta = 7;
         targetDay = delta;
         break;
       }
@@ -1520,11 +1368,6 @@ function parseNaturalDateTime(text, env) {
   return { start, end };
 }
 
-/**
- * clampToWindow:
- * - Ajusta a ventana 10:00–15:00 local.
- * - Mantiene duración 60 min.
- */
 function clampToWindow(when, tz) {
   const start = new Date(when.start);
   const hours = Number(new Intl.DateTimeFormat('es-MX', { hour:'2-digit', hour12:false, timeZone:tz }).format(start));
@@ -1536,10 +1379,6 @@ function clampToWindow(when, tz) {
 }
 
 /* ============================ Dirección & Cliente (heurísticos) ============================ */
-/**
- * Extrae CP, calle, número, colonia si vienen sueltos en texto.
- * No sobreescribe campos ya capturados si se usan a nivel flujo.
- */
 function parseAddressLoose(text=''){
   const out = {};
   const mcp = text.match(/\bcp\s*(\d{5})\b/i) || text.match(/\b(\d{5})\b/);
@@ -1553,9 +1392,6 @@ function parseAddressLoose(text=''){
   return out;
 }
 
-/**
- * Busca nombre (con “soy”/“me llamo”) y email en un texto libre.
- */
 function parseCustomerText(text=''){
   const out = {};
   const email = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
@@ -1565,11 +1401,6 @@ function parseCustomerText(text=''){
   return out;
 }
 
-/**
- * cityFromCP:
- * - Consulta sepomex_cp (o vista equivalente) con el CP.
- * - Devuelve { cp, estado, municipio, ciudad } si existe.
- */
 async function cityFromCP(env, cp){
   try {
     const r = await sbGet(env, 'sepomex_cp', { query: `cp=eq.${encodeURIComponent(cp)}&select=cp,estado,municipio,ciudad&limit=1` });
@@ -1578,12 +1409,6 @@ async function cityFromCP(env, cp){
 }
 
 /* ============================ Persistencia de sesión (KV) ============================ */
-/**
- * loadSession/saveSession:
- * - Guarda la sesión en KV por 7 días (TTL).
- * - Clave: sess:<telefono>
- * - Estructura mínima: { from, stage, data:{} }
- */
 async function loadSession(env, id){
   try{
     const r = await env.COPIBOT_KV.get(`sess:${id}`, 'json');
@@ -1597,16 +1422,12 @@ async function saveSession(env, sess, now=new Date()){
     await env.COPIBOT_KV.put(
       `sess:${sess.from}`,
       JSON.stringify(sess),
-      { expirationTtl: 60*60*24*7 } // 7 días
+      { expirationTtl: 60*60*24*7 }
     );
   }catch{}
 }
 
-/**
- * promptedRecently:
- * - Antirepetición de prompts. Marca una llave temporal en session.data
- *   y devuelve true si ya se preguntó hace menos de ms.
- */
+/* ============================ Prompt gating ============================ */
 function promptedRecently(session, key, ms){
   const k = `prompted_${key}_at`;
   const last = session?.data?.[k] ? new Date(session.data[k]).getTime() : 0;
@@ -1616,10 +1437,6 @@ function promptedRecently(session, key, ms){
   return false;
 }
 
-/**
- * buildResumePrompt:
- * - Mensaje corto para retomar contexto según stage previo.
- */
 function buildResumePrompt(session){
   if (session.stage?.startsWith('sv_')) return 'seguimos con el soporte pendiente.';
   if (session.stage==='await_invoice') return 'estábamos por cotizar con/sin factura.';
@@ -1627,19 +1444,11 @@ function buildResumePrompt(session){
   return '¿en qué te ayudo?';
 }
 
-/* ============================ Utilidades HTTP ============================ */
+/* ============================ HTTP utils & cron ============================ */
 async function safeJson(req){ try{ return await req.json(); }catch{ return {}; } }
 function ok(s='ok'){ return new Response(s, { status: 200 }); }
-
+function json(obj){ return new Response(JSON.stringify(obj), { status:200, headers:{'Content-Type':'application/json'} }); }
 
 async function cronReminders(env){
-  // Espacio para recordatorios o tareas programadas
   return { ok:true, ts: Date.now() };
 }
-      
-};      
-
-
-
-
-
