@@ -334,19 +334,19 @@ function normalizeWithAliases(s=''){
 
 function fmtDate(d, tz){
   try{ return new Intl.DateTimeFormat('es-MX',{dateStyle:'full',timeZone:tz}).format(new Date(d)); }
-  catch{ return new Date(d).toLocaleDateString('es-MX'); }
+  catch(_){ return new Date(d).toLocaleDateString('es-MX'); }
 }
+
 function fmtTime(d, tz){
   try{ return new Intl.DateTimeFormat('es-MX',{timeStyle:'short',timeZone:tz}).format(new Date(d)); }
-  catch{ const x=new Date(d); return `${x.getHours()}:${String(x.getMinutes()).padStart(2,'0')}`; }
+  catch(_){ const x=new Date(d); return `${x.getHours()}:${String(x.getMinutes()).padStart(2,'0')}`; }
 }
+
 function formatMoneyMXN(n){
   const v=Number(n||0);
-  try{ return new Intl.NumberFormat('es-MX',{style:'currency',currency:'MXN',maximumFractionDigits:2}.format(v) )
-  catch{ return `$${v.toFixed(2)}`; }
+  try{ return new Intl.NumberFormat('es-MX',{style:'currency',currency:'MXN',maximumFractionDigits:2}).format(v); }
+  catch(_){ return `$${v.toFixed(2)}`; }
 }
-function numberOrZero(n){ const v=Number(n||0); return Number.isFinite(v)?v:0; }
-function priceWithIVA(n){ const v=Number(n||0); return `${formatMoneyMXN(v)} + IVA`; }
 
 /* ============================ IA ============================ */
 async function aiCall(env, messages, {json=false}={}) {
@@ -1559,6 +1559,7 @@ function json(obj){ return new Response(JSON.stringify(obj), { status:200, heade
 async function cronReminders(env){
   return { ok:true, ts: Date.now() };
 }
+
 
 
 
