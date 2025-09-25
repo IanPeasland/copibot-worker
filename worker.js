@@ -12,16 +12,29 @@ export default {
     try {
       const url = new URL(req.url);
 
-      // --- Webhook verify (WhatsApp) ---
-      if (req.method === 'GET' && url.pathname === '/') {
-        const mode = url.searchParams.get('hub.mode');
-        const token = url.searchParams.get('hub.verify_token');
-        const challenge = url.searchParams.get('hub.challenge');
-        if (mode === 'subscribe' && token === env.VERIFY_TOKEN) {
-          return new Response(challenge, { status: 200 });
-        }
-        return new Response('Forbidden', { status: 403 });
+      // --- Health simple (verifica que el worker corre y que ve variables) ---
+      if (req.method === 'GET' && url.pathname === '/health') {
+        const have = {
+          WA_TOKEN: !!env.WA_TOKEN,
+          PHONE_ID: !!env.PHONE_ID,
+          VERIFY_TOKEN: !!env.VERIFY_TOKEN,
+          SUPABASE_URL: !!env.SUPABASE_URL,
+          SUPABASE_ANON_KEY: !!env.SUPABASE_ANON_KEY,
+          TZ: env.TZ || 'n/a'
+        };
+        return new Response(JSON.stringify({ ok:true, have, now: new Date().toISOString() }), { status: 200, headers: { 'content-type':'application/json' } });
       }
+
+      // --- Self test: envía un WhatsApp a ?to=521XXXXXXXXXX para validar envío ---
+      if (url.pathname === '/selftest') {
+        if (req.method !== 'POST') return new Response('Use POST', { status: 405 });
+        const body = await safeJson(req);
+        const to = (url.searchParams.get('to') || body.to || '').trim();
+        if (!to) return new Response('Missing "to"', { status: 400 });
+        await sendWhatsAppText(env, to.startsWith('+') ? to : `+${to}`, `✅ CopiBot activo ${new Date().toLocaleString()} (selftest)`);
+        return ok('sent');
+      }
+
 
       // --- Manual cron ---
       if (req.method === 'POST' && url.pathname === '/cron') {
@@ -31,30 +44,42 @@ export default {
         return ok(`cron ok ${JSON.stringify(out)}`);
       }
 
-      // --- WhatsApp webhook principal ---
+            // --- WhatsApp webhook principal ---
       if (req.method === 'POST' && url.pathname === '/') {
         const payload = await safeJson(req);
-        const ctx = extractWhatsAppContext(payload);
-        if (!ctx) return ok('EVENT_RECEIVED');
 
-        // Desestructurar PRIMERO para evitar ReferenceError
+        // Trazas básicas
+        const trace_id = OBS_startTrace();
+        OBS_log(env, trace_id, 'webhook', 'payload_received');
+        OBS_logJSON(env, { trace_id, type:'wa_incoming', size: JSON.stringify(payload||{}).length });
+
+        const ctx = extractWhatsAppContext(payload);
+        if (!ctx) {
+          OBS_log(env, trace_id, 'webhook', 'no_message_context');
+          return ok('EVENT_RECEIVED');
+        }
+
         const { mid, from, fromE164, profileName, textRaw, msgType } = ctx;
         const originalText = (textRaw || '').trim();
         const lowered = originalText.toLowerCase();
         const ntext = normalizeWithAliases(originalText);
 
-        // —— Debug de entrada (si lo necesitas, no rompe flujo)
-        if (String(env.DEBUG_WEBHOOK || '').toLowerCase() === 'true') {
-          try { await sendWhatsAppText(env, fromE164, `✅ webhook ok: "${originalText.slice(0, 50)}"`); } catch {}
+        OBS_log(env, trace_id, 'webhook', 'ctx_parsed', { mid, from, fromE164, msgType, originalText });
+
+        // 🔊 Modo "eco" de depuración (activar con DEBUG_ECHO=true)
+        if ((env.DEBUG_ECHO || '').toString().toLowerCase() === 'true') {
+          await sendWhatsAppText(env, fromE164, `👋 Recibí tu mensaje: "${originalText.slice(0,160)}"`);
+          OBS_log(env, trace_id, 'debug_echo', 'replied');
           return ok('EVENT_RECEIVED');
         }
 
-        // ===== Session =====
+        // ===== Session (dual-key ya existente) =====
         const now = new Date();
-        let session = await loadSessionMulti(env, from, fromE164); // KV si existe; fallback Supabase
+        let session = await loadSessionMulti(env, from, fromE164); // dual-key KV
         session.data = session.data || {};
         session.stage = session.stage || 'idle';
         session.from = from;
+        session.data.trace_id = trace_id;
 
         // Nombre suave por profile
         if (profileName && !session?.data?.customer?.nombre) {
@@ -63,11 +88,15 @@ export default {
         }
 
         // Idempotencia por mid
-        if (session?.data?.last_mid && session.data.last_mid === mid) return ok('EVENT_RECEIVED');
+        if (session?.data?.last_mid && session.data.last_mid === mid) {
+          OBS_log(env, trace_id, 'idempotency', 'duplicate_mid_skip', { mid });
+          return ok('EVENT_RECEIVED');
+        }
         session.data.last_mid = mid;
 
-        // NO-TEXTO (excepto interactive -> ya se mapea a text)
+        // NO-TEXTO (excepto interactive mapeado a text por extractWhatsAppContext)
         if (msgType !== 'text') {
+          OBS_log(env, trace_id, 'non_text', msgType);
           await sendWhatsAppText(env, fromE164, `¿Podrías escribirme con palabras lo que necesitas? Así te ayudo más rápido 🙂`);
           await saveSessionMulti(env, session, from, fromE164);
           return ok('EVENT_RECEIVED');
@@ -77,12 +106,13 @@ export default {
          *  BARRERA 0: si veníamos en Soporte, Soporte tiene prioridad
          * ============================================================ */
         if (session.stage?.startsWith('sv_') || session?.data?.intent_lock === 'support') {
+          OBS_log(env, trace_id, 'flow', 'support_priority', { stage: session.stage });
           const handled = await handleSupport(env, session, fromE164, originalText, lowered, ntext, now, { intent: 'support' });
           return handled;
         }
 
         /* ============================================================
-         *  REGLA DURA: texto parece Marca+Modelo (sin palabra de compra)
+         *  REGLA DURA: texto con Marca+Modelo sin palabras de compra => soporte
          * ============================================================ */
         const SALES_WORDS = /\b(toner|t[óo]ner|cartucho|developer|refacci[oó]n|precio)\b/i;
         const pmGuard = parseBrandModel(ntext);
@@ -96,6 +126,7 @@ export default {
             if (pmGuard.modelo) session.data.sv.modelo = pmGuard.modelo;
           }
           await saveSessionMulti(env, session, from, fromE164);
+          OBS_log(env, trace_id, 'rule', 'brand_model_to_support', pmGuard);
           const handled = await handleSupport(env, session, fromE164, originalText, lowered, ntext, now, { intent: 'support' });
           return handled;
         }
@@ -106,6 +137,7 @@ export default {
           await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
           session.data.last_greet_at = now.toISOString();
           await saveSessionMulti(env, session, from, fromE164);
+          OBS_log(env, trace_id, 'flow', 'greet_replied');
           return ok('EVENT_RECEIVED');
         }
 
@@ -114,6 +146,7 @@ export default {
           session.data.intent_lock = 'support';
           await svCancel(env, session, fromE164);
           await saveSessionMulti(env, session, from, fromE164);
+          OBS_log(env, trace_id, 'support_cmd', 'cancel');
           return ok('EVENT_RECEIVED');
         }
         if (/\b(reprogram|mueve|cambia|modif)\w*/i.test(lowered)) {
@@ -122,6 +155,7 @@ export default {
             session.data.intent_lock = 'support';
             await svReschedule(env, session, fromE164, when);
             await saveSessionMulti(env, session, from, fromE164);
+            OBS_log(env, trace_id, 'support_cmd', 'reschedule');
             return ok('EVENT_RECEIVED');
           }
         }
@@ -129,6 +163,7 @@ export default {
           session.data.intent_lock = 'support';
           await svWhenIsMyVisit(env, session, fromE164);
           await saveSessionMulti(env, session, from, fromE164);
+          OBS_log(env, trace_id, 'support_cmd', 'when_is_my_visit');
           return ok('EVENT_RECEIVED');
         }
 
@@ -137,14 +172,14 @@ export default {
         if (supportIntent) {
           session.data.intent_lock = 'support';
           await saveSessionMulti(env, session, from, fromE164);
+          OBS_log(env, trace_id, 'intent', 'support');
           const handled = await handleSupport(env, session, fromE164, originalText, lowered, ntext, now, { intent: 'support' });
           return handled;
         }
 
         const salesIntent = RX_INV_Q.test(ntext) || (await intentIs(env, originalText, 'sales'));
-
-        /* =================== Ventas =================== */
         if (salesIntent) {
+          OBS_log(env, trace_id, 'intent', 'sales');
           const handled = await startSalesFromQuery(env, session, fromE164, originalText, ntext, now);
           return handled;
         }
@@ -152,7 +187,7 @@ export default {
         // ===== Stages de ventas activos =====
         if (session.stage === 'ask_qty') return await handleAskQty(env, session, fromE164, originalText, lowered, ntext, now);
         if (session.stage === 'cart_open') return await handleCartOpen(env, session, fromE164, originalText, lowered, ntext, now);
-        if (session.stage === 'await_invoice') return await handleAwaitInvoice(env, session, fromE164, lowered, now, originalText);
+        if (session.stage === 'await_invoice') return await handleAwaitInvoice(env, session, toE164, lowered, now, originalText);
         if (session.stage?.startsWith('collect_')) return await handleCollectSequential(env, session, fromE164, originalText, now);
 
         // ===== FAQs =====
@@ -160,6 +195,7 @@ export default {
         if (faqAns) {
           await sendWhatsAppText(env, fromE164, faqAns);
           await saveSessionMulti(env, session, from, fromE164);
+          OBS_log(env, trace_id, 'faq', 'answered');
           return ok('EVENT_RECEIVED');
         }
 
@@ -167,6 +203,7 @@ export default {
         const reply = await aiSmallTalk(env, session, 'fallback', originalText);
         await sendWhatsAppText(env, fromE164, reply);
         await saveSessionMulti(env, session, from, fromE164);
+        OBS_log(env, trace_id, 'fallback', 'replied');
         return ok('EVENT_RECEIVED');
       }
 
@@ -1780,3 +1817,4 @@ async function OBS_cronMetricsSnapshot(env){
 /* ========================================================================== */
 /* ============================== FIN BLOQUE 7/7 ============================ */
 /* ========================================================================== */
+
