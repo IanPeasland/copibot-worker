@@ -220,34 +220,25 @@ export default {
       await saveSession(env, session, now);
       return ok('EVENT_RECEIVED');
 
-    } // <-- cierra el if (req.method === 'POST' && url.pathname === '/')
+    } // cierra if (POST '/')
 
-    // — Rutas no coincidentes (GET/POST) → 404 controlado
+    // — Rutas no coincidentes → 404 controlado
     return new Response('Not found', { status: 404 });
 
   } catch (e) {
     console.error('Worker error', e);
-    // No dejar al usuario sin respuesta
-    try { 
-      const fromE164 = '+' + (extractWhatsAppContext(await safeJson(req))?.from || '');
-      if (fromE164.replace(/\D/g,'')) {
-        await sendWhatsAppText(env, fromE164, 'Tu mensaje me llegó, estoy teniendo un detalle técnico y te respondo enseguida 🙏');
+    try {
+      const body = await safeJson(req).catch(() => ({}));
+      const ctx = extractWhatsAppContext(body);
+      const toE164 = ctx?.from ? `+${ctx.from}` : null;
+      if (toE164) {
+        await sendWhatsAppText(env, toE164, 'Me llegó tu mensaje pero tuve un detalle técnico. Te respondo enseguida 🙏');
       }
     } catch {}
     return ok('EVENT_RECEIVED');
   }
 }
 
-
-  async scheduled(event, env, ctx) {
-    try {
-      const out = await cronReminders(env);
-      console.log('cron run', out);
-    } catch (e) {
-      console.error('cron error', e);
-    }
-  }
-};
 
 /* ============================ Regex / Intents ============================ */
 const RX_GREET = /^(hola+|buen[oa]s|qué onda|que tal|saludos|hey|buen dia|buenas|holi+)\b/i;
@@ -1631,6 +1622,7 @@ async function cronReminders(env){
   // Espacio para recordatorios o tareas programadas
   return { ok:true, ts: Date.now() };
 }
+
 
 
 
