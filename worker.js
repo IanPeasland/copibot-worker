@@ -1,6 +1,6 @@
 /**
  * CopiBot – Conversacional con IA + Ventas + Soporte Técnico + GCal + Supabase
- * Build: “Borbón-R7” - VERSIÓN SUPABASE SESSIONS
+ * Build: “Borbón-R7” - VERSIÓN SUPABASE SESSIONS - CORREGIDO
  */
 
 export default {
@@ -29,7 +29,10 @@ export default {
         GCAL_REFRESH_TOKEN: !!env.GCAL_REFRESH_TOKEN,
         TZ: env.TZ || 'America/Mexico_City'
       };
-      return json({ ok: true, have, now: new Date().toISOString() });
+      return new Response(JSON.stringify({ ok: true, have, now: new Date().toISOString() }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      });
     }
 
     // ===== Cron manual =====
@@ -37,7 +40,7 @@ export default {
       const sec = req.headers.get('x-cron-secret') || url.searchParams.get('secret');
       if (!sec || sec !== env.CRON_SECRET) return new Response('Forbidden', { status: 403 });
       const out = await cronReminders(env);
-      return ok(`cron ok ${JSON.stringify(out)}`);
+      return new Response(`cron ok ${JSON.stringify(out)}`, { status: 200 });
     }
 
     // ===== Webhook principal de WhatsApp =====
@@ -45,7 +48,7 @@ export default {
       try {
         const payload = await safeJson(req);
         const ctx = extractWhatsAppContext(payload);
-        if (!ctx) return ok('EVENT_RECEIVED');
+        if (!ctx) return new Response('EVENT_RECEIVED', { status: 200 });
 
         const { mid, from, fromE164, profileName, textRaw, msgType } = ctx;
         const text = (textRaw || '').trim();
@@ -66,7 +69,7 @@ export default {
 
         // Idempotencia por MID
         if (session?.data?.last_mid && session.data.last_mid === mid) {
-          return ok('EVENT_RECEIVED');
+          return new Response('EVENT_RECEIVED', { status: 200 });
         }
         session.data.last_mid = mid;
 
@@ -74,7 +77,7 @@ export default {
         if (msgType !== 'text') {
           await sendWhatsAppText(env, fromE164, '¿Podrías describirme con palabras lo que necesitas? Así te ayudo más rápido 🙂');
           await saveSession(env, session, now);
-          return ok('EVENT_RECEIVED');
+          return new Response('EVENT_RECEIVED', { status: 200 });
         }
 
         // Intenciones
@@ -94,25 +97,24 @@ export default {
         if (/\b(cancel(a|ar).*(cita|visita|servicio))\b/i.test(lowered)) {
           await svCancel(env, session, fromE164);
           await saveSession(env, session, now);
-          return ok('EVENT_RECEIVED');
+          return new Response('EVENT_RECEIVED', { status: 200 });
         }
         if (/\b(reprogram|mueve|cambia|modif)\w*/i.test(lowered)) {
           const when = parseNaturalDateTime(lowered, env);
           if (when?.start) {
             await svReschedule(env, session, fromE164, when);
             await saveSession(env, session, now);
-            return ok('EVENT_RECEIVED');
+            return new Response('EVENT_RECEIVED', { status: 200 });
           }
         }
         if (/\b(cu[aá]ndo|cuando).*(cita|visita|servicio)\b/i.test(lowered)) {
           await svWhenIsMyVisit(env, session, fromE164);
           await saveSession(env, session, now);
-          return ok('EVENT_RECEIVED');
+          return new Response('EVENT_RECEIVED', { status: 200 });
         }
 
         // ===== Saludo genuino =====
         if (isGreet) {
-          // NO eliminar last_candidate para mantener continuidad
           const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
           await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
           session.data.last_greet_at = now.toISOString();
@@ -121,10 +123,10 @@ export default {
             session.data.last_stage = session.stage;
             session.stage = 'await_choice';
             await saveSession(env, session, now);
-            return ok('EVENT_RECEIVED');
+            return new Response('EVENT_RECEIVED', { status: 200 });
           }
           await saveSession(env, session, now);
-          return ok('EVENT_RECEIVED');
+          return new Response('EVENT_RECEIVED', { status: 200 });
         }
 
         // ===== Menú "continuar o nuevo" =====
@@ -145,17 +147,17 @@ export default {
             await saveSession(env, session, now);
             const prompt = buildResumePrompt(session);
             await sendWhatsAppText(env, fromE164, `Va. ${prompt}`);
-            return ok('EVENT_RECEIVED');
+            return new Response('EVENT_RECEIVED', { status: 200 });
           }
           if (isStartNewish(lowered)) {
             session.data.last_stage = 'idle';
             session.stage = 'idle';
             await saveSession(env, session, now);
             await sendWhatsAppText(env, fromE164, 'Perfecto, cuéntame qué necesitas (soporte, cotización, etc.). 🙂');
-            return ok('EVENT_RECEIVED');
+            return new Response('EVENT_RECEIVED', { status: 200 });
           }
           await sendWhatsAppText(env, fromE164, '¿Prefieres continuar con lo pendiente o empezamos algo nuevo?');
-          return ok('EVENT_RECEIVED');
+          return new Response('EVENT_RECEIVED', { status: 200 });
         }
 
         // ===== Cambio a soporte si aplica =====
@@ -179,14 +181,14 @@ export default {
         if (faqAns) {
           await sendWhatsAppText(env, fromE164, faqAns);
           await saveSession(env, session, now);
-          return ok('EVENT_RECEIVED');
+          return new Response('EVENT_RECEIVED', { status: 200 });
         }
 
         // ===== Fallback IA breve =====
         const reply = await aiSmallTalk(env, session, 'fallback', text);
         await sendWhatsAppText(env, fromE164, reply);
         await saveSession(env, session, now);
-        return ok('EVENT_RECEIVED');
+        return new Response('EVENT_RECEIVED', { status: 200 });
 
       } catch (e) {
         console.error('Worker error', e);
@@ -198,14 +200,14 @@ export default {
           if (ctx2?.fromE164) {
             await sendWhatsAppText(env, ctx2.fromE164, 'Tu mensaje llegó, tuve un problema momentáneo pero ya estoy encima 🙂');
           }
-        } catch {}
-        return ok('EVENT_RECEIVED');
+        } catch (_) {}
+        return new Response('EVENT_RECEIVED', { status: 200 });
       }
     }
 
     // Cualquier otra ruta
     return new Response('Not found', { status: 404 });
-  }, // fetch
+  },
 
   // ===== CRON opcional =====
   async scheduled(event, env, ctx) {
@@ -216,7 +218,7 @@ export default {
       console.error('cron error', e);
     }
   }
-}; // export default
+};
 
 // ===== FUNCIONES CRÍTICAS =====
 
@@ -315,6 +317,8 @@ const toTitleCase = (s='') => s ? s.charAt(0).toUpperCase() + s.slice(1).toLower
 function normalizeBase(s=''){ return s.normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/\s+/g,' ').trim().toLowerCase(); }
 function clean(s=''){ return s.replace(/\s+/g,' ').trim(); }
 function truthy(v){ return v!==null && v!==undefined && String(v).trim()!==''; }
+function numberOrZero(n){ const v=Number(n||0); return Number.isFinite(v)?v:0; }
+function priceWithIVA(n){ const v=Number(n||0); return `${formatMoneyMXN(v)} + IVA`; }
 
 function normalizeWithAliases(s=''){
   const t = normalizeBase(s);
@@ -379,13 +383,14 @@ async function intentIs(env, text, expected){
   try{
     const out = await aiClassifyIntent(env, text);
     return out?.intent === expected;
-  }catch{return false;}
+  }catch(_){return false;}
 }
+
 async function aiClassifyIntent(env, text){
   if (!env.OPENAI_API_KEY && !env.OPENAI_KEY) return null;
   const sys = `Clasifica texto (es-MX) en JSON: { "intent": "support|sales|faq|smalltalk" }`;
   const out = await aiCall(env, [{role:'system', content: sys},{role:'user', content: text}], {json:true});
-  try { return JSON.parse(out||'{}'); } catch { return null; }
+  try { return JSON.parse(out||'{}'); } catch (_) { return null; }
 }
 
 /** IA opcional para reforzar NER de inventario */
@@ -393,7 +398,7 @@ async function aiExtractTonerQuery(env, text){
   if (!env.OPENAI_API_KEY && !env.OPENAI_KEY) return null;
   const sys = `Extrae de una consulta (es-MX) sobre tóners los campos { "familia": "versant|docucolor|primelink|versalink|altalink|apeos|c70|", "color": "yellow|magenta|cyan|black|null", "subfamilia": "string|null", "cantidad": "number|null" } en JSON. No inventes.`;
   const out = await aiCall(env, [{role:'system', content: sys},{role:'user', content: text}], {json:true});
-  try { return JSON.parse(out||'{}'); } catch { return null; }
+  try { return JSON.parse(out||'{}'); } catch (_) { return null; }
 }
 
 /* ============================ WhatsApp ============================ */
@@ -508,7 +513,7 @@ function renderProducto(p) {
   const marca = p.marca ? `\nMarca: ${p.marca}` : '';
   const s = numberOrZero(p.stock);
   const stockLine = s > 0 ? `${s} pzas en stock` : `0 pzas — *sobre pedido*`;
-  return `1. ${p.nombre}${marga}${sku}\n${precio}\n${stockLine}\n\nEste suele ser el indicado para tu equipo.`;
+  return `1. ${p.nombre}${marca}${sku}\n${precio}\n${stockLine}\n\nEste suele ser el indicado para tu equipo.`;
 }
 
 async function handleAskQty(env, session, toE164, text, lowered, ntext, now){
@@ -517,7 +522,7 @@ async function handleAskQty(env, session, toE164, text, lowered, ntext, now){
     session.stage = 'cart_open';
     await saveSession(env, session, now);
     await sendWhatsAppText(env, toE164, 'No alcancé a ver el artículo. ¿Lo repetimos o buscas otro? 🙂');
-    return ok('EVENT_RECEIVED');
+    return new Response('EVENT_RECEIVED', { status: 200 });
   }
   const qty = parseQty(lowered, 1);
   addWithStockSplit(session, cand, qty);
@@ -527,7 +532,7 @@ async function handleAskQty(env, session, toE164, text, lowered, ntext, now){
   const bo = Math.max(0, qty - Math.min(s, qty));
   const nota = bo>0 ? `\n(De ${qty}, ${Math.min(s,qty)} en stock y ${bo} sobre pedido)` : '';
   await sendWhatsAppText(env, toE164, `Añadí 🛒\n• ${cand.nombre} x ${qty} ${priceWithIVA(cand.precio)}${nota}\n\n¿Deseas agregar algo más o *finalizamos*?`);
-  return ok('EVENT_RECEIVED');
+  return new Response('EVENT_RECEIVED', { status: 200 });
 }
 
 async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
@@ -541,7 +546,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     session.stage = 'await_invoice';
     await saveSession(env, session, now);
     await sendWhatsAppText(env, toE164, `Perfecto 🙌 ¿La cotizamos *con factura* o *sin factura*?`);
-    return ok('EVENT_RECEIVED');
+    return new Response('EVENT_RECEIVED', { status: 200 });
   }
 
   const RX_YES_CONFIRM = /\b(s[ií]|sí|si|claro|va|dale|correcto|ok|afirmativo|hazlo|agr[eé]ga(lo)?|añade|m[eé]te|pon(lo)?)\b/i;
@@ -552,7 +557,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
       await saveSession(env, session, now);
       const s = numberOrZero(c.stock);
       await sendWhatsAppText(env, toE164, `De acuerdo. ¿Cuántas *piezas* necesitas? (hay ${s} en stock; el resto iría *sobre pedido*)`);
-      return ok('EVENT_RECEIVED');
+      return new Response('EVENT_RECEIVED', { status: 200 });
     }
   }
 
@@ -562,7 +567,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     const c = session.data?.last_candidate;
     const s = numberOrZero(c?.stock);
     await sendWhatsAppText(env, toE164, `Perfecto. ¿Cuántas *piezas* en total? (hay ${s} en stock; el resto iría *sobre pedido*)`);
-    return ok('EVENT_RECEIVED');
+    return new Response('EVENT_RECEIVED', { status: 200 });
   }
 
   if (RX_ADD_ITEM.test(lowered) || RX_INV_Q.test(ntext)) {
@@ -578,7 +583,7 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
       await saveSession(env, session, now);
       const s = numberOrZero(best.stock);
       await sendWhatsAppText(env, toE164, `${renderProducto(best)}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; hay ${s} en stock y el resto sería *sobre pedido*.`);
-      return ok('EVENT_RECEIVED');
+      return new Response('EVENT_RECEIVED', { status: 200 });
     } else {
       const hints = extractModelHints(enrichedQ);
       if (hints.family) {
@@ -592,18 +597,18 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
         session.stage = 'ask_qty';
         await saveSession(env, session, now);
         await sendWhatsAppText(env, toE164, `Ese modelo se maneja *sobre pedido*. Si deseas, indícame *cuántas piezas* y lo agrego al carrito; también puedo buscar *compatibles* si lo prefieres.`);
-        return ok('EVENT_RECEIVED');
+        return new Response('EVENT_RECEIVED', { status: 200 });
       }
       await sendWhatsAppText(env, toE164, `No encontré una coincidencia directa 😕. ¿Busco otra opción o lo revisa un asesor?`);
       await notifySupport(env, `Inventario sin match. ${toE164}: ${text}`);
       await saveSession(env, session, now);
-      return ok('EVENT_RECEIVED');
+      return new Response('EVENT_RECEIVED', { status: 200 });
     }
   }
 
   await sendWhatsAppText(env, toE164, `Te leo 🙂. Puedo agregar el artículo visto, buscar otro o *finalizar* si ya está completo.`);
   await saveSession(env, session, now);
-  return ok('EVENT_RECEIVED');
+  return new Response('EVENT_RECEIVED', { status: 200 });
 }
 
 async function handleAwaitInvoice(env, session, toE164, lowered, now, originalText='') {
@@ -611,7 +616,7 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now, originalTe
     session.stage = 'idle';
     await saveSession(env, session, now);
     await sendWhatsAppText(env, toE164, `Perfecto, quedo al pendiente. Si necesitas algo más, aquí estoy 🙂`);
-    return ok('EVENT_RECEIVED');
+    return new Response('EVENT_RECEIVED', { status: 200 });
   }
 
   const saysNo = /\b(sin(\s+factura)?|sin|no)\b/i.test(lowered);
@@ -627,7 +632,7 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now, originalTe
       await sendWhatsAppText(env, toE164, `Por cierto, ¿la quieres *con factura* o *sin factura*?`);
     }
     await saveSession(env, session, now);
-    return ok('EVENT_RECEIVED');
+    return new Response('EVENT_RECEIVED', { status: 200 });
   }
 
   if (saysYes || saysNo) {
@@ -639,7 +644,7 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now, originalTe
       session.stage = `collect_${need}`;
       await saveSession(env, session, now);
       await sendWhatsAppText(env, toE164, `¿${LABEL[need]}?`);
-      return ok('EVENT_RECEIVED');
+      return new Response('EVENT_RECEIVED', { status: 200 });
     }
     const res = await createOrderFromSession(env, session, toE164);
     if (res?.ok) {
@@ -653,14 +658,14 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now, originalTe
     session.data.cart = [];
     await saveSession(env, session, now);
     await sendWhatsAppText(env, toE164, `¿Te ayudo con algo más en este momento? (Sí / No)`);
-    return ok('EVENT_RECEIVED');
+    return new Response('EVENT_RECEIVED', { status: 200 });
   }
 
   if (!promptedRecently(session, 'invoice', 2*60*1000)) {
     await sendWhatsAppText(env, toE164, `¿La quieres con factura o sin factura?`);
   }
   await saveSession(env, session, now);
-  return ok('EVENT_RECEIVED');
+  return new Response('EVENT_RECEIVED', { status: 200 });
 }
 
 /* Captura UNO A UNO (ventas) */
@@ -700,7 +705,7 @@ async function handleCollectSequential(env, session, toE164, text, now){
     session.stage = `collect_${nextField}`;
     await saveSession(env, session, now);
     await sendWhatsAppText(env, toE164, `¿${LABEL[nextField]}?`);
-    return ok('EVENT_RECEIVED');
+    return new Response('EVENT_RECEIVED', { status: 200 });
   }
   const res = await createOrderFromSession(env, session, toE164);
   if (res?.ok) {
@@ -714,7 +719,7 @@ async function handleCollectSequential(env, session, toE164, text, now){
   session.data.cart = [];
   await saveSession(env, session, now);
   await sendWhatsAppText(env, toE164, `¿Puedo ayudarte con algo más? (Sí / No)`);
-  return ok('EVENT_RECEIVED');
+  return new Response('EVENT_RECEIVED', { status: 200 });
 }
 
 function summaryCart(cart = []) { return cart.map(i => `${i.product?.nombre} x ${i.qty}${i.backorder ? ' (sobre pedido)' : ''}`).join('; '); }
@@ -878,7 +883,7 @@ async function startSalesFromQuery(env, session, toE164, text, ntext, now){
     await saveSession(env, session, now);
     const s = numberOrZero(best.stock);
     await sendWhatsAppText(env, toE164, `${renderProducto(best)}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; hay ${s} en stock y el resto sería *sobre pedido*.`);
-    return ok('EVENT_RECEIVED');
+    return new Response('EVENT_RECEIVED', { status: 200 });
   }
 
   if (!best && hints.family) {
@@ -892,13 +897,13 @@ async function startSalesFromQuery(env, session, toE164, text, ntext, now){
     session.stage = 'ask_qty';
     await saveSession(env, session, now);
     await sendWhatsAppText(env, toE164, `Ese modelo se maneja *sobre pedido*. Dime *cuántas piezas* y lo agrego; si deseas, también busco *compatibles*.`);
-    return ok('EVENT_RECEIVED');
+    return new Response('EVENT_RECEIVED', { status: 200 });
   }
 
   await sendWhatsAppText(env, toE164, `No encontré una coincidencia directa 😕. Te conecto con un asesor…`);
   await notifySupport(env, `Inventario sin match. +${session.from}: ${text}`);
   await saveSession(env, session, now);
-  return ok('EVENT_RECEIVED');
+  return new Response('EVENT_RECEIVED', { status: 200 });
 }
 
 /* ============================ Cliente & Pedido ============================ */
@@ -937,7 +942,7 @@ async function createOrderFromSession(env, session, toE164) {
         query: `select=id,telefono,email&or=(telefono.eq.${session.from},email.eq.${encodeURIComponent(c.email || '')})&limit=1`
       });
       if (exist && exist[0]) cliente_id = exist[0].id;
-    } catch {}
+    } catch (_) {}
 
     // Crear si no existe
     if (!cliente_id) {
@@ -1247,7 +1252,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
         email: '¿Cuál es tu *email* para enviarte confirmaciones?'
       };
       await sendWhatsAppText(env, toE164, Q[needed[0]]);
-      return ok('EVENT_RECEIVED');
+      return new Response('EVENT_RECEIVED', { status: 200 });
     }
 
     // === Agenda (GCal) + OS ===
@@ -1258,7 +1263,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     const chosen = clampToWindow(sv.when, tz);
 
     const cliente_id = await upsertClienteByPhone(env, session.from);
-    try { await ensureClienteFields(env, cliente_id, { nombre: sv.nombre, email: sv.email, calle: sv.calle, numero: sv.numero, colonia: sv.colonia, ciudad: sv.ciudad, estado: sv.estado, cp: sv.cp }); } catch {}
+    try { await ensureClienteFields(env, cliente_id, { nombre: sv.nombre, email: sv.email, calle: sv.calle, numero: sv.numero, colonia: sv.colonia, ciudad: sv.ciudad, estado: sv.estado, cp: sv.cp }); } catch (_) {}
 
     let slot = chosen, event = null, calName = '';
     if (cal && env.GCAL_REFRESH_TOKEN && env.GCAL_CLIENT_ID && env.GCAL_CLIENT_SECRET) {
@@ -1302,17 +1307,17 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     session.data.sv.os_id = osId;
     session.data.sv.gcal_event_id = event?.id || null;
     await saveSession(env, session, now);
-    return ok('EVENT_RECEIVED');
+    return new Response('EVENT_RECEIVED', { status: 200 });
 
   } catch (e) {
     console.warn('[SUPPORT] handleSupport catch', e);
     try{
       const need = session?.data?.sv_need_next || 'modelo';
       await sendWhatsAppText(env, toE164, `Gracias por la info. Para avanzar, ¿${displayFieldSupport(need)}?`);
-    }catch{
+    }catch(_){
       await sendWhatsAppText(env, toE164, `Tomé tu solicitud de soporte. Si te parece, seguimos con los datos para agendar o te contacto enseguida 🙌`);
     }
-    return ok('EVENT_RECEIVED');
+    return new Response('EVENT_RECEIVED', { status: 200 });
   }
 }
 
@@ -1434,7 +1439,7 @@ async function getLastOpenOS(env, phone) {
       query: `select=id,estado,ventana_inicio,ventana_fin,calendar_id,gcal_event_id,cliente_id&cliente_id=eq.${cid}&order=ventana_inicio.desc&limit=1`
     });
     if (r && r[0] && ['agendado','reprogramado','confirmado'].includes(r[0].estado)) return r[0];
-  } catch {}
+  } catch (_) {}
   return null;
 }
 
@@ -1531,7 +1536,7 @@ async function cityFromCP(env, cp){
   try {
     const r = await sbGet(env, 'sepomex_cp', { query: `cp=eq.${encodeURIComponent(cp)}&select=cp,estado,municipio,ciudad&limit=1` });
     return r?.[0] || null;
-  } catch { return null; }
+  } catch (_) { return null; }
 }
 
 /* ============================ Prompt gating ============================ */
@@ -1552,14 +1557,8 @@ function buildResumePrompt(session){
 }
 
 /* ============================ HTTP utils & cron ============================ */
-async function safeJson(req){ try{ return await req.json(); }catch{ return {}; } }
-function ok(s='ok'){ return new Response(s, { status: 200 }); }
-function json(obj){ return new Response(JSON.stringify(obj), { status:200, headers:{'Content-Type':'application/json'} }); }
+async function safeJson(req){ try{ return await req.json(); }catch(_){ return {}; } }
 
 async function cronReminders(env){
   return { ok:true, ts: Date.now() };
 }
-
-
-
-
