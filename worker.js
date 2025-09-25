@@ -122,34 +122,57 @@ export default {
           return await handleCollectSequential(env, session, fromE164, text, now);
         }
 
+{
+  const looksGreet  = RX_GREET.test(lowered);
+  const isGreetOnly =
+    looksGreet &&
+    !RX_INV_Q.test(ntext) &&
+    !isSupportIntent(ntext) &&
+    lowered.replace(RX_GREET, '').trim().length < 2;
 
-        // Saludo
-        const isGreet = RX_GREET.test(lowered);
-// sólo saludamos si NO estamos en mitad de un flujo de ventas/soporte
-        const inFlow = session.stage === 'ask_qty' || session.stage === 'cart_open' ||
-               session.stage === 'await_invoice' || (session.stage || '').startsWith('collect_') ||
-               (session.stage || '').startsWith('sv_');
+  if (isGreetOnly) {
+    if (session?.data?.last_candidate) delete session.data.last_candidate;
+    if (session?.data?.pending_query) delete session.data.pending_query;
 
-        if (isGreet && !inFlow) {
-  // ... (tu saludo tal cual)
+    const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
+    await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
+    session.data.last_greet_at = now.toISOString();
+
+    if (session.stage !== 'idle') {
+      session.data.last_stage = session.stage;
+      session.stage = 'await_choice';
+    }
+    await saveSession(env, session, now);
+    return ok('EVENT_RECEIVED');
+  }
 }
 
-          if (session?.data?.last_candidate) delete session.data.last_candidate;
-          if (session?.data?.pending_query) delete session.data.pending_query;
+// ===== Saludo (solo si es realmente un saludo) =====
+const looksGreet = RX_GREET.test(lowered);
+// Es "solo saludo" si NO contiene intención de ventas ni de soporte y es corto.
+const isGreetOnly =
+  looksGreet &&
+  !RX_INV_Q.test(ntext) &&
+  !isSupportIntent(ntext) &&
+  lowered.replace(RX_GREET, '').trim().length < 2;
 
-          const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
-          await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
-          session.data.last_greet_at = now.toISOString();
+if (isGreetOnly) {
+  if (session?.data?.last_candidate) delete session.data.last_candidate;
+  if (session?.data?.pending_query) delete session.data.pending_query;
 
-          if (session.stage !== 'idle') {
-            session.data.last_stage = session.stage;
-            session.stage = 'await_choice';
-            await saveSession(env, session, now);
-            return ok('EVENT_RECEIVED');
-          }
-          await saveSession(env, session, now);
-          return ok('EVENT_RECEIVED');
-        }
+  const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
+  await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
+  session.data.last_greet_at = now.toISOString();
+
+  if (session.stage !== 'idle') {
+    session.data.last_stage = session.stage;
+    session.stage = 'await_choice';
+  }
+  await saveSession(env, session, now);
+  return ok('EVENT_RECEIVED');
+}
+// si NO es solo saludo, seguimos y dejamos que ventas/soporte procesen el texto
+
 
         // Continuar/retomar
         if (session.stage === 'await_choice') {
@@ -1622,6 +1645,7 @@ async function cronReminders(env){
   // Espacio para recordatorios o tareas programadas
   return { ok:true, ts: Date.now() };
 }
+
 
 
 
