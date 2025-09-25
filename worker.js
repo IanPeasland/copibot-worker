@@ -59,12 +59,6 @@ if (req.method === 'POST' && url.pathname === '/') {
     await saveSessionMulti(env, session, from, fromE164);
     return ok('EVENT_RECEIVED');
   }
-  
-        const { mid, from, fromE164, profileName, textRaw, msgType } = ctx;
-        const originalText = (textRaw || '').trim();
-        const lowered = originalText.toLowerCase();
-        const ntext = normalizeWithAliases(originalText);
-
         // ===== Session =====
         const now = new Date();
         let session = await loadSessionMulti(env, from, fromE164); // dual-key
@@ -1547,6 +1541,7 @@ async function cronReminders(env){
   // - Recordar pedidos con estado “nuevo” > 48h.
   return { ok: true, ts: new Date().toISOString() };
 }
+
 
 
 
