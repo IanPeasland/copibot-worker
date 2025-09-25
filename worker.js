@@ -206,39 +206,38 @@ export default {
         if (session.stage === 'await_invoice') return await handleAwaitInvoice(env, session, fromE164, lowered, now, text);
         if (session.stage?.startsWith('collect_')) return await handleCollectSequential(env, session, fromE164, text, now);
 
-        // FAQs rápidas
-        const faqAns = await maybeFAQ(env, ntext);
-        if (faqAns) {
-          await sendWhatsAppText(env, fromE164, faqAns);
-          await saveSession(env, session, now);
-          return ok('EVENT_RECEIVED');
-        }
+      // ===== FAQs rápidas por company_info o heurísticas =====
+      const faqAns = await maybeFAQ(env, ntext);
+      if (faqAns) {
+        await sendWhatsAppText(env, fromE164, faqAns);
+        await saveSession(env, session, now);
+        return ok('EVENT_RECEIVED');
+      }
 
       // ===== Fallback IA breve =====
       const reply = await aiSmallTalk(env, session, 'fallback', text);
       await sendWhatsAppText(env, fromE164, reply);
       await saveSession(env, session, now);
       return ok('EVENT_RECEIVED');
+    } catch (e) {
+      console.error('Worker error', e);
+      try {
+        // intenta avisar al usuario de manera amable
+        const body = await safeJson(req).catch(() => ({}));
+        const value = body?.entry?.[0]?.changes?.[0]?.value;
+        const fromMsg = value?.messages?.[0]?.from;
+        const toE164 = fromMsg ? `+${fromMsg}` : (new URL(req.url).searchParams.get('to') || env.SUPPORT_PHONE_E164 || null);
+        if (toE164) {
+          await sendWhatsAppText(env, toE164, 'Tuvimos un problema procesando tu mensaje. Ya lo reviso un asesor 🙏');
+        }
+      } catch { /* no-op */ }
+      // Nunca dejamos al usuario sin respuesta
+      return ok('EVENT_RECEIVED');
+    }
 
-    } // cierra if (POST '/')
-
-    // — Rutas no coincidentes → 404 controlado
+    // --- Rutas no coincidentes → 404 controlado (fuera del try/catch) ---
     return new Response('Not found', { status: 404 });
-
-  } catch (e) {
-    console.error('Worker error', e);
-    try {
-      const body = await safeJson(req).catch(() => ({}));
-      const ctx = extractWhatsAppContext(body);
-      const toE164 = ctx?.from ? `+${ctx.from}` : null;
-      if (toE164) {
-        await sendWhatsAppText(env, toE164, 'Me llegó tu mensaje pero tuve un detalle técnico. Te respondo enseguida 🙏');
-      }
-    } catch {}
-    return ok('EVENT_RECEIVED');
-  }
-}
-
+  }, // <-- cierra fetch
 
 /* ============================ Regex / Intents ============================ */
 const RX_GREET = /^(hola+|buen[oa]s|qué onda|que tal|saludos|hey|buen dia|buenas|holi+)\b/i;
@@ -1622,6 +1621,7 @@ async function cronReminders(env){
   // Espacio para recordatorios o tareas programadas
   return { ok:true, ts: Date.now() };
 }
+
 
 
 
