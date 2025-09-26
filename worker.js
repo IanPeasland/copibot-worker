@@ -357,19 +357,40 @@ async function aiExtractTonerQuery(env, text){
 /* ============================ Sesión (Supabase) =========================== */
 /* ========================================================================== */
 
+/* ============================ Persistencia de sesión (Supabase - 90 días) ============================ */
+/*  FIX: siempre leemos la fila más reciente por last_updated/created_at para no perder la etapa.     */
+
 async function loadSession(env, phone) {
   try {
-    const r = await sbGet(env, 'wa_session', { query: `select=session_data,created_at&phone=eq.${phone}&limit=1` });
-    if (r && r[0] && r[0].session_data) {
+    const r = await sbGet(env, 'wa_session', {
+      // Tomamos SIEMPRE la sesión más nueva
+      query: `select=session_data,created_at,last_updated&phone=eq.${phone}&order=last_updated.desc,created_at.desc&limit=1`
+    });
+
+    if (Array.isArray(r) && r[0] && r[0].session_data) {
       const sessionData = r[0].session_data;
-      const createdAt = new Date(r[0].created_at);
+
+      // Si la sesión es muy vieja (>90 días), reseteamos a idle pero conservamos nombre si existe
+      const createdAt = new Date(r[0].created_at || r[0].last_updated || Date.now());
       const now = new Date();
       const daysDiff = (now - createdAt) / (1000 * 60 * 60 * 24);
       if (daysDiff > 90) {
-        return { from: phone, stage: 'idle', data: { customer: sessionData.data?.customer || {} } };
+        return {
+          from: phone,
+          stage: 'idle',
+          data: { customer: sessionData?.data?.customer || {} }
+        };
       }
-      return sessionData;
+
+      // Normalizamos el shape esperado
+      return {
+        from: phone,
+        stage: sessionData.stage || 'idle',
+        data: sessionData.data || {}
+      };
     }
+
+    // Sesión nueva
     return { from: phone, stage: 'idle', data: {} };
   } catch (e) {
     console.warn('loadSession error', e);
@@ -381,16 +402,21 @@ async function saveSession(env, session, now = new Date()) {
   try {
     const sessionData = {
       from: session.from,
-      stage: session.stage,
+      stage: session.stage || 'idle',
       data: session.data || {},
       last_updated: now.toISOString()
     };
+
+    // Intento de upsert por phone; si no hay UNIQUE en DB, aún así guardamos y luego loadSession tomará la más reciente
     await sbUpsert(env, 'wa_session', [{
       phone: session.from,
       session_data: sessionData,
       last_updated: now.toISOString(),
       created_at: session.data?.created_at || now.toISOString()
-    }], { onConflict: 'phone', returning: 'minimal' });
+    }], {
+      onConflict: 'phone',
+      returning: 'minimal'
+    });
   } catch (e) {
     console.warn('saveSession error', e);
   }
@@ -1619,5 +1645,6 @@ function extractWhatsAppContext(payload) {
     return null;
   }
 }
+
 
 
