@@ -1,6 +1,10 @@
 /**
  * CopiBot – Conversacional con IA + Ventas + Soporte Técnico + GCal + Supabase
- * Build: “Borbón-R8” – Sesión Supabase + FastPath Cantidad
+ * Build: “Borbón-R8.1” – Adaptado a wa_session(from,stage,data,updated_at,expires_at)
+ * Cambios clave:
+ *  - Persistencia compatible con esquema actual (from/stage/data/updated_at).
+ *  - Anti re-orden por timestamp (data.last_ts) + idempotencia por mid.
+ *  - Saludo no degrada etapas críticas; fast-path de cantidad también en await_choice.
  */
 
 export default {
@@ -50,22 +54,31 @@ export default {
         const ctx = extractWhatsAppContext(payload);
         if (!ctx) return ok('EVENT_RECEIVED');
 
-        const { mid, from, fromE164, profileName, textRaw, msgType } = ctx;
+        const { mid, from, fromE164, profileName, textRaw, msgType, ts } = ctx;
         const text = (textRaw || '').trim();
         const lowered = text.toLowerCase();
         const ntext = normalizeWithAliases(text);
 
-        // Sesión desde Supabase (90 días)
+        // Sesión desde Supabase
         const now = new Date();
-        let session = await loadSession(env, from);
+        let session = await loadSession(env, from); // <-- lee from/stage/data/updated_at
         session.data  = session.data  || {};
         session.stage = session.stage || 'idle';
         session.from  = from;
 
+        // Autocompletar nombre si lo tenemos
         if (profileName && !session?.data?.customer?.nombre) {
           session.data.customer = session.data.customer || {};
           session.data.customer.nombre = toTitleCase(firstWord(profileName));
         }
+
+        // ==== Anti re-orden por timestamp (descarta atrasados) ====
+        const msgTs = Number(ts || Date.now());
+        const lastTs = Number(session?.data?.last_ts || 0);
+        if (lastTs && msgTs <= lastTs) {
+          return ok('EVENT_RECEIVED');
+        }
+        session.data.last_ts = msgTs;
 
         // Idempotencia por MID
         if (session?.data?.last_mid && session.data.last_mid === mid) {
@@ -81,8 +94,6 @@ export default {
         }
 
         // ======= FAST-PATH: cantidad aun si se perdió la etapa =======
-        // Si hay un candidato reciente y el usuario dice "1", "uno", "quiero 2", etc.,
-        // procesamos como ask_qty (evita que caiga a saludo/fallback si la etapa no se guardó).
         if (session?.data?.last_candidate && looksLikeQuantity(lowered)) {
           return await handleAskQty(env, session, fromE164, text, lowered, ntext, now);
         }
@@ -92,7 +103,7 @@ export default {
         const salesIntent   = RX_INV_Q.test(ntext)   || (await intentIs(env, text, 'sales'));
         const isGreet       = RX_GREET.test(lowered);
 
-        // ===== Prioridad: etapas de ventas activas ANTES que saludo =====
+        // ===== Etapas de ventas activas =====
         if (session.stage === 'ask_qty')       return await handleAskQty(env, session, fromE164, text, lowered, ntext, now);
         if (session.stage === 'cart_open')     return await handleCartOpen(env, session, fromE164, text, lowered, ntext, now);
         if (session.stage === 'await_invoice') return await handleAwaitInvoice(env, session, fromE164, lowered, now, text);
@@ -120,17 +131,16 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // ===== Saludo genuino =====
+        // ===== Saludo genuino (NO degrada etapas críticas) =====
+        const CRITICAL_STAGES = ['ask_qty','cart_open','await_invoice','sv_collect'];
         if (isGreet) {
           const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
           await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
           session.data.last_greet_at = now.toISOString();
 
-          if (session.stage !== 'idle') {
+          if (session.stage && session.stage !== 'idle' && !CRITICAL_STAGES.includes(session.stage)) {
             session.data.last_stage = session.stage;
             session.stage = 'await_choice';
-            await saveSession(env, session, now);
-            return ok('EVENT_RECEIVED');
           }
           await saveSession(env, session, now);
           return ok('EVENT_RECEIVED');
@@ -138,6 +148,13 @@ export default {
 
         // ===== Menú "continuar o nuevo" =====
         if (session.stage === 'await_choice') {
+          // Fast-path: si hay last_candidate y parece cantidad → tratar como ask_qty
+          if (session?.data?.last_candidate && looksLikeQuantity(lowered)) {
+            session.stage = 'ask_qty';
+            await saveSession(env, session, now);
+            return await handleAskQty(env, session, fromE164, text, lowered, ntext, now);
+          }
+
           if (supportIntent) {
             session.stage = 'sv_collect';
             await saveSession(env, session, now);
@@ -357,40 +374,24 @@ async function aiExtractTonerQuery(env, text){
 /* ============================ Sesión (Supabase) =========================== */
 /* ========================================================================== */
 
-/* ============================ Persistencia de sesión (Supabase - 90 días) ============================ */
-/*  FIX: siempre leemos la fila más reciente por last_updated/created_at para no perder la etapa.     */
-
+/** Lee sesión del esquema actual: wa_session(from, stage, data, updated_at, expires_at) */
 async function loadSession(env, phone) {
   try {
     const r = await sbGet(env, 'wa_session', {
-      // Tomamos SIEMPRE la sesión más nueva
-      query: `select=session_data,created_at,last_updated&phone=eq.${phone}&order=last_updated.desc,created_at.desc&limit=1`
+      query:
+        `select=from,stage,data,updated_at,expires_at&` +
+        `from=eq.${encodeURIComponent(phone)}&` +
+        `order=updated_at.desc&limit=1`
     });
 
-    if (Array.isArray(r) && r[0] && r[0].session_data) {
-      const sessionData = r[0].session_data;
-
-      // Si la sesión es muy vieja (>90 días), reseteamos a idle pero conservamos nombre si existe
-      const createdAt = new Date(r[0].created_at || r[0].last_updated || Date.now());
-      const now = new Date();
-      const daysDiff = (now - createdAt) / (1000 * 60 * 60 * 24);
-      if (daysDiff > 90) {
-        return {
-          from: phone,
-          stage: 'idle',
-          data: { customer: sessionData?.data?.customer || {} }
-        };
-      }
-
-      // Normalizamos el shape esperado
+    if (Array.isArray(r) && r[0]) {
       return {
-        from: phone,
-        stage: sessionData.stage || 'idle',
-        data: sessionData.data || {}
+        from: r[0].from,
+        stage: r[0].stage || 'idle',
+        data:  r[0].data  || {}
       };
     }
 
-    // Sesión nueva
     return { from: phone, stage: 'idle', data: {} };
   } catch (e) {
     console.warn('loadSession error', e);
@@ -398,23 +399,17 @@ async function loadSession(env, phone) {
   }
 }
 
+/** Guarda sesión al esquema actual (upsert por from) */
 async function saveSession(env, session, now = new Date()) {
   try {
-    const sessionData = {
+    await sbUpsert(env, 'wa_session', [{
       from: session.from,
       stage: session.stage || 'idle',
-      data: session.data || {},
-      last_updated: now.toISOString()
-    };
-
-    // Intento de upsert por phone; si no hay UNIQUE en DB, aún así guardamos y luego loadSession tomará la más reciente
-    await sbUpsert(env, 'wa_session', [{
-      phone: session.from,
-      session_data: sessionData,
-      last_updated: now.toISOString(),
-      created_at: session.data?.created_at || now.toISOString()
+      data:  session.data  || {},
+      updated_at: now.toISOString()
+      // expires_at opcional si manejas TTL
     }], {
-      onConflict: 'phone',
+      onConflict: 'from',
       returning: 'minimal'
     });
   } catch (e) {
@@ -426,7 +421,6 @@ async function saveSession(env, session, now = new Date()) {
 /* ============================ Cantidades robustas ========================= */
 /* ========================================================================== */
 
-// Palabras comunes → número
 const NUM_WORDS = {
   'cero':0, 'una':1, 'uno':1, 'un':1, 'dos':2, 'tres':3, 'cuatro':4, 'cinco':5, 'seis':6, 'siete':7, 'ocho':8, 'nueve':9, 'diez':10,
   'once':11, 'doce':12, 'docena':12, 'media':0.5, 'media docena':6
@@ -444,18 +438,15 @@ const RX_WANT_QTY = /\b(quiero|ocupo|me llevo|pon|agrega|añade|mete|dame|manda|
 function parseQty(text, fallback = 1) {
   const t = normalizeBase(text);
 
-  // “quiero 2”, “pon 5”
   const mCmd = t.match(RX_WANT_QTY);
   if (mCmd) {
     const q = Number(mCmd[2]);
     if (q > 0) return q;
   }
 
-  // “docena”, “media docena”
   if (/\bmedia\s+docena\b/i.test(t)) return 6;
   if (/\bdocena\b/i.test(t)) return 12;
 
-  // palabra-num
   for (const [w, n] of Object.entries(NUM_WORDS)) {
     if (new RegExp(`\\b${w}\\b`, 'i').test(t)) {
       const q = Number(n);
@@ -463,7 +454,6 @@ function parseQty(text, fallback = 1) {
     }
   }
 
-  // número suelto
   const m = t.match(/\b(\d+)\b/);
   if (m) {
     const q = Number(m[1]);
@@ -477,10 +467,8 @@ function parseQty(text, fallback = 1) {
 /* ========================= Inventario & Carrito =========================== */
 /* ========================================================================== */
 
-/* --- Reglas de diálogo del carrito --- */
 const RX_ADD_ITEM = /\b(agrega(?:me)?|añade|mete|pon|suma|incluye)\b/i;
 
-/* ---- Utils de carrito ---- */
 function pushCart(session, product, qty, backorder = false) {
   session.data = session.data || {};
   session.data.cart = session.data.cart || [];
@@ -507,11 +495,9 @@ function renderProducto(p) {
   return `1. ${p.nombre}${marca}${sku}\n${precio}\n${stockLine}\n\nEste suele ser el indicado para tu equipo.`;
 }
 
-/* ---- Etapa: pedir cantidad para el último candidato ---- */
 async function handleAskQty(env, session, toE164, text, lowered, ntext, now){
   const cand = session.data?.last_candidate;
   if (!cand) {
-    // No hay candidato guardado; pasamos a cart_open pero pedimos repetir
     session.stage = 'cart_open';
     await saveSession(env, session, now);
     await sendWhatsAppText(env, toE164, 'No alcancé a ver el artículo. ¿Lo repetimos o buscas otro? 🙂');
@@ -522,7 +508,7 @@ async function handleAskQty(env, session, toE164, text, lowered, ntext, now){
   addWithStockSplit(session, cand, qty);
 
   session.stage = 'cart_open';
-  await saveSession(env, session, now); // persistimos ANTES de responder (evita perder etapa)
+  await saveSession(env, session, now);
 
   const s = numberOrZero(cand.stock);
   const bo = Math.max(0, qty - Math.min(s, qty));
@@ -534,15 +520,12 @@ async function handleAskQty(env, session, toE164, text, lowered, ntext, now){
   return ok('EVENT_RECEIVED');
 }
 
-/* ---- Etapa: carrito abierto (agregar más, cerrar, etc.) ---- */
 async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
   session.data = session.data || {};
   const cart = session.data.cart || [];
 
-  // Cerrar carrito
   if (RX_DONE.test(lowered) || (RX_NEG_NO.test(lowered) && cart.length > 0)) {
     if (!cart.length && session.data.last_candidate) {
-      // Safety: si no alcanzó a añadir, agrega 1 del último candidato
       addWithStockSplit(session, session.data.last_candidate, 1);
     }
     session.stage = 'await_invoice';
@@ -551,7 +534,6 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     return ok('EVENT_RECEIVED');
   }
 
-  // Confirmación tipo “sí / ok / agrégalo” → vuelve a pedir piezas del candidato mostrado
   const RX_YES_CONFIRM = /\b(s[ií]|sí|si|claro|va|dale|correcto|ok|afirmativo|hazlo|agr[eé]ga(lo)?|añade|m[eé]te|pon(lo)?)\b/i;
   if (RX_YES_CONFIRM.test(lowered)) {
     const c = session.data?.last_candidate;
@@ -564,7 +546,6 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     }
   }
 
-  // “quiero 3” dentro de cart_open → trata como ask_qty del candidato actual
   if (looksLikeQuantity(lowered)) {
     const c = session.data?.last_candidate;
     if (c) {
@@ -576,7 +557,6 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     }
   }
 
-  // Agregar otro artículo o nueva consulta de inventario
   if (RX_ADD_ITEM.test(lowered) || RX_INV_Q.test(ntext)) {
     const cleanQ = lowered.replace(RX_ADD_ITEM, '').trim() || ntext;
 
@@ -615,13 +595,11 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now) {
     }
   }
 
-  // Mensaje neutral dentro del carrito
   await sendWhatsAppText(env, toE164, `Te leo 🙂. Puedo agregar el artículo mostrado, buscar otro o *finalizar* si ya está completo.`);
   await saveSession(env, session, now);
   return ok('EVENT_RECEIVED');
 }
 
-/* ---- Inicio de ventas desde una consulta libre ---- */
 function enrichQueryFromAI(q, ai){
   if (!ai) return q;
   let out = q;
@@ -677,7 +655,6 @@ function extractModelHints(text='') {
   const t = normalizeWithAliases(text);
   const out = {};
 
-  // Familia
   if (/\bversant\b/i.test(t) || /\b(80|180|2100|280|4100)\b/i.test(t)) out.family = 'versant';
   else if (/\bdocu\s*color\b/i.test(t) || /\b(550|560|570)\b/.test(t)) out.family = 'docucolor';
   else if (/\bprime\s*link\b/i.test(t) || /\bprimelink\b/i.test(t)) out.family = 'primelink';
@@ -686,7 +663,6 @@ function extractModelHints(text='') {
   else if (/\bapeos\b/i.test(t)) out.family = 'apeos';
   else if (/\bc(60|70|75)\b/i.test(t)) out.family = 'c70';
 
-  // Color
   const c = extractColorWord(t);
   if (c) out.color = c;
 
@@ -737,7 +713,6 @@ function productMatchesFamily(p, family){
   return s.includes(family);
 }
 
-/* === findBestProduct === */
 async function findBestProduct(env, queryText, opts = {}) {
   const hints = extractModelHints(queryText);
   const colorCode = hints.color || extractColorWord(queryText);
@@ -747,12 +722,10 @@ async function findBestProduct(env, queryText, opts = {}) {
     if (!Array.isArray(arr) || !arr.length) return null;
     let pool = arr.slice();
 
-    // Filtros duros
     if (hints.family && !opts.ignoreFamily) pool = pool.filter(p => productMatchesFamily(p, hints.family));
     if (colorCode) pool = pool.filter(p => productHasColor(p, colorCode));
     if (!pool.length) return null;
 
-    // Priorizar stock >0, luego precio
     pool.sort((a,b) => {
       const sa = numberOrZero(a.stock) > 0 ? 1 : 0;
       const sb = numberOrZero(b.stock) > 0 ? 1 : 0;
@@ -762,7 +735,6 @@ async function findBestProduct(env, queryText, opts = {}) {
     return pool[0] || null;
   };
 
-  // 1) RPC similitud
   try {
     const res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 40 }) || [];
     const pick1 = scoreAndPick(res);
@@ -772,7 +744,6 @@ async function findBestProduct(env, queryText, opts = {}) {
     if (debug) console.log('[INV] RPC error', e);
   }
 
-  // 2) Vista por familia
   if (hints.family && !opts.ignoreFamily) {
     try {
       const likeFam = encodeURIComponent(`%${hints.family}%`);
@@ -789,7 +760,6 @@ async function findBestProduct(env, queryText, opts = {}) {
     }
   }
 
-  // 3) Broad scan "toner"
   try {
     const likeToner = encodeURIComponent(`%toner%`);
     const r2 = await sbGet(env, 'producto_stock_v', {
@@ -848,7 +818,6 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now, originalTe
   session.data = session.data || {};
   session.data.customer = session.data.customer || {};
 
-  // Small talk intercalado
   if (!saysYes && !saysNo && /hola|cómo estás|como estas|gracias/i.test(lowered)) {
     const friendly = await aiSmallTalk(env, session, 'general', originalText);
     await sendWhatsAppText(env, toE164, friendly);
@@ -892,7 +861,6 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now, originalTe
   return ok('EVENT_RECEIVED');
 }
 
-/* ------------------------- Captura UNO A UNO ----------------------------- */
 const FLOW_FACT = ['nombre','rfc','email','calle','numero','colonia','cp'];
 const FLOW_SHIP = ['nombre','email','calle','numero','colonia','cp'];
 const LABEL     = { nombre:'Nombre / Razón Social', rfc:'RFC', email:'Email', calle:'Calle', numero:'Número', colonia:'Colonia', cp:'Código Postal' };
@@ -903,10 +871,37 @@ function parseCustomerFragment(field, text){
   const t = text;
   if (field==='nombre') return clean(t);
   if (field==='rfc'){ const m = t.match(/\b([A-ZÑ&]{3,4}\d{6}[A-Z0-9]{3})\b/i); return m ? m[1].toUpperCase() : clean(t).toUpperCase(); }
-  if (field==='email'){ const m = t.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i); return m ? m[0].toLowerCase() : clean(t).toLowerCase(); }
+   if (field==='email'){ const m = t.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i); return m ? m[0].toLowerCase() : clean(t).toLowerCase(); }
   if (field==='numero'){ const m = t.match(/\b(\d+[A-Z]?)\b/i); return m ? m[1] : clean(t); }
   if (field==='cp'){ const m = t.match(/\b(\d{5})\b/); return m ? m[1] : clean(t); }
   return clean(t);
+}
+
+function promptedRecently(session, key, msWindow){
+  const k = `_prompted_${key}`;
+  const last = session?.data?.[k] ? new Date(session.data[k]).getTime() : 0;
+  const now = Date.now();
+  if (now - last < msWindow) return true;
+  session.data[k] = new Date(now).toISOString();
+  return false;
+}
+
+function buildResumePrompt(session){
+  const st = session?.stage || 'idle';
+  if (st === 'ask_qty' && session?.data?.last_candidate) {
+    const s = numberOrZero(session.data.last_candidate.stock);
+    return `Estábamos revisando *cantidad* del artículo mostrado (hay ${s} en stock).`;
+  }
+  if (st === 'cart_open') {
+    const cart = session?.data?.cart || [];
+    return cart.length ? `Traías un carrito abierto: ${summaryCart(cart)}.` : `Estábamos por abrir carrito.`;
+  }
+  if (st.startsWith('collect_')) {
+    const field = st.replace('collect_','');
+    return `Nos quedamos capturando *${LABEL[field] || field}*.`;
+  }
+  if (st.startsWith('sv_')) return `Continuábamos con los datos para *soporte técnico*.`;
+  return `¿Continuamos desde donde nos quedamos o empezamos algo nuevo?`;
 }
 
 async function handleCollectSequential(env, session, toE164, text, now){
@@ -976,7 +971,7 @@ async function createOrderFromSession(env, session, toE164) {
     const c = session.data.customer || {};
     let cliente_id = null;
 
-    // Buscar cliente
+    // Buscar cliente por teléfono o email
     try {
       const exist = await sbGet(env, 'cliente', {
         query: `select=id,telefono,email&or=(telefono.eq.${session.from},email.eq.${encodeURIComponent(c.email || '')})&limit=1`
@@ -1233,13 +1228,11 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     session.data.sv = session.data.sv || {};
     const sv = session.data.sv;
 
-    // Captura lo esperado si veníamos en sv_collect
     if (session.stage === 'sv_collect' && session.data.sv_need_next) {
       svFillFromAnswer(sv, session.data.sv_need_next, text, env);
       await saveSession(env, session, now);
     }
 
-    // Enriquecer con lo que venga
     const mined = extractSvInfo(text);
     if (!sv.marca && mined.marca) sv.marca = mined.marca;
     if (!sv.modelo && mined.modelo) sv.modelo = mined.modelo;
@@ -1271,7 +1264,6 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
     if (!sv.nombre && truthy(c.nombre)) sv.nombre = c.nombre;
     if (!sv.email && truthy(c.email)) sv.email = c.email;
 
-    // Faltantes
     const needed = [];
     if (!(truthy(sv.marca) && truthy(sv.modelo))) {
       const pmNow = parseBrandModel(text);
@@ -1622,6 +1614,7 @@ function extractWhatsAppContext(payload) {
     const fromE164 = `+${from}`;
     const mid = message.id;
     const profileName = value?.contacts?.[0]?.profile?.name || '';
+    const ts = Number(message.timestamp ? `${message.timestamp}000` : Date.now()); // epoch sec → ms
 
     let textRaw = '';
     let msgType = 'unknown';
@@ -1639,12 +1632,9 @@ function extractWhatsAppContext(payload) {
       }
     }
 
-    return { from, fromE164, mid, profileName, textRaw, msgType };
+    return { from, fromE164, mid, profileName, textRaw, msgType, ts };
   } catch (e) {
     console.warn('extractWhatsAppContext error', e);
     return null;
   }
 }
-
-
-
