@@ -426,11 +426,10 @@ const NUM_WORDS = {
   'once':11, 'doce':12, 'docena':12, 'media':0.5, 'media docena':6
 };
 
-function looksLikeQuantity(t=''){
+function looksLikeQuantityStrict(t=''){
   const hasDigit = /\b\d+\b/.test(t);
   const hasWord  = Object.keys(NUM_WORDS).some(w => new RegExp(`\\b${w}\\b`, 'i').test(t));
-  const hasVerb  = /\b(quiero|ocupo|me llevo|pon|agrega|añade|mete|dame|manda|env[ií]ame|p[oó]n)\b/i.test(t);
-  return hasDigit || hasWord || hasVerb;
+  return hasDigit || hasWord;
 }
 
 const RX_WANT_QTY = /\b(quiero|ocupo|me llevo|pon|agrega|añade|mete|dame|manda|env[ií]ame|p[oó]n)\s+(\d+)\b/i;
@@ -1677,4 +1676,5 @@ function extractWhatsAppContext(payload) {
     return null;
   }
 }
+
 
