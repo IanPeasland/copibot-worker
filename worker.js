@@ -72,29 +72,39 @@ export default {
           session.data.customer.nombre = toTitleCase(firstWord(profileName));
         }
 
-        // ==== Anti re-orden por timestamp (tolerante a desfaces) ====
-        const msgTs = Number(ts || Date.now());     // ms
+        // ====== Filtros de seguridad (modo prueba opcional) ======
+        const DEBUG_ALLOW_ALL = (env.DEBUG_ALLOW_ALL === 'true');
+
+        // ==== Anti re-orden por timestamp (tolerante a desfases) ====
+        const msgTs = Number(ts || Date.now());       // ts del mensaje (ms)
         let lastTs = Number(session?.data?.last_ts || 0);
         const nowMs = Date.now();
 
-        // Si last_ts quedó "en el futuro" (>10 min), lo ignoramos
-        if (lastTs > nowMs + 10 * 60 * 1000) {
-        lastTs = 0;
-        }
-
-        // Solo descartamos si el mensaje es >5s MÁS viejo que el último
-        if (lastTs && (msgTs + 5000) <= lastTs) {
-        return ok('EVENT_RECEIVED');
-        }
-
-        // Guardamos el mayor para no retroceder
-        session.data.last_ts = Math.max(msgTs, lastTs);
-
-        // Idempotencia por MID
-        if (session?.data?.last_mid && session.data.last_mid === mid) {
+        if (!DEBUG_ALLOW_ALL) {
+          // Si por algún bug last_ts quedó muy en el futuro (>10 min), lo ignoramos
+          if (lastTs > nowMs + 10 * 60 * 1000) {
+            lastTs = 0;
+          }
+          // Solo descartamos si el mensaje es notablemente más viejo que el último (5s)
+          if (lastTs && (msgTs + 5000) <= lastTs) {
+          // Mensaje atrasado → no respondemos para que WA no reintente
           return ok('EVENT_RECEIVED');
-        }
-        session.data.last_mid = mid;
+            }
+          }
+          // Guardamos el mayor para no retroceder
+          session.data.last_ts = Math.max(msgTs, lastTs);
+
+          // ==== Idempotencia por MID (tolerante) ====
+          if (!DEBUG_ALLOW_ALL) {
+            const lastMid = session?.data?.last_mid || null;
+            if (lastMid === mid) {
+              // Webhook duplicado exacto del mismo mensaje → ignorar 1 vez
+              return ok('EVENT_RECEIVED');
+            }
+          }
+          // Solo actualizamos si cambia
+          session.data.last_mid = mid;
+
 
         // No-texto → pedir texto
         if (msgType !== 'text') {
@@ -1686,6 +1696,7 @@ function extractWhatsAppContext(payload) {
     return null;
   }
 }
+
 
 
 
