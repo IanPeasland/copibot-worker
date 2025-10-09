@@ -495,18 +495,57 @@ function renderProducto(p) {
   return `1. ${p.nombre}${marca}${sku}\n${precio}\n${stockLine}\n\nEste suele ser el indicado para tu equipo.`;
 }
 
+/* ---- Etapa: pedir cantidad para el último candidato (con verificación estricta) ---- */
 async function handleAskQty(env, session, toE164, text, lowered, ntext, now){
   const cand = session.data?.last_candidate;
   if (!cand) {
+    // No hay candidato guardado; pasa a cart_open pero pide repetir el artículo
     session.stage = 'cart_open';
     await saveSession(env, session, now);
     await sendWhatsAppText(env, toE164, 'No alcancé a ver el artículo. ¿Lo repetimos o buscas otro? 🙂');
     return ok('EVENT_RECEIVED');
   }
 
+  // 1) Cierre desde ask_qty: respétalo SOLO si ya hay algo en carrito
+  if (RX_DONE.test(lowered)) {
+    const cart = session.data?.cart || [];
+    if (cart.length > 0) {
+      session.stage = 'await_invoice';
+      await saveSession(env, session, now);
+      await sendWhatsAppText(env, toE164, `Perfecto 🙌 ¿La cotizamos *con factura* o *sin factura*?`);
+      return ok('EVENT_RECEIVED');
+    }
+    // Si no hay nada en el carrito, no cierro; pido la cantidad explícita
+    const s = numberOrZero(cand.stock);
+    await sendWhatsAppText(env, toE164, `Aún no he agregado piezas. ¿Cuántas *piezas* necesitas? (hay ${s} en stock; el resto sería *sobre pedido*)`);
+    await saveSession(env, session, now);
+    return ok('EVENT_RECEIVED');
+  }
+
+  // 2) Saludos u otros textos que NO sean cantidad → NO agregar nada
+  if (!looksLikeQuantityStrict(lowered)) {
+    const s = numberOrZero(cand.stock);
+    // Si fue saludo, respondemos amable y repreguntamos
+    if (RX_GREET.test(lowered)) {
+      await sendWhatsAppText(env, toE164, `¡Hola! 🙂`);
+    }
+    await sendWhatsAppText(env, toE164, `Para avanzar, dime *cuántas piezas* necesitas. (hay ${s} en stock; el resto sería *sobre pedido*)`);
+    await saveSession(env, session, now);
+    return ok('EVENT_RECEIVED');
+  }
+
+  // 3) Ahora sí, texto parece cantidad → parsear y agregar
   const qty = parseQty(lowered, 1);
+  if (!Number.isFinite(qty) || qty <= 0) {
+    const s = numberOrZero(cand.stock);
+    await sendWhatsAppText(env, toE164, `Necesito un número de piezas (hay ${s} en stock).`);
+    await saveSession(env, session, now);
+    return ok('EVENT_RECEIVED');
+  }
+
   addWithStockSplit(session, cand, qty);
 
+  // 4) Pasamos a carrito abierto
   session.stage = 'cart_open';
   await saveSession(env, session, now);
 
@@ -1638,3 +1677,4 @@ function extractWhatsAppContext(payload) {
     return null;
   }
 }
+
