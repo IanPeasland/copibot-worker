@@ -1,32 +1,22 @@
 /**
  * CopiBot – Worker Lite (SIN IA)
  * Conversacional + Ventas + Soporte Técnico + GCal + Supabase
- * Build: “Lite-R10”
+ * Build: “Lite-R11”
  *
- * Variables esperadas (Cloudflare):
- *  - WA_TOKEN, PHONE_ID, VERIFY_TOKEN
- *  - SUPABASE_URL, SUPABASE_ANON_KEY
- *  - GCAL_CLIENT_ID, GCAL_CLIENT_SECRET, GCAL_REFRESH_TOKEN
- *  - SUPPORT_WHATSAPP (o SUPPORT_PHONE_E164)
- *  - TZ (ej. America/Mexico_City)
- *  - CRON_SECRET (para /cron)
- *
- * Tablas (public):
- *  - wa_session(from text pk, stage text, data jsonb, updated_at timestamptz, expires_at timestamptz?)
- *  - producto_stock_v (id, nombre, marca, sku, precio, stock, tipo, compatible)
- *  - cliente (id uuid pk, nombre, rfc, email, telefono, calle, numero, colonia, ciudad, estado, cp)
- *  - pedido, pedido_item
- *  - orden_servicio
- *  - calendar_pool(name text, calendar_id text, active bool)
- *
- * Nota: SIN IA — intenciones por regex.
+ * Env vars (Cloudflare):
+ *  WA_TOKEN, PHONE_ID, VERIFY_TOKEN
+ *  SUPABASE_URL, SUPABASE_ANON_KEY
+ *  GCAL_CLIENT_ID, GCAL_CLIENT_SECRET, GCAL_REFRESH_TOKEN
+ *  SUPPORT_WHATSAPP (o SUPPORT_PHONE_E164)
+ *  TZ (ej. America/Mexico_City)
+ *  CRON_SECRET (para /cron)
  */
 
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
 
-    // ==== Verificación webhook (GET) ====
+    // Verificación webhook
     if (req.method === 'GET' && url.pathname === '/') {
       const mode = url.searchParams.get('hub.mode');
       const token = url.searchParams.get('hub.verify_token');
@@ -37,21 +27,24 @@ export default {
       return new Response('Forbidden', { status: 403 });
     }
 
-    // ==== Health ====
+    // Health
     if (req.method === 'GET' && url.pathname === '/health') {
-      const have = {
-        WA_TOKEN: !!env.WA_TOKEN,
-        PHONE_ID: !!env.PHONE_ID,
-        VERIFY_TOKEN: !!env.VERIFY_TOKEN,
-        SUPABASE_URL: !!env.SUPABASE_URL,
-        SUPABASE_ANON_KEY: !!env.SUPABASE_ANON_KEY,
-        GCAL_REFRESH_TOKEN: !!env.GCAL_REFRESH_TOKEN,
-        TZ: env.TZ || 'America/Mexico_City'
-      };
-      return json({ ok: true, have, now: new Date().toISOString() });
+      return json({
+        ok: true,
+        have: {
+          WA_TOKEN: !!env.WA_TOKEN,
+          PHONE_ID: !!env.PHONE_ID,
+          VERIFY_TOKEN: !!env.VERIFY_TOKEN,
+          SUPABASE_URL: !!env.SUPABASE_URL,
+          SUPABASE_ANON_KEY: !!env.SUPABASE_ANON_KEY,
+          GCAL_REFRESH_TOKEN: !!env.GCAL_REFRESH_TOKEN,
+          TZ: env.TZ || 'America/Mexico_City'
+        },
+        now: new Date().toISOString()
+      });
     }
 
-    // ==== Cron manual (opcional) ====
+    // Cron manual
     if (req.method === 'POST' && url.pathname === '/cron') {
       const sec = req.headers.get('x-cron-secret') || url.searchParams.get('secret');
       if (!sec || sec !== env.CRON_SECRET) return new Response('Forbidden', { status: 403 });
@@ -59,7 +52,7 @@ export default {
       return new Response(`cron ok ${JSON.stringify(out)}`, { status: 200 });
     }
 
-    // ==== Webhook principal (POST) ====
+    // Webhook principal
     if (req.method === 'POST' && url.pathname === '/') {
       try {
         const payload = await safeJson(req);
@@ -75,27 +68,27 @@ export default {
         session.stage = session.stage || 'idle';
         session.from = from;
 
+        // Nombre por defecto
         if (profileName && !session?.data?.customer?.nombre) {
           session.data.customer = session.data.customer || {};
           session.data.customer.nombre = toTitleCase(firstWord(profileName));
         }
 
-        // Idempotencia
+        // Idempotencia básica
         const msgTs = Number(ts || Date.now());
         let lastTs = Number(session?.data?.last_ts || 0);
         const nowMs = Date.now();
         if (lastTs > nowMs + 10 * 60 * 1000) lastTs = 0;
         if (lastTs && (msgTs + 5000) <= lastTs) return ok('EVENT_RECEIVED');
         session.data.last_ts = Math.max(msgTs, lastTs);
-        if (session?.data?.last_mid === mid) return ok('EVENT_RECEIVED');
+        const lastMid = session?.data?.last_mid || null;
+        if (lastMid === mid) return ok('EVENT_RECEIVED');
         session.data.last_mid = mid;
 
-        // === No-texto ===
+        // Mensaje no texto
         if (msgType === 'audio') {
           await forwardAudioToSupport(env, media, fromE164);
-          await sendWhatsAppText(env, fromE164,
-            'Lo siento, todavía no puedo escuchar audios. Ya avisé a soporte y en breve te contactan. Si quieres, escríbeme el detalle y te ayudo por aquí 🙂'
-          );
+          await sendWhatsAppText(env, fromE164, 'Lo siento, todavía no puedo escuchar audios. Ya avisé a soporte y en breve te contactan. Si quieres, escríbeme el detalle y te ayudo por aquí 🙂');
           await saveSession(env, session, now);
           return ok('EVENT_RECEIVED');
         }
@@ -105,32 +98,38 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // Normalización/intención
+        // Texto normalizado
         const text = (textRaw || '').trim();
         const lowered = text.toLowerCase();
         const ntext = normalizeWithAliases(text);
 
-        // Saludo -> limpiar estado de ventas viejo
+        // Saludo: limpia estado de ventas viejo
         if (RX_GREET.test(lowered)) {
           const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
           session.data.last_candidate = null;
-          session.data.cart = session.data.cart || [];
+          session.data.cart = [];
           session.stage = 'idle';
           await saveSession(env, session, now);
           await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
           return ok('EVENT_RECEIVED');
         }
 
-        // Etapas activas
+        // Etapas
         if (session.stage === 'ask_qty')       return await handleAskQty(env, session, fromE164, text, lowered, ntext, now);
         if (session.stage === 'cart_open')     return await handleCartOpen(env, session, fromE164, text, lowered, ntext, now);
         if (session.stage === 'await_invoice') return await handleAwaitInvoice(env, session, fromE164, lowered, now, text);
-        if (session.stage && session.stage.startsWith('collect_'))
+        if (session.stage && session.stage.startsWith('collect_')) {
           return await handleCollectSequential(env, session, fromE164, text, now);
-        if (session.stage?.startsWith('sv_'))
+        }
+        if (session.stage?.startsWith('sv_')) {
           return await handleSupport(env, session, fromE164, text, lowered, ntext, now, {});
+        }
 
-        // Comandos soporte directos
+        // Intenciones
+        const supportIntent = isSupportIntent(ntext);
+        const salesIntent   = isSalesIntent(ntext);
+
+        // Comandos soporte
         if (/\b(cancel(a|ar).*(cita|visita|servicio))\b/i.test(lowered)) {
           await svCancel(env, session, fromE164);
           await saveSession(env, session, now);
@@ -150,26 +149,17 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // Intenciones (sin IA)
-        const wantSupport = isSupportIntent(ntext);
-        const wantSales   = isSalesIntent(ntext);
-
-        if (wantSupport) {
+        // Soporte primero
+        if (supportIntent) {
           return await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support' });
         }
-        if (wantSales) {
-          if (session.stage !== 'idle') session.data.last_stage = session.stage;
+
+        // Ventas
+        if (salesIntent) {
+          session.data.last_stage = session.stage;
           session.stage = 'idle';
           await saveSession(env, session, now);
           return await startSalesFromQuery(env, session, fromE164, text, ntext, now);
-        }
-
-        // FAQs
-        const faqAns = await maybeFAQ(env, ntext);
-        if (faqAns) {
-          await sendWhatsAppText(env, fromE164, faqAns);
-          await saveSession(env, session, now);
-          return ok('EVENT_RECEIVED');
         }
 
         // Fallback
@@ -193,21 +183,16 @@ export default {
     return new Response('Not found', { status: 404 });
   },
 
-  async scheduled(event, env, ctx) {
-    try {
-      const out = await cronReminders(env);
-      console.log('cron run', out);
-    } catch (e) {
-      console.error('cron error', e);
-    }
+  async scheduled(event, env) {
+    try { await cronReminders(env); } catch (e) { console.error('cron error', e); }
   }
 };
 
-/* ============================ Utils ============================ */
+/* ---------- Utils ---------- */
 function ok(s='ok'){ return new Response(s, { status: 200 }); }
 function json(obj){ return new Response(JSON.stringify(obj), { status: 200, headers:{'Content-Type':'application/json'} }); }
 async function safeJson(req){ try{ return await req.json(); }catch{ return {}; } }
-async function cronReminders(env){ return { ok:true, ts: Date.now() }; }
+async function cronReminders(){ return { ok:true }; }
 
 const firstWord   = (s='') => (s||'').trim().split(/\s+/)[0] || '';
 const toTitleCase = (s='') => s ? s.charAt(0).toUpperCase() + s.slice(1).toLowerCase() : '';
@@ -218,7 +203,7 @@ function truthy(v){ return v!==null && v!==undefined && String(v).trim()!==''; }
 function formatMoneyMXN(n){ const v=Number(n||0); try{ return new Intl.NumberFormat('es-MX',{style:'currency',currency:'MXN',maximumFractionDigits:2}).format(v); }catch{ return `$${v.toFixed(2)}`; } }
 function priceWithIVA(n){ return `${formatMoneyMXN(Number(n||0))} + IVA`; }
 
-/* ============================ Intents ============================ */
+/* ---------- Intents ---------- */
 const RX_GREET = /^(hola+|buen[oa]s|qué onda|que tal|saludos|hey|buen dia|buenas|holi+)\b/i;
 
 function normalizeWithAliases(s=''){
@@ -246,61 +231,48 @@ function isSupportIntent(ntext='') {
 const RX_NEG_NO = /\b(no|nel|ahorita no|no gracias)\b/i;
 const RX_DONE   = /\b(es(ta)?\s*todo|ser[ií]a\s*todo|nada\s*m[aá]s|con\s*eso|as[ií]\s*est[aá]\s*bien|ya\s*qued[oó]|listo|finaliza(r|mos)?|termina(r)?)\b/i;
 
-/* ============================ WhatsApp send ============================ */
+/* ---------- WhatsApp send ---------- */
 async function sendWhatsAppText(env, toE164, body) {
-  if (!env.WA_TOKEN || !env.PHONE_ID) { console.warn('WA env missing'); return; }
+  if (!env.WA_TOKEN || !env.PHONE_ID) return;
   const url = `https://graph.facebook.com/v20.0/${env.PHONE_ID}/messages`;
   const payload = { messaging_product: 'whatsapp', to: toE164.replace(/\D/g, ''), text: { body } };
-  const r = await fetch(url, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${env.WA_TOKEN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
+  const r = await fetch(url, { method: 'POST', headers: { Authorization: `Bearer ${env.WA_TOKEN}`, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
   if (!r.ok) console.warn('sendWhatsAppText', r.status, await r.text());
 }
+
 async function notifySupport(env, body) {
   const to = env.SUPPORT_WHATSAPP || env.SUPPORT_PHONE_E164;
   if (!to) return;
   await sendWhatsAppText(env, to, `🛎️ *Soporte*\n${body}`);
 }
 async function forwardAudioToSupport(env, media, fromE164) {
-  try {
-    const to = env.SUPPORT_WHATSAPP || env.SUPPORT_PHONE_E164;
-    if (!to) return;
-    const txt = `Audio recibido de ${fromE164} (id:${media?.id || 'N/A'}). Revísalo en WhatsApp Business / Meta.`;
-    await sendWhatsAppText(env, to, `🗣️ *Audio reenviado*\n${txt}`);
-  } catch (e) { console.warn('forwardAudioToSupport', e); }
+  const to = env.SUPPORT_WHATSAPP || env.SUPPORT_PHONE_E164;
+  if (!to) return;
+  const txt = `Audio recibido de ${fromE164} (id:${media?.id || 'N/A'}). Revísalo en WhatsApp Business / Meta.`;
+  await sendWhatsAppText(env, to, `🗣️ *Audio reenviado*\n${txt}`);
 }
 
-/* ============================ Sesión (Supabase) ============================ */
+/* ---------- Sesión (Supabase) ---------- */
 async function loadSession(env, phone) {
   try {
     const r = await sbGet(env, 'wa_session', {
-      query:
-        `select=from,stage,data,updated_at,expires_at&` +
-        `from=eq.${encodeURIComponent(phone)}&order=updated_at.desc&limit=1`
+      query: `select=from,stage,data,updated_at,expires_at&from=eq.${encodeURIComponent(phone)}&order=updated_at.desc&limit=1`
     });
-    if (Array.isArray(r) && r[0]) {
-      return { from: r[0].from, stage: r[0].stage || 'idle', data: r[0].data || {} };
-    }
+    if (Array.isArray(r) && r[0]) return { from: r[0].from, stage: r[0].stage || 'idle', data: r[0].data || {} };
     return { from: phone, stage: 'idle', data: {} };
-  } catch (e) {
-    console.warn('loadSession error', e);
+  } catch {
     return { from: phone, stage: 'idle', data: {} };
   }
 }
 async function saveSession(env, session, now = new Date()) {
   try {
     await sbUpsert(env, 'wa_session', [{
-      from: session.from,
-      stage: session.stage || 'idle',
-      data:  session.data  || {},
-      updated_at: now.toISOString()
+      from: session.from, stage: session.stage || 'idle', data: session.data || {}, updated_at: now.toISOString()
     }], { onConflict: 'from', returning: 'minimal' });
-  } catch (e) { console.warn('saveSession error', e); }
+  } catch {}
 }
 
-/* ============================ Cantidades ============================ */
+/* ---------- Cantidades ---------- */
 const NUM_WORDS = { 'cero':0,'una':1,'uno':1,'un':1,'dos':2,'tres':3,'cuatro':4,'cinco':5,'seis':6,'siete':7,'ocho':8,'nueve':9,'diez':10,'once':11,'doce':12,'docena':12,'media':0.5,'media docena':6 };
 function looksLikeQuantityStrict(t=''){ const hasDigit=/\b\d+\b/.test(t); const hasWord=Object.keys(NUM_WORDS).some(w=>new RegExp(`\\b${w}\\b`,'i').test(t)); return hasDigit||hasWord; }
 function parseQty(text, fallback=1){
@@ -312,7 +284,7 @@ function parseQty(text, fallback=1){
   return fallback;
 }
 
-/* ============================ Inventario & Carrito ============================ */
+/* ---------- Inventario & Carrito ---------- */
 function pushCart(session, product, qty, backorder=false){
   session.data = session.data || {};
   session.data.cart = session.data.cart || [];
@@ -339,96 +311,110 @@ function renderProducto(p, queryText=''){
   const tip = famHit ? `\n\nEste suele ser el indicado para tu equipo.` : '';
   return `1. ${p.nombre}${marca}${sku}\n${precio}\n${stockLine}${tip}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; hay ${Math.max(0, s)} en stock y el resto sería *sobre pedido*.`;
 }
-async function handleAskQty(env, session, toE164, text, lowered, ntext, now){
+
+/* Etapas de carrito */
+async function handleAskQty(env, session, toE164, text, lowered){
   const cand = session.data?.last_candidate;
+
   if (RX_NEG_NO.test(lowered)) {
     session.data.last_candidate = null;
     session.stage = 'cart_open';
-    await saveSession(env, session, now);
+    await saveSession(env, session);
     await sendWhatsAppText(env, toE164, 'Sin problema. ¿Busco otra opción? Dime modelo/color o lo que necesitas.');
     return ok('EVENT_RECEIVED');
   }
+
   if (RX_DONE.test(lowered)) {
     const cart = session.data?.cart || [];
     if (cart.length > 0) {
       session.stage = 'await_invoice';
-      await saveSession(env, session, now);
+      await saveSession(env, session);
       await sendWhatsAppText(env, toE164, '¿La cotizamos *con factura* o *sin factura*?');
       return ok('EVENT_RECEIVED');
     }
   }
+
   if (!cand) {
     session.stage = 'cart_open';
-    await saveSession(env, session, now);
+    await saveSession(env, session);
     await sendWhatsAppText(env, toE164, '¿Qué artículo necesitas? (modelo/color, p. ej. "tóner amarillo versant")');
     return ok('EVENT_RECEIVED');
   }
+
   if (!looksLikeQuantityStrict(lowered)) {
     const s = numberOrZero(cand.stock);
     await sendWhatsAppText(env, toE164, `¿Cuántas *piezas* necesitas? (hay ${s} en stock; el resto sería *sobre pedido*)`);
-    await saveSession(env, session, now);
+    await saveSession(env, session);
     return ok('EVENT_RECEIVED');
   }
+
   const qty = parseQty(lowered, 1);
   if (!Number.isFinite(qty) || qty <= 0) {
     const s = numberOrZero(cand.stock);
     await sendWhatsAppText(env, toE164, `Necesito un número de piezas (hay ${s} en stock).`);
-    await saveSession(env, session, now);
+    await saveSession(env, session);
     return ok('EVENT_RECEIVED');
   }
+
   addWithStockSplit(session, cand, qty);
   session.stage = 'cart_open';
-  await saveSession(env, session, now);
+  await saveSession(env, session);
+
   const s = numberOrZero(cand.stock);
   const bo = Math.max(0, qty - Math.min(s, qty));
   const nota = bo>0 ? `\n(De ${qty}, ${Math.min(s,qty)} en stock y ${bo} sobre pedido)` : '';
   await sendWhatsAppText(env, toE164, `Añadí 🛒\n• ${cand.nombre} x ${qty} ${priceWithIVA(cand.precio)}${nota}\n\n¿Deseas *agregar algo más* o *finalizamos*?`);
   return ok('EVENT_RECEIVED');
 }
-async function handleCartOpen(env, session, toE164, text, lowered, ntext, now){
-  session.data = session.data || {};
+
+async function handleCartOpen(env, session, toE164, text, lowered, ntext){
   const cart = session.data.cart || [];
+
   if (RX_DONE.test(lowered) || (RX_NEG_NO.test(lowered) && cart.length > 0)) {
     if (!cart.length && session.data.last_candidate) addWithStockSplit(session, session.data.last_candidate, 1);
     session.stage = 'await_invoice';
-    await saveSession(env, session, now);
+    await saveSession(env, session);
     await sendWhatsAppText(env, toE164, '¿La quieres *con factura* o *sin factura*?');
     return ok('EVENT_RECEIVED');
   }
+
   if (looksLikeQuantityStrict(lowered) && session.data?.last_candidate) {
     session.stage = 'ask_qty';
-    await saveSession(env, session, now);
+    await saveSession(env, session);
     const s = numberOrZero(session.data.last_candidate.stock);
     await sendWhatsAppText(env, toE164, `Perfecto. ¿Cuántas *piezas* en total? (hay ${s} en stock; el resto sería *sobre pedido*)`);
     return ok('EVENT_RECEIVED');
   }
+
   if (RX_INV_KWS.test(ntext) || RX_MODEL_KWS.test(ntext)) {
-    return await startSalesFromQuery(env, session, toE164, text, ntext, now);
+    return await startSalesFromQuery(env, session, toE164, text, ntext);
   }
+
   await sendWhatsAppText(env, toE164, 'Te leo 🙂. Puedo agregar un artículo nuevo, buscar otro o *finalizar* si ya está completo.');
-  await saveSession(env, session, now);
+  await saveSession(env, session);
   return ok('EVENT_RECEIVED');
 }
-async function startSalesFromQuery(env, session, toE164, text, ntext, now){
-  session.data = session.data || {};
-  session.data.last_candidate = null;
-  await saveSession(env, session, now);
+
+async function startSalesFromQuery(env, session, toE164, text, ntext){
+  session.data.last_candidate = null; // limpia candidatos viejos
+  await saveSession(env, session);
 
   const best = await findBestProduct(env, ntext);
   if (best) {
     session.stage = 'ask_qty';
     session.data.last_candidate = best;
-    await saveSession(env, session, now);
+    await saveSession(env, session);
     await sendWhatsAppText(env, toE164, renderProducto(best, ntext));
     return ok('EVENT_RECEIVED');
   }
+
   await sendWhatsAppText(env, toE164, 'No encontré una coincidencia directa 😕. ¿Me das el *modelo* y el *color* del consumible? (ej. *tóner amarillo Versant 180*)');
   await notifySupport(env, `Inventario sin match. ${toE164}: ${text}`);
-  await saveSession(env, session, now);
+  await saveSession(env, session);
   return ok('EVENT_RECEIVED');
 }
 
-/* ============================ Matching ============================ */
+/* ---------- Matching ---------- */
 function extractColorWord(text=''){
   const t = normalizeWithAliases(text);
   if (/\b(amarillo|yellow)\b/i.test(t)) return 'yellow';
@@ -451,7 +437,7 @@ function productHasColor(p, colorCode){
 }
 function productMatchesFamily(p, text=''){
   const t = normalizeWithAliases(text);
-  const s = normalizeBase([p?.nombre, p?.sku, p?.marca, p?.compatible].join(' '));
+  const s = normalizeBase([p?.nombre, p?.sku, p?.marca, p?.compatible, p?.tipo].join(' '));
   const fams = [
     ['versant', /(versant|80|180|2100|280|4100)\b/i, /(docu\s*color|primelink|alta\s*link|versa\s*link|c(60|70|75)|550|560|570)/i],
     ['docucolor', /(docu\s*color|550|560|570)\b/i, /(versant|primelink|alta\s*link|versa\s*link|2100|180|280|4100)/i],
@@ -469,14 +455,33 @@ function productMatchesFamily(p, text=''){
   }
   return true;
 }
+
 async function findBestProduct(env, queryText) {
   const colorCode = extractColorWord(queryText);
+  const forceToner = /(toner|t[óo]ner|cartucho)/i.test(queryText) || !!colorCode;
+
+  const mustBeToner = (p) => {
+    if (!forceToner) return true;
+    const nom = `${p?.nombre || ''} ${p?.tipo || ''}`;
+    return /\bton(e|é)r|t[oó]ner|cartucho/i.test(nom);
+  };
+
   const scoreAndPick = (arr=[]) => {
     if (!Array.isArray(arr) || !arr.length) return null;
     let pool = arr.slice();
+
+    // Toner estricto cuando corresponde
+    pool = pool.filter(mustBeToner);
+
+    // Familia
     pool = pool.filter(p => productMatchesFamily(p, queryText));
+
+    // Color obligatorio si viene en la consulta
     if (colorCode) pool = pool.filter(p => productHasColor(p, colorCode));
+
     if (!pool.length) return null;
+
+    // Prioriza stock y luego menor precio
     pool.sort((a,b) => {
       const sa = numberOrZero(a.stock) > 0 ? 1 : 0;
       const sb = numberOrZero(b.stock) > 0 ? 1 : 0;
@@ -486,26 +491,27 @@ async function findBestProduct(env, queryText) {
     return pool[0] || null;
   };
 
+  // 1) RPC fuzzy (si existe)
   try {
-    const res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 50 }) || [];
+    const res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 80 }) || [];
     const pick1 = scoreAndPick(res);
     if (pick1) return pick1;
   } catch {}
+
+  // 2) LIKE directo a la vista de inventario
   try {
-    const likeToner = /\bton(e|é)r|t[oó]ner|cartucho/i.test(queryText) ? '%toner%' : '%';
-    const like = encodeURIComponent(likeToner);
+    const like = forceToner ? encodeURIComponent('%toner%') : encodeURIComponent('%');
     const r2 = await sbGet(env, 'producto_stock_v', {
-      query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&` +
-             `or=(nombre.ilike.${like},sku.ilike.${like})&` +
-             `order=stock.desc.nullslast,precio.asc&limit=500`
+      query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&or=(nombre.ilike.${like},sku.ilike.${like})&order=stock.desc.nullslast,precio.asc&limit=800`
     }) || [];
     const pick2 = scoreAndPick(r2);
     if (pick2) return pick2;
   } catch {}
+
   return null;
 }
 
-/* ============================ FAQs ============================ */
+/* ---------- FAQs / cierre venta ---------- */
 async function maybeFAQ(env, ntext) {
   const faqs = {
     'horario': 'Horario de atención: Lunes a Viernes 9:00-18:00, Sábados 9:00-14:00',
@@ -519,22 +525,26 @@ async function maybeFAQ(env, ntext) {
     'contacto': /\b(contacto|telefono|tel|email|correo|whatsapp)\b/i,
     'empresa': /\b(empresa|quienes|somos|compania|negocio)\b/i
   };
-  for (const [key, pattern] of Object.entries(patterns)) if (pattern.test(ntext)) return faqs[key];
+  for (const [key, pattern] of Object.entries(patterns)) {
+    if (pattern.test(ntext)) return faqs[key];
+  }
   return null;
 }
 
-/* ============================ Cierre venta ============================ */
-async function handleAwaitInvoice(env, session, toE164, lowered, now){
+async function handleAwaitInvoice(env, session, toE164, lowered){
   if (/\b(no|gracias|todo bien)\b/i.test(lowered)) {
     session.stage = 'idle';
-    await saveSession(env, session, now);
+    await saveSession(env, session);
     await sendWhatsAppText(env, toE164, 'Perfecto, quedo al pendiente. Si necesitas algo más, aquí estoy 🙂');
     return ok('EVENT_RECEIVED');
   }
+
   const saysNo  = /\b(sin(\s+factura)?|sin|no)\b/i.test(lowered);
   const saysYes = !saysNo && /\b(s[ií]|sí|si|con(\s+factura)?|con|factura)\b/i.test(lowered);
+
   session.data = session.data || {};
   session.data.customer = session.data.customer || {};
+
   if (saysYes || saysNo) {
     session.data.requires_invoice = !!saysYes;
     await preloadCustomerIfAny(env, session);
@@ -542,7 +552,7 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now){
     const need = firstMissing(list, session.data.customer);
     if (need) {
       session.stage = `collect_${need}`;
-      await saveSession(env, session, now);
+      await saveSession(env, session);
       await sendWhatsAppText(env, toE164, `¿${LABEL[need]}?`);
       return ok('EVENT_RECEIVED');
     }
@@ -556,14 +566,16 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now){
     }
     session.stage = 'idle';
     session.data.cart = [];
-    await saveSession(env, session, now);
+    await saveSession(env, session);
     await sendWhatsAppText(env, toE164, `¿Te ayudo con algo más en este momento? (Sí / No)`);
     return ok('EVENT_RECEIVED');
   }
+
   await sendWhatsAppText(env, toE164, `¿La quieres con factura o sin factura?`);
-  await saveSession(env, session, now);
+  await saveSession(env, session);
   return ok('EVENT_RECEIVED');
 }
+
 const FLOW_FACT = ['nombre','rfc','email','calle','numero','colonia','cp'];
 const FLOW_SHIP = ['nombre','email','calle','numero','colonia','cp'];
 const LABEL     = { nombre:'Nombre / Razón Social', rfc:'RFC', email:'Email', calle:'Calle', numero:'Número', colonia:'Colonia', cp:'Código Postal' };
@@ -577,7 +589,7 @@ function parseCustomerFragment(field, text){
   if (field==='cp'){ const m = t.match(/\b(\d{5})\b/); return m ? m[1] : clean(t); }
   return clean(t);
 }
-async function handleCollectSequential(env, session, toE164, text, now){
+async function handleCollectSequential(env, session, toE164, text){
   session.data = session.data || {};
   session.data.customer = session.data.customer || {};
   const c = session.data.customer;
@@ -588,44 +600,44 @@ async function handleCollectSequential(env, session, toE164, text, now){
     const info = await cityFromCP(env, c.cp);
     if (info) { c.ciudad = info.ciudad || info.municipio || c.ciudad; c.estado = info.estado || c.estado; }
   }
-  await saveSession(env, session, now);
+  await saveSession(env, session);
   const nextField = firstMissing(list, c);
   if (nextField){
     session.stage = `collect_${nextField}`;
-    await saveSession(env, session, now);
+    await saveSession(env, session);
     await sendWhatsAppText(env, toE164, `¿${LABEL[nextField]}?`);
     return ok('EVENT_RECEIVED');
   }
   const res = await createOrderFromSession(env, session, toE164);
   if (res?.ok) {
     await sendWhatsAppText(env, toE164, `¡Listo! Generé tu solicitud 🙌\n*Total estimado:* ${formatMoneyMXN(res.total)} + IVA\nUn asesor te confirmará entrega y forma de pago.`);
-    await notifySupport(env, `Nuevo pedido #${c.nombre ? c.nombre : ''} (${toE164})`);
+    await notifySupport(env, `Nuevo pedido ${c.nombre ? '# ' + c.nombre : ''} (${toE164})`);
   } else {
     await sendWhatsAppText(env, toE164, `Creé tu solicitud y la pasé a un asesor humano para confirmar detalles. 🙌`);
     await notifySupport(env, `Pedido (parcial) ${toE164}. Error: ${res?.error || 'N/A'}`);
   }
   session.stage = 'idle';
   session.data.cart = [];
-  await saveSession(env, session, now);
+  await saveSession(env, session);
   await sendWhatsAppText(env, toE164, `¿Puedo ayudarte con algo más? (Sí / No)`);
   return ok('EVENT_RECEIVED');
 }
 
-/* ============================= Cliente & Pedido ============================ */
+/* ---------- Cliente & Pedido ---------- */
 async function preloadCustomerIfAny(env, session){
   try{
     const r = await sbGet(env, 'cliente', { query: `select=nombre,rfc,email,calle,numero,colonia,ciudad,estado,cp&telefono=eq.${session.from}&limit=1` });
     if (r && r[0]) session.data.customer = { ...(session.data.customer||{}), ...r[0] };
-  }catch(e){ console.warn('preloadCustomerIfAny', e); }
+  }catch{}
 }
 async function ensureClienteFields(env, cliente_id, c){
   try{
     const patch = {};
     ['nombre','rfc','email','calle','numero','colonia','ciudad','estado','cp'].forEach(k=>{ if (truthy(c[k])) patch[k]=c[k]; });
     if (Object.keys(patch).length>0) await sbPatch(env, 'cliente', patch, `id=eq.${cliente_id}`);
-  }catch(e){ console.warn('ensureClienteFields', e); }
+  }catch{}
 }
-async function createOrderFromSession(env, session, toE164) {
+async function createOrderFromSession(env, session){
   try {
     const cart = session.data?.cart || [];
     if (!cart.length) return { ok: false, error: 'empty cart' };
@@ -633,9 +645,7 @@ async function createOrderFromSession(env, session, toE164) {
     let cliente_id = null;
 
     try {
-      const exist = await sbGet(env, 'cliente', {
-        query: `select=id,telefono,email&or=(telefono.eq.${session.from},email.eq.${encodeURIComponent(c.email || '')})&limit=1`
-      });
+      const exist = await sbGet(env, 'cliente', { query: `select=id,telefono,email&or=(telefono.eq.${session.from},email.eq.${encodeURIComponent(c.email || '')})&limit=1` });
       if (exist && exist[0]) cliente_id = exist[0].id;
     } catch {}
 
@@ -664,6 +674,7 @@ async function createOrderFromSession(env, session, toE164) {
     }));
     await sbUpsert(env, 'pedido_item', items, { returning: 'minimal' });
 
+    // Decremento (solo lo disponible)
     for (const it of cart) {
       const sku = it.product?.sku;
       if (!sku) continue;
@@ -682,24 +693,20 @@ async function createOrderFromSession(env, session, toE164) {
   }
 }
 
-/* ============================ Supabase Helpers ============================ */
-async function sbGet(env, table, { query }) {
+/* ---------- Supabase helpers ---------- */
+async function sbGet(env, table, { query }){
   const url = `${env.SUPABASE_URL}/rest/v1/${table}?${query}`;
-  const r = await fetch(url, {
-    headers: { apikey: env.SUPABASE_ANON_KEY, Authorization: `Bearer ${env.SUPABASE_ANON_KEY}` }
-  });
+  const r = await fetch(url, { headers: { apikey: env.SUPABASE_ANON_KEY, Authorization: `Bearer ${env.SUPABASE_ANON_KEY}` } });
   if (!r.ok) { console.warn('sbGet', table, await r.text()); return null; }
   return await r.json();
 }
-async function sbUpsert(env, table, rows, { onConflict, returning='representation' }={}) {
+async function sbUpsert(env, table, rows, { onConflict, returning='representation' }={}){
   const url = `${env.SUPABASE_URL}/rest/v1/${table}${onConflict?`?on_conflict=${onConflict}`:''}`;
   const r = await fetch(url, {
     method:'POST',
     headers: {
-      apikey: env.SUPABASE_ANON_KEY,
-      Authorization:`Bearer ${env.SUPABASE_ANON_KEY}`,
-      'Content-Type':'application/json',
-      Prefer:`resolution=merge-duplicates,return=${returning}`
+      apikey: env.SUPABASE_ANON_KEY, Authorization:`Bearer ${env.SUPABASE_ANON_KEY}`,
+      'Content-Type':'application/json', Prefer:`resolution=merge-duplicates,return=${returning}`
     },
     body: JSON.stringify(rows)
   });
@@ -712,10 +719,8 @@ async function sbPatch(env, table, patch, filter){
   const r = await fetch(url, {
     method:'PATCH',
     headers: {
-      apikey: env.SUPABASE_ANON_KEY,
-      Authorization:`Bearer ${env.SUPABASE_ANON_KEY}`,
-      'Content-Type':'application/json',
-      Prefer:'return=minimal'
+      apikey: env.SUPABASE_ANON_KEY, Authorization:`Bearer ${env.SUPABASE_ANON_KEY}`,
+      'Content-Type':'application/json', Prefer:'return=minimal'
     },
     body: JSON.stringify(patch)
   });
@@ -732,12 +737,10 @@ async function sbRpc(env, fn, params){
   return await r.json();
 }
 
-/* ============================ SEPOMEX ============================ */
+/* ---------- SEPOMEX ---------- */
 async function cityFromCP(env, cp){
-  try {
-    const r = await sbGet(env, 'sepomex_cp', { query: `cp=eq.${encodeURIComponent(cp)}&select=cp,estado,municipio,ciudad&limit=1` });
-    return r?.[0] || null;
-  } catch { return null; }
+  try { const r = await sbGet(env, 'sepomex_cp', { query: `cp=eq.${encodeURIComponent(cp)}&select=cp,estado,municipio,ciudad&limit=1` }); return r?.[0] || null; }
+  catch { return null; }
 }
 
 /* =============================== SOPORTE + GCal ============================ */
@@ -1141,3 +1144,4 @@ async function findNearestFreeSlot(env, calendarId, slot, tz) {
   // Implementación simple: usa el slot tal cual; puedes mejorar consultando busy API
   return { start: slot.start, end: slot.end };
 }
+
