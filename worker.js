@@ -1025,7 +1025,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now, in
         gcal_event_id: event?.id || null, calendar_id: cal?.calendar_id || null,
         calle: sv.calle || null, numero: sv.numero || null, colonia: sv.colonia || null, ciudad: sv.ciudad || null, estado: sv.estado || null, cp: sv.cp || null,
         created_at: new Date().toISOString()
-      }]];
+      }];
       const os = await sbUpsert(env, 'orden_servicio', osBody, { returning: 'representation' });
       osId = os?.data?.[0]?.id || null;
 
@@ -1211,3 +1211,4 @@ async function findNearestFreeSlot(env, calendarId, when, tz){
   // Simplificado: usar tal cual el slot pedido
   return { start: when.start, end: when.end };
 }
+
