@@ -1,7 +1,7 @@
 /**
  * CopiBot – Worker Lite (SIN IA)
  * Conversacional + Ventas + Soporte Técnico + GCal + Supabase
- * Build: “Lite-R9”
+ * Build: “Lite-R10”
  *
  * Variables esperadas en Cloudflare:
  *  - WA_TOKEN, PHONE_ID, VERIFY_TOKEN
@@ -11,13 +11,17 @@
  *  - TZ (ej. America/Mexico_City)
  *  - CRON_SECRET (para /cron)
  *
- * Tablas requeridas (public):
+ * Tablas requeridas (schema public):
  *  - wa_session(from text pk, stage text, data jsonb, updated_at timestamptz, expires_at timestamptz?)
  *  - producto_stock_v (id, nombre, marca, sku, precio, stock, tipo, compatible)
  *  - cliente (id uuid pk, nombre, rfc, email, telefono, calle, numero, colonia, ciudad, estado, cp)
- *  - pedido, pedido_item
- *  - orden_servicio
- *  - calendar_pool (name text, calendar_id text, active bool)
+ *  - pedido(id uuid, cliente_id uuid, total numeric, moneda text, estado text, created_at timestamptz)
+ *  - pedido_item(pedido_id uuid, producto_id uuid, sku text, nombre text, qty int, precio_unitario numeric)
+ *  - orden_servicio(id uuid, cliente_id uuid, marca text, modelo text, falla_descripcion text, prioridad text,
+ *                   estado text, ventana_inicio timestamptz, ventana_fin timestamptz,
+ *                   gcal_event_id text, calendar_id text,
+ *                   calle text, numero text, colonia text, ciudad text, estado text, cp text, created_at timestamptz)
+ *  - calendar_pool(id uuid, name text, calendar_id text, active bool)
  *
  * Nota: SIN IA — la intención se detecta con regex robustas.
  */
@@ -118,12 +122,15 @@ export default {
         const lowered = text.toLowerCase();
         const ntext = normalizeWithAliases(text);
 
-        // Saludo: NO disparar ventas ni soporte, solo un saludo amable y salir
+        // Saludo: limpiar estado de ventas viejo y saludar
         if (RX_GREET.test(lowered)) {
           const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
-          await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
-          session.data.last_greet_at = now.toISOString();
+          // limpiar estado de ventas viejo
+          session.data.last_candidate = null;
+          session.data.cart = session.data.cart || [];
+          session.stage = 'idle';
           await saveSession(env, session, now);
+          await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
           return ok('EVENT_RECEIVED');
         }
 
@@ -169,7 +176,6 @@ export default {
 
         // Ventas por intención clara
         if (salesIntent) {
-          // Guardar last_stage si vienes de otra cosa (aunque en lite casi no aplica)
           if (session.stage !== 'idle') session.data.last_stage = session.stage;
           session.stage = 'idle';
           await saveSession(env, session, now);
@@ -184,7 +190,7 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // Fallback mínimo (sin IA): ofrecer inventario o soporte
+        // Fallback mínimo (sin IA)
         await sendWhatsAppText(env, fromE164, 'Te leo. Puedo cotizar consumibles/refacciones o agendar *soporte técnico*. ¿Qué necesitas?');
         await saveSession(env, session, now);
         return ok('EVENT_RECEIVED');
@@ -344,12 +350,19 @@ function addWithStockSplit(session, product, qty){
   if (take > 0) pushCart(session, product, take, false);
   if (rest > 0) pushCart(session, product, rest, true);
 }
-function renderProducto(p){
+function renderProducto(p, queryText=''){
   const precio = priceWithIVA(p.precio);
   const sku = p.sku ? `\nSKU: ${p.sku}` : '';
+  const marca = p.marca ? `\nMarca: ${p.marca}` : '';
   const s = numberOrZero(p.stock);
   const stockLine = s > 0 ? `${s} pzas en stock` : `0 pzas — *sobre pedido*`;
-  return `ℹ️ ${p.nombre}${sku}\n${precio}\n${stockLine}`;
+
+  // “Este suele ser…”
+  const q = normalizeWithAliases(queryText);
+  const famHit = /(versant|docu\s*color|primelink|versa\s*link|alta\s*link|apeos|c\d{2,4}|b\d{2,4})/i.test(q);
+  const tip = famHit ? `\n\nEste suele ser el indicado para tu equipo.` : '';
+
+  return `1. ${p.nombre}${marca}${sku}\n${precio}\n${stockLine}${tip}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; hay ${Math.max(0, s)} en stock y el resto sería *sobre pedido*.`;
 }
 
 /* ---- ASK_QTY (con rechazo) ---- */
@@ -444,17 +457,22 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now){
 }
 
 async function startSalesFromQuery(env, session, toE164, text, ntext, now){
+  // Cada nueva consulta limpia candidato previo para evitar “colas” viejas
+  session.data = session.data || {};
+  session.data.last_candidate = null;
+  await saveSession(env, session, now);
+
   const best = await findBestProduct(env, ntext);
   if (best) {
     session.stage = 'ask_qty';
-    session.data.cart = session.data.cart || [];
     session.data.last_candidate = best;
     await saveSession(env, session, now);
-    const s = numberOrZero(best.stock);
-    await sendWhatsAppText(env, toE164, `${renderProducto(best)}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; hay ${s} en stock y el resto sería *sobre pedido*.`);
+    await sendWhatsAppText(env, toE164, renderProducto(best, ntext));
     return ok('EVENT_RECEIVED');
   }
-  await sendWhatsAppText(env, toE164, 'No encontré una coincidencia directa 😕. ¿Me das el *modelo* y *color* del consumible?');
+
+  // Sin match claro, no pasamos a ask_qty
+  await sendWhatsAppText(env, toE164, 'No encontré una coincidencia directa 😕. ¿Me das el *modelo* y el *color* del consumible? (ej. *tóner amarillo Versant 180*)');
   await notifySupport(env, `Inventario sin match. ${toE164}: ${text}`);
   await saveSession(env, session, now);
   return ok('EVENT_RECEIVED');
@@ -505,14 +523,20 @@ function productMatchesFamily(p, text=''){
 
 async function findBestProduct(env, queryText, opts = {}) {
   const colorCode = extractColorWord(queryText);
+
   const scoreAndPick = (arr=[]) => {
     if (!Array.isArray(arr) || !arr.length) return null;
     let pool = arr.slice();
-    // Filtrar por familia según texto
+
+    // Filtrar por familia (evita mezclar Versant vs DocuColor, etc.)
     pool = pool.filter(p => productMatchesFamily(p, queryText));
-    // Filtrar color si se entendió
+
+    // Si entendimos color, ES OBLIGATORIO que lo traiga
     if (colorCode) pool = pool.filter(p => productHasColor(p, colorCode));
+
     if (!pool.length) return null;
+
+    // Prioriza stock y luego menor precio
     pool.sort((a,b) => {
       const sa = numberOrZero(a.stock) > 0 ? 1 : 0;
       const sb = numberOrZero(b.stock) > 0 ? 1 : 0;
@@ -522,23 +546,24 @@ async function findBestProduct(env, queryText, opts = {}) {
     return pool[0] || null;
   };
 
-  // 1) RPC (si existe)
+  // 1) RPC fuzzy (si existe)
   try {
-    const res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 40 }) || [];
+    const res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 50 }) || [];
     const pick1 = scoreAndPick(res);
     if (pick1) return pick1;
-  } catch (e) { /* silencioso */ }
+  } catch (_) {}
 
-  // 2) LIKE por “toner” como red de seguridad
+  // 2) LIKE por texto principal
   try {
-    const likeToner = encodeURIComponent(`%toner%`);
+    const likeToner = /\bton(e|é)r|t[oó]ner|cartucho/i.test(queryText) ? '%toner%' : '%';
+    const like = encodeURIComponent(likeToner);
     const r2 = await sbGet(env, 'producto_stock_v', {
       query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&` +
-             `or=(nombre.ilike.${likeToner},sku.ilike.${likeToner})&` +
-             `order=stock.desc.nullslast,precio.asc&limit=400`
+             `or=(nombre.ilike.${like},sku.ilike.${like})&` +
+             `order=stock.desc.nullslast,precio.asc&limit=500`
     }) || [];
-    const pick3 = scoreAndPick(r2);
-    if (pick3) return pick3;
+    const pick2 = scoreAndPick(r2);
+    if (pick2) return pick2;
   } catch (_) {}
 
   return null;
@@ -647,7 +672,7 @@ async function handleCollectSequential(env, session, toE164, text, now){
   const res = await createOrderFromSession(env, session, toE164);
   if (res?.ok) {
     await sendWhatsAppText(env, toE164, `¡Listo! Generé tu solicitud 🙌\n*Total estimado:* ${formatMoneyMXN(res.total)} + IVA\nUn asesor te confirmará entrega y forma de pago.`);
-    await notifySupport(env, `Nuevo pedido #${res.pedido_id ?? '—'}\nCliente: ${c.nombre} (${toE164})`);
+    await notifySupport(env, `Nuevo pedido #${c.nombre ? c.nombre : ''} (${toE164})`);
   } else {
     await sendWhatsAppText(env, toE164, `Creé tu solicitud y la pasé a un asesor humano para confirmar detalles. 🙌`);
     await notifySupport(env, `Pedido (parcial) ${toE164}. Error: ${res?.error || 'N/A'}`);
@@ -731,65 +756,70 @@ async function createOrderFromSession(env, session, toE164) {
       } catch(e){ /* noop */ }
     }
 
-    return { ok: true, pedido_id, total };
-  } catch (e) {
     console.warn('createOrderFromSession', e);
     return { ok: false, error: String(e) };
   }
 }
 
 /* ============================ Supabase Helpers ============================ */
-async function sbGet(env, table, { query }){
+async function sbGet(env, table, { query }) {
   const url = `${env.SUPABASE_URL}/rest/v1/${table}?${query}`;
   const r = await fetch(url, {
-    headers: { apikey: env.SUPABASE_ANON_KEY, Authorization: `Bearer ${env.SUPABASE_ANON_KEY}` }
+    headers: {
+      apikey: env.SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${env.SUPABASE_ANON_KEY}`
+    }
   });
   if (!r.ok) { console.warn('sbGet', table, await r.text()); return null; }
   return await r.json();
 }
-async function sbUpsert(env, table, rows, { onConflict, returning='representation' }={}){
-  const url = `${env.SUPABASE_URL}/rest/v1/${table}${onConflict?`?on_conflict=${onConflict}`:''}`;
+async function sbUpsert(env, table, rows, { onConflict, returning = 'representation' } = {}) {
+  const url = `${env.SUPABASE_URL}/rest/v1/${table}${onConflict ? `?on_conflict=${onConflict}` : ''}`;
   const r = await fetch(url, {
-    method:'POST',
+    method: 'POST',
     headers: {
       apikey: env.SUPABASE_ANON_KEY,
-      Authorization:`Bearer ${env.SUPABASE_ANON_KEY}`,
-      'Content-Type':'application/json',
-      Prefer:`resolution=merge-duplicates,return=${returning}`
+      Authorization: `Bearer ${env.SUPABASE_ANON_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: `resolution=merge-duplicates,return=${returning}`
     },
     body: JSON.stringify(rows)
   });
   if (!r.ok) { console.warn('sbUpsert', table, await r.text()); return null; }
-  const data = returning==='minimal' ? null : await r.json();
+  const data = returning === 'minimal' ? null : await r.json();
   return { data };
 }
-async function sbPatch(env, table, patch, filter){
+async function sbPatch(env, table, patch, filter) {
   const url = `${env.SUPABASE_URL}/rest/v1/${table}?${filter}`;
   const r = await fetch(url, {
-    method:'PATCH',
+    method: 'PATCH',
     headers: {
       apikey: env.SUPABASE_ANON_KEY,
-      Authorization:`Bearer ${env.SUPABASE_ANON_KEY}`,
-      'Content-Type':'application/json',
-      Prefer:'return=minimal'
+      Authorization: `Bearer ${env.SUPABASE_ANON_KEY}`,
+      'Content-Type': 'application/json',
+      Prefer: 'return=minimal'
     },
     body: JSON.stringify(patch)
   });
   if (!r.ok) console.warn('sbPatch', table, await r.text());
 }
-async function sbRpc(env, fn, params){
+async function sbRpc(env, fn, params) {
   const url = `${env.SUPABASE_URL}/rest/v1/rpc/${fn}`;
   const r = await fetch(url, {
-    method:'POST',
-    headers: { apikey: env.SUPABASE_ANON_KEY, Authorization:`Bearer ${env.SUPABASE_ANON_KEY}`, 'Content-Type':'application/json' },
-    body: JSON.stringify(params||{})
+    method: 'POST',
+    headers: {
+      apikey: env.SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${env.SUPABASE_ANON_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(params || {})
   });
   if (!r.ok) { console.warn('sbRpc', fn, await r.text()); return null; }
   return await r.json();
 }
 
 /* ============================ SEPOMEX helper ============================ */
-async function cityFromCP(env, cp){
+async function cityFromCP(env, cp) {
   try {
     const r = await sbGet(env, 'sepomex_cp', { query: `cp=eq.${encodeURIComponent(cp)}&select=cp,estado,municipio,ciudad&limit=1` });
     return r?.[0] || null;
@@ -797,236 +827,40 @@ async function cityFromCP(env, cp){
 }
 
 /* =============================== SOPORTE + GCal ============================ */
-function parseBrandModel(text=''){
-  const t = normalizeWithAliases(text);
-  let marca = null;
-  if (/\bxerox\b/i.test(t)) marca = 'Xerox';
-  else if (/\bfujifilm|fuji\s?film\b/i.test(t)) marca = 'Fujifilm';
-
-  const norm = t.replace(/\s+/g,' ').trim();
-  const mDocu = norm.match(/\bdocu ?color\s*(550|560|570)\b/i);
-  if (mDocu) return { marca: marca || 'Xerox', modelo: `DOCUCOLOR ${mDocu[1]}` };
-  const mVers = norm.match(/\bversant\s*(80|180|2100|280|4100)\b/i);
-  if (mVers) return { marca: marca || 'Xerox', modelo: `VERSANT ${mVers[1]}` };
-  const mVL = norm.match(/\b(versalink|versa ?link)\s*([a-z0-9\-]+)\b/i);
-  if (mVL) return { marca: marca || 'Xerox', modelo: `${mVL[1].replace(/\s/,'').toUpperCase()} ${mVL[2].toUpperCase()}` };
-  const mAL = norm.match(/\b(altalink|alta ?link)\s*([a-z0-9\-]+)\b/i);
-  if (mAL) return { marca: marca || 'Xerox', modelo: `${mAL[1].replace(/\s/,'').toUpperCase()} ${mAL[2].toUpperCase()}` };
-  const mPL = norm.match(/\b(primelink|prime ?link)\s*([a-z0-9\-]+)\b/i);
-  if (mPL) return { marca: marca || 'Xerox', modelo: `${mPL[1].replace(/\s/,'').toUpperCase()} ${mPL[2].toUpperCase()}` };
-  const mSeries = norm.match(/\b([cb]\d{2,4})\b/i);
-  if (mSeries) return { marca, modelo: mSeries[1].toUpperCase() };
-  return { marca, modelo: null };
-}
-
-function extractSvInfo(text) {
-  const t = normalizeWithAliases(text);
-  const out = {};
-  if (/xerox/i.test(t)) out.marca = 'Xerox';
-  else if (/fujifilm|fuji\s?film/i.test(t)) out.marca = 'Fujifilm';
-
-  const pm = parseBrandModel(text);
-  if (pm.marca && !out.marca) out.marca = pm.marca;
-  if (pm.modelo) out.modelo = pm.modelo;
-
-  const err = t.match(/\berror\s*([0-9\-]+)\b/i);
-  if (err) out.error_code = err[1];
-
-  if (/no imprime/i.test(t)) out.falla = 'No imprime';
-  if (/atasc(a|o)|se atora|se traba|arrugad(i|o)|saca el papel/i.test(t)) out.falla = 'Atasco/arrugado de papel';
-  if (/mancha|calidad|linea|l[ií]nea/i.test(t)) out.falla = 'Calidad de impresión';
-  if (/\b(parado|urgente|producci[oó]n detenida|parada)\b/i.test(t)) out.prioridad = 'alta';
-
-  const loose = parseAddressLoose(text);
-  Object.assign(out, loose);
-
-  const d = parseCustomerText(text);
-  if (d.calle) out.calle = d.calle;
-  if (d.numero) out.numero = d.numero;
-  if (d.colonia) out.colonia = d.colonia;
-  if (d.cp) out.cp = d.cp;
-  if (d.ciudad) out.ciudad = d.ciudad;
-  if (d.estado) out.estado = d.estado;
-
-  return out;
-}
-
-function parseAddressLoose(text=''){
-  const out = {};
-  const mcp = text.match(/\bcp\s*(\d{5})\b/i) || text.match(/\b(\d{5})\b/);
-  if (mcp) out.cp = mcp[1];
-  const calle = text.match(/\bcalle\s+([a-z0-9\s\.#\-]+)\b/i); if (calle) out.calle = clean(calle[1]);
-  const num = text.match(/\bn[uú]mero\s+(\d+[A-Z]?)\b/i);    if (num) out.numero = num[1];
-  const col = text.match(/\bcolonia\s+([a-z0-9\s\.\-]+)\b/i); if (col) out.colonia = clean(col[1]);
-  return out;
-}
-function parseCustomerText(text=''){
-  const out = {};
-  const email = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
-  if (email) out.email = email[0].toLowerCase();
-  const nombre = text.match(/\b(soy|me llamo)\s+([a-záéíóúñ\s]{3,})/i);
-  if (nombre) out.nombre = toTitleCase(firstWord(nombre[2]));
-  return out;
-}
-
-async function handleSupport(env, session, toE164, text, lowered, ntext, now, intent){
+async function getCalendarPool(env) {
   try {
-    session.data = session.data || {};
-    session.data.last_intent = 'support';
-    session.data.sv = session.data.sv || {};
-    const sv = session.data.sv;
-
-    if (session.stage === 'sv_collect' && session.data.sv_need_next) {
-      svFillFromAnswer(sv, session.data.sv_need_next, text, env);
-      await saveSession(env, session, now);
-    }
-
-    const mined = extractSvInfo(text);
-    ['marca','modelo','falla','calle','numero','colonia','cp','ciudad','estado','error_code','prioridad','nombre','email'].forEach(k=>{
-      if (!truthy(sv[k]) && truthy(mined[k])) sv[k]=mined[k];
+    return await sbGet(env, 'calendar_pool', { query: 'select=name,calendar_id,active&active=is.true&order=created_at.asc' }) || [];
+  } catch { return []; }
+}
+async function upsertClienteByPhone(env, phone) {
+  try {
+    const found = await sbGet(env, 'cliente', { query: `select=id&telefono=eq.${phone}&limit=1` });
+    if (found && found[0]) return found[0].id;
+    const ins = await sbUpsert(env, 'cliente', [{ telefono: phone }], { onConflict: 'telefono', returning: 'representation' });
+    return ins?.data?.[0]?.id || null;
+  } catch { return null; }
+}
+async function getLastOpenOS(env, phone) {
+  try {
+    const qCli = await sbGet(env, 'cliente', { query: `select=id&telefono=eq.${phone}&limit=1` });
+    const cid = qCli?.[0]?.id;
+    if (!cid) return null;
+    const os = await sbGet(env, 'orden_servicio', {
+      query: `select=id,cliente_id,estado,ventana_inicio,ventana_fin,gcal_event_id,calendar_id&cliente_id=eq.${cid}&` +
+             `or=(estado.eq.agendado,estado.eq.pendiente)&order=ventana_inicio.desc&limit=1`
     });
-
-    if (!sv._welcomed) {
-      sv._welcomed = true;
-      await sendWhatsAppText(env, toE164, `Te ayudo con soporte técnico 👨‍🔧. Dime por favor la *marca y el modelo* del equipo y una breve *descripción* de la falla.`);
-    }
-
-    // Completar datos del cliente si existen
-    await preloadCustomerIfAny(env, session);
-    const c = session.data.customer || {};
-    if (!sv.nombre && truthy(c.nombre)) sv.nombre = c.nombre;
-    if (!sv.email && truthy(c.email)) sv.email = c.email;
-
-    // ¿Qué falta?
-    const needed = [];
-    if (!(truthy(sv.marca) && truthy(sv.modelo))) needed.push('modelo');
-    if (!truthy(sv.falla))  needed.push('falla');
-    if (!truthy(sv.calle))  needed.push('calle');
-    if (!truthy(sv.numero)) needed.push('numero');
-    if (!truthy(sv.colonia))needed.push('colonia');
-    if (!truthy(sv.cp))     needed.push('cp');
-    if (!truthy(sv.nombre)) needed.push('nombre');
-    if (!truthy(sv.email))  needed.push('email');
-    if (!sv.when?.start)    needed.push('horario');
-
-    if (needed.length) {
-      session.stage = 'sv_collect';
-      session.data.sv_need_next = needed[0];
-      await saveSession(env, session, now);
-      const Q = {
-        modelo: '¿Qué *marca y modelo* es tu impresora? (p.ej., *Xerox DocuColor 550* o *Xerox Versant 180*)',
-        falla: '¿Me describes brevemente la *falla*? (p.ej., "*atasco en fusor*", "*no imprime*")',
-        calle: '¿En qué *calle* está el equipo?',
-        numero: '¿Qué *número* es?',
-        colonia: '¿*Colonia*?',
-        cp: '¿*Código Postal* (5 dígitos)?',
-        horario: '¿Qué día y hora te viene bien entre *10:00 y 15:00*? (ej: "*mañana 12:30*")',
-        nombre: '¿A nombre de quién registramos la visita?',
-        email: '¿Cuál es tu *email* para enviarte confirmaciones?'
-      };
-      await sendWhatsAppText(env, toE164, Q[needed[0]]);
-      return ok('EVENT_RECEIVED');
-    }
-
-    // === Agenda (GCal) + OS ===
-    let pool = [];
-    try { pool = await getCalendarPool(env) || []; } catch(e){ console.warn('[GCal] pool', e); }
-
-    // usar los dos primeros activos si hay
-    const candidates = pool.filter(p => p.active !== false).slice(0,2);
-    const cal = candidates[0] || pool[0] || null;
-    const tz = env.TZ || 'America/Mexico_City';
-    const when = parseNaturalDateTime(lowered, env) || sv.when || { start:new Date().toISOString(), end:new Date(Date.now()+60*60*1000).toISOString() };
-    const slot = clampToWindow(when, tz);
-
-    const cliente_id = await upsertClienteByPhone(env, session.from);
-    try { await ensureClienteFields(env, cliente_id, { nombre: sv.nombre, email: sv.email, calle: sv.calle, numero: sv.numero, colonia: sv.colonia, ciudad: sv.ciudad, estado: sv.estado, cp: sv.cp }); } catch (_) {}
-
-    // Crear en GCal
-    let event = null; let calName = cal?.name || '';
-    if (cal && env.GCAL_REFRESH_TOKEN && env.GCAL_CLIENT_ID && env.GCAL_CLIENT_SECRET) {
-      try {
-        const nearest = await findNearestFreeSlot(env, cal.calendar_id, slot, tz);
-        const osTmpNumber = Math.floor(Date.now()/1000); // número temporal para el título
-        const summary = `${sv.nombre || 'Cliente'} — ${sv.modelo || 'Equipo'} — OS#${osTmpNumber}`;
-        event = await gcalCreateEvent(env, cal.calendar_id, {
-          summary,
-          description: renderOsDescription(session.from, sv),
-          start: nearest.start, end: nearest.end, timezone: tz
-        });
-        // usar la hora final agendada
-        slot.start = nearest.start; slot.end = nearest.end;
-      } catch (e) { console.warn('[GCal] create error', e); }
-    }
-
-    // Crear OS en supabase
-    let osId = null; let estado = event ? 'agendado' : 'pendiente';
-    try {
-      const osBody = [{
-        cliente_id, marca: sv.marca || null, modelo: sv.modelo || null, falla_descripcion: sv.falla || null,
-        prioridad: sv.prioridad || 'media', estado,
-        ventana_inicio: new Date(slot.start).toISOString(), ventana_fin: new Date(slot.end).toISOString(),
-        gcal_event_id: event?.id || null, calendar_id: cal?.calendar_id || null,
-        calle: sv.calle || null, numero: sv.numero || null, colonia: sv.colonia || null, ciudad: sv.ciudad || null, estado: sv.estado || null, cp: sv.cp || null,
-        created_at: new Date().toISOString()
-      }];
-      const os = await sbUpsert(env, 'orden_servicio', osBody, { returning: 'representation' });
-      osId = os?.data?.[0]?.id || null;
-
-      // Renombrar evento con OS real si se pudo crear
-      if (event && osId) {
-        const pretty = `${sv.nombre || 'Cliente'} — ${sv.modelo || 'Equipo'} — OS#${osId}`;
-        await gcalPatchEvent(env, cal.calendar_id, event.id, { summary: pretty });
-      }
-    } catch (e) { console.warn('[Supabase] OS upsert', e); estado = 'pendiente'; }
-
-    if (event) {
-      await sendWhatsAppText(env, toE164,
-        `¡Listo! Agendé tu visita 🙌\n*${fmtDate(slot.start, tz)}*, de *${fmtTime(slot.start, tz)}* a *${fmtTime(slot.end, tz)}*\nDirección: ${sv.calle} ${sv.numero}, ${sv.colonia}, ${sv.cp} ${sv.ciudad || ''}\nTécnico asignado: ${calName || 'por confirmar'}.\n\nSi necesitas reprogramar o cancelar, dímelo con confianza.`
-      );
-      session.stage = 'sv_scheduled';
-    } else {
-      await sendWhatsAppText(env, toE164, `Tomé tus datos ✍️. En breve te confirmo el horario exacto por este medio.`);
-      await notifySupport(env, `OS *pendiente/agendar* para ${toE164}\nEquipo: ${sv.marca||''} ${sv.modelo||''}\nFalla: ${sv.falla}\nDirección: ${sv.calle} ${sv.numero} ${sv.colonia}, CP ${sv.cp} ${sv.ciudad||''}\nNombre: ${sv.nombre} | Email: ${sv.email}`);
-      session.stage = 'sv_scheduled';
-    }
-
-    session.data.sv.os_id = osId;
-    session.data.sv.gcal_event_id = event?.id || null;
-    await saveSession(env, session, now);
-    return ok('EVENT_RECEIVED');
-
-  } catch (e) {
-    console.warn('[SUPPORT] handleSupport catch', e);
-    try{
-      const need = session?.data?.sv_need_next || 'modelo';
-      await sendWhatsAppText(env, toE164, `Gracias por la info. Para avanzar, ¿${displayFieldSupport(need)}?`);
-    }catch{
-      await sendWhatsAppText(env, toE164, `Tomé tu solicitud de soporte. Si te parece, seguimos con los datos para agendar o te contacto enseguida 🙌`);
-    }
-    return ok('EVENT_RECEIVED');
-  }
+    return os?.[0] || null;
+  } catch { return null; }
 }
-function displayFieldSupport(k){
-  const map = {
-    modelo:'marca y modelo', falla:'descripción breve de la falla', nombre:'Nombre o Razón Social', email:'email',
-    calle:'calle', numero:'número', colonia:'colonia', ciudad:'ciudad o municipio', estado:'estado', cp:'código postal', horario:'día y hora (10:00–15:00)'
-  };
-  return map[k]||k;
-}
-function svFillFromAnswer(sv, field, text, env){
-  const pm = parseBrandModel(text);
-  if (field === 'modelo') { if (pm.marca) sv.marca = pm.marca; if (pm.modelo) sv.modelo = pm.modelo; if (!sv.modelo) sv.modelo = clean(text); return; }
-  if (field === 'falla')   { sv.falla = clean(text); return; }
-  if (field === 'nombre')  { sv.nombre = clean(text); return; }
-  if (field === 'email')   { const em = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i); sv.email = em ? em[0].toLowerCase() : clean(text).toLowerCase(); return; }
-  if (field === 'calle')   { sv.calle = clean(text); return; }
-  if (field === 'numero')  { const mnum = text.match(/\b(\d+[A-Z]?)\b/); sv.numero = mnum?mnum[1]:clean(text); return; }
-  if (field === 'colonia') { sv.colonia = clean(text); return; }
-  if (field === 'ciudad')  { sv.ciudad = clean(text); return; }
-  if (field === 'estado')  { sv.estado = clean(text); return; }
-  if (field === 'cp')      { const mcp = text.match(/\b(\d{5})\b/); sv.cp = mcp?mcp[1]:clean(text); return; }
-  if (field === 'horario') { const dt = parseNaturalDateTime(text, env); if (dt?.start) sv.when = dt; return; }
+function renderOsDescription(from, sv) {
+  return [
+    `WhatsApp: ${from}`,
+    `Equipo: ${sv.marca || ''} ${sv.modelo || ''}`.trim(),
+    `Falla: ${sv.falla || ''}`,
+    sv.error_code ? `Código de error: ${sv.error_code}` : null,
+    `Dirección: ${[sv.calle, sv.numero, sv.colonia, sv.cp, sv.ciudad || '', sv.estado || ''].filter(Boolean).join(' ')}`,
+    `Prioridad: ${sv.prioridad || 'media'}`
+  ].filter(Boolean).join('\n');
 }
 
 async function svCancel(env, session, toE164) {
@@ -1038,274 +872,176 @@ async function svCancel(env, session, toE164) {
 }
 async function svReschedule(env, session, toE164, when) {
   const os = await getLastOpenOS(env, session.from);
-  if (!os) {
-    await sendWhatsAppText(env, toE164, `No encuentro una visita activa para reprogramar.`);
-    return;
-  }
+  if (!os) { await sendWhatsAppText(env, toE164, `No encuentro una visita activa para reprogramar.`); return; }
   const tz = env.TZ || 'America/Mexico_City';
   const slot = clampToWindow(when, tz);
 
-  // mover evento en Google Calendar si existe
+  // Reprogramar en GCal si existe
   if (os.gcal_event_id && os.calendar_id) {
     try {
+      const nearest = await findNearestFreeSlot(env, os.calendar_id, slot, tz);
       await gcalPatchEvent(env, os.calendar_id, os.gcal_event_id, {
-        start: slot.start, end: slot.end, timezone: tz
+        start: nearest.start, end: nearest.end, timezone: tz
       });
-      await sbUpsert(env, 'orden_servicio', [{
-        id: os.id, ventana_inicio: new Date(slot.start).toISOString(),
-        ventana_fin: new Date(slot.end).toISOString(), estado: 'agendado'
-      }], { returning: 'minimal' });
-      await sendWhatsAppText(env, toE164,
-        `Reprogramé tu visita a *${fmtDate(slot.start, tz)}* de *${fmtTime(slot.start, tz)}* a *${fmtTime(slot.end, tz)}* ✅`
-      );
-      return;
-    } catch (e) { console.warn('[GCal] reschedule', e); }
+      slot.start = nearest.start; slot.end = nearest.end;
+    } catch (e) { console.warn('[GCal] resched', e); }
   }
 
-  // si no hay evento, sólo actualiza en OS
   await sbUpsert(env, 'orden_servicio', [{
-    id: os.id, ventana_inicio: new Date(slot.start).toISOString(),
-    ventana_fin: new Date(slot.end).toISOString(), estado: 'pendiente'
+    id: os.id, ventana_inicio: slot.start, ventana_fin: slot.end, estado: 'agendado'
   }], { returning: 'minimal' });
+
   await sendWhatsAppText(env, toE164,
-    `Actualicé tu ventana a *${fmtDate(slot.start, tz)}* de *${fmtTime(slot.start, tz)}* a *${fmtTime(slot.end, tz)}*. En breve confirmo el técnico.`
+    `Actualicé tu visita: *${fmtDate(slot.start, tz)}*, de *${fmtTime(slot.start, tz)}* a *${fmtTime(slot.end, tz)}*.`
   );
 }
-
 async function svWhenIsMyVisit(env, session, toE164) {
   const os = await getLastOpenOS(env, session.from);
-  if (!os) {
-    await sendWhatsAppText(env, toE164, `No encuentro una visita activa registrada a tu número.`);
-    return;
-  }
+  if (!os) { await sendWhatsAppText(env, toE164, `No veo una visita activa. Si gustas la agendamos 🙂`); return; }
   const tz = env.TZ || 'America/Mexico_City';
   await sendWhatsAppText(env, toE164,
-    `Tu visita está ${os.estado || 'pendiente'} para *${fmtDate(os.ventana_inicio, tz)}* entre *${fmtTime(os.ventana_inicio, tz)}* y *${fmtTime(os.ventana_fin, tz)}*.`
+    `Tu visita está para *${fmtDate(os.ventana_inicio, tz)}* de *${fmtTime(os.ventana_inicio, tz)}* a *${fmtTime(os.ventana_fin, tz)}*.`
   );
 }
 
-/* ============================ Support helpers ============================ */
-async function getLastOpenOS(env, phone) {
-  try {
-    // 1) get cliente id por teléfono
-    const c = await sbGet(env, 'cliente', {
-      query: `select=id&telefono=eq.${encodeURIComponent(phone)}&limit=1`
-    });
-    if (!c || !c[0]) return null;
-    const cliente_id = c[0].id;
-
-    // 2) última OS abierta
-    const os = await sbGet(env, 'orden_servicio', {
-      query: `select=id,estado,ventana_inicio,ventana_fin,gcal_event_id,calendar_id&cliente_id=eq.${cliente_id}&` +
-             `or=(estado.eq.pendiente,estado.eq.agendado)&order=created_at.desc&limit=1`
-    });
-    return (os && os[0]) || null;
-  } catch (e) { console.warn('getLastOpenOS', e); return null; }
-}
-
-async function upsertClienteByPhone(env, phone) {
-  try {
-    const r = await sbGet(env, 'cliente', {
-      query: `select=id&telefono=eq.${encodeURIComponent(phone)}&limit=1`
-    });
-    if (r && r[0]) return r[0].id;
-    const ins = await sbUpsert(env, 'cliente', [{ telefono: phone }], { onConflict: 'telefono', returning: 'representation' });
-    return ins?.data?.[0]?.id || null;
-  } catch (e) { console.warn('upsertClienteByPhone', e); return null; }
-}
-
-async function getCalendarPool(env) {
-  try {
-    const r = await sbGet(env, 'calendar_pool', {
-      query: `select=name,calendar_id,active&order=created_at.asc`
-    });
-    return r || [];
-  } catch (e) { console.warn('getCalendarPool', e); return []; }
-}
-
-function renderOsDescription(fromPhone, sv) {
-  const lines = [
-    `WhatsApp: ${fromPhone}`,
-    `Equipo: ${sv.marca || ''} ${sv.modelo || ''}`.trim(),
-    `Falla: ${sv.falla || ''}`,
-    `Prioridad: ${sv.prioridad || 'media'}`,
-    `Dirección: ${[sv.calle, sv.numero, sv.colonia, sv.cp, sv.ciudad, sv.estado].filter(Boolean).join(', ')}`,
-    `Contacto: ${sv.nombre || ''} | ${sv.email || ''}`
-  ];
-  return lines.filter(Boolean).join('\n');
-}
-
-/* ============================ Date/Time helpers ============================ */
-// Parser sencillo: "hoy 12:30", "mañana 11", "viernes 10", "2025-10-11 13:00"
-function parseNaturalDateTime(text, env) {
-  const tz = env?.TZ || 'America/Mexico_City';
-  const now = new Date();
-  const base = new Date(now.getTime());
-
-  const t = normalizeBase(text);
-  const timeM = t.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/);
-  let hour = 12, minute = 0;
-  if (timeM) {
-    hour = Number(timeM[1]);
-    minute = Number(timeM[2] || 0);
-    const ampm = (timeM[3] || '').toLowerCase();
-    if (ampm === 'pm' && hour < 12) hour += 12;
-    if (ampm === 'am' && hour === 12) hour = 0;
-  }
-
-  // fecha explícita YYYY-MM-DD
-  const ymd = t.match(/\b(20\d{2})[\/\-\s\.](\d{1,2})[\/\-\s\.](\d{1,2})\b/);
-  if (ymd) {
-    const y = Number(ymd[1]), m = Number(ymd[2]) - 1, d = Number(ymd[3]);
-    const start = new Date(Date.UTC(y, m, d, hour, minute));
-    const end = new Date(start.getTime() + 60 * 60 * 1000);
-    return { start: start.toISOString(), end: end.toISOString() };
-  }
-
-  // hoy / mañana
-  if (/\b(ma[nñ]ana)\b/.test(t)) base.setUTCDate(base.getUTCDate() + 1);
-  // día de semana
-  const dows = ['domingo','lunes','martes','miercoles','miércoles','jueves','viernes','sabado','sábado'];
-  const dowIdx = dows.findIndex(w => t.includes(w));
-  if (dowIdx >= 0) {
-    // map to 0-6
-    const target = [0,1,2,3,3,4,5,6,6][dowIdx];
-    const cur = now.getDay();
-    let add = target - cur; if (add <= 0) add += 7;
-    base.setUTCDate(base.getUTCDate() + add);
-  }
-
-  // compón fecha
-  const start = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate(), hour, minute));
-  const end = new Date(start.getTime() + 60 * 60 * 1000);
-  return { start: start.toISOString(), end: end.toISOString() };
-}
-
-// Asegura ventana entre 10:00–15:00 local (1h)
-function clampToWindow(when, tz) {
-  try {
-    const start = new Date(when.start || new Date().toISOString());
-    const end = new Date(when.end || (start.getTime() + 60*60*1000));
-    const s = new Date(start);
-    const e = new Date(end);
-
-    // mover a rango [10:00, 15:00]
-    const sh = s.getUTCHours(), sm = s.getUTCMinutes();
-    // 10:00 local ~ 16:00 UTC para CDMX cuando DST off; esto es aproximado.
-    // Para no complicar con librerías, validamos sólo por hora "lógica"
-    const localHour = sh; // aproximación suficiente para confirmar al cliente
-    if (localHour < 10) { s.setUTCHours(16, 0, 0, 0); e.setTime(s.getTime()+60*60*1000); }
-    if (localHour >= 15) { s.setUTCHours(20, 0, 0, 0); e.setTime(s.getTime()+60*60*1000); }
-    return { start: s.toISOString(), end: e.toISOString() };
-  } catch { 
-    const s = new Date(); const e = new Date(s.getTime()+60*60*1000);
-    return { start: s.toISOString(), end: e.toISOString() };
-  }
-}
-
-function fmtDate(iso, tz) {
-  try {
-    return new Intl.DateTimeFormat('es-MX', { timeZone: tz, weekday:'long', day:'2-digit', month:'long' }).format(new Date(iso));
-  } catch {
-    const d = new Date(iso); return d.toISOString().slice(0,10);
-  }
-}
-function fmtTime(iso, tz) {
-  try {
-    return new Intl.DateTimeFormat('es-MX', { timeZone: tz, hour:'2-digit', minute:'2-digit' }).format(new Date(iso));
-  } catch {
-    const d = new Date(iso); return `${d.getUTCHours()}:${String(d.getUTCMinutes()).padStart(2,'0')} UTC`;
-  }
-}
-
-/* ============================ Google Calendar ============================ */
-async function getGoogleAccessToken(env) {
-  const body = new URLSearchParams({
+/* --------- GCal OAuth + API --------- */
+async function gcalAccessToken(env) {
+  const url = 'https://oauth2.googleapis.com/token';
+  const body = {
     client_id: env.GCAL_CLIENT_ID,
     client_secret: env.GCAL_CLIENT_SECRET,
-    refresh_token: env.GCAL_REFRESH_TOKEN,
-    grant_type: 'refresh_token'
-  });
-  const r = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body
-  });
-  if (!r.ok) throw new Error(`gToken ${r.status} ${await r.text()}`);
+    grant_type: 'refresh_token',
+    refresh_token: env.GCAL_REFRESH_TOKEN
+  };
+  const r = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  if (!r.ok) throw new Error(`gcal token: ${r.status} ${await r.text()}`);
   const j = await r.json();
   return j.access_token;
 }
-
 async function gcalCreateEvent(env, calendarId, { summary, description, start, end, timezone }) {
-  const token = await getGoogleAccessToken(env);
+  const token = await gcalAccessToken(env);
   const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`;
-  const payload = {
+  const body = {
     summary, description,
-    start: { dateTime: start, timeZone: timezone },
-    end:   { dateTime: end,   timeZone: timezone }
+    start: { dateTime: new Date(start).toISOString(), timeZone: timezone },
+    end:   { dateTime: new Date(end).toISOString(),   timeZone: timezone }
   };
   const r = await fetch(url, {
-    method:'POST',
-    headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
-    body: JSON.stringify(payload)
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
   });
-  if (!r.ok) throw new Error(`gcalCreateEvent ${r.status} ${await r.text()}`);
+  if (!r.ok) throw new Error(`gcal create: ${r.status} ${await r.text()}`);
   return await r.json();
 }
-
-async function gcalPatchEvent(env, calendarId, eventId, { summary, start, end, timezone }) {
-  const token = await getGoogleAccessToken(env);
+async function gcalPatchEvent(env, calendarId, eventId, { summary, description, start, end, timezone }) {
+  const token = await gcalAccessToken(env);
   const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`;
-  const payload = {};
-  if (summary) payload.summary = summary;
+  const body = {};
+  if (summary) body.summary = summary;
+  if (description) body.description = description;
   if (start && end) {
-    payload.start = { dateTime: start, timeZone: timezone };
-    payload.end   = { dateTime: end,   timeZone: timezone };
+    body.start = { dateTime: new Date(start).toISOString(), timeZone: timezone };
+    body.end   = { dateTime: new Date(end).toISOString(),   timeZone: timezone };
   }
   const r = await fetch(url, {
-    method:'PATCH',
-    headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
-    body: JSON.stringify(payload)
+    method: 'PATCH',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
   });
-  if (!r.ok) throw new Error(`gcalPatchEvent ${r.status} ${await r.text()}`);
+  if (!r.ok) throw new Error(`gcal patch: ${r.status} ${await r.text()}`);
   return await r.json();
 }
-
 async function gcalDeleteEvent(env, calendarId, eventId) {
-  const token = await getGoogleAccessToken(env);
-  const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`;
-  const r = await fetch(url, { method:'DELETE', headers:{ Authorization:`Bearer ${token}` } });
-  if (!r.ok && r.status !== 204) throw new Error(`gcalDeleteEvent ${r.status} ${await r.text()}`);
-  return true;
-}
-
-// simple “freebusy” dummy: por ahora, usa el slot solicitado
-async function findNearestFreeSlot(env, calendarId, slot, tz) {
-  // (Podemos consultar freebusy aquí; para Lite mantengo directo)
-  return { start: slot.start, end: slot.end };
-}
-
-/* ============================ WhatsApp inbound parser ============================ */
-function extractWhatsAppContext(payload) {
   try {
-    const entry = payload?.entry?.[0];
+    const token = await gcalAccessToken(env);
+    const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`;
+    const r = await fetch(url, { method: 'DELETE', headers: { Authorization: `Bearer ${token}` } });
+    if (!r.ok) console.warn('gcal delete', r.status, await r.text());
+  } catch (e) { console.warn('gcalDeleteEvent', e); }
+}
+
+/* --------- Horarios/fechas naturales --------- */
+function parseNaturalDateTime(text, env) {
+  const tz = env?.TZ || 'America/Mexico_City';
+  const now = new Date();
+  const lower = (text || '').toLowerCase();
+
+  // Día base
+  let d = new Date(now);
+  if (/\bpasado\s*ma[ñn]ana\b/.test(lower)) d.setDate(d.getDate() + 2);
+  else if (/\bma[ñn]ana\b/.test(lower)) d.setDate(d.getDate() + 1);
+  else if (/\bhoy\b/.test(lower)) { /* same */ }
+
+  // Hora
+  let hh = 12, mm = 0; // default mediodía
+  const m1 = lower.match(/\b(\d{1,2})[:\.](\d{2})\b/);
+  const m2 = lower.match(/\b(?:a\s*las\s*)?(\d{1,2})\b/);
+  if (m1) { hh = Number(m1[1]); mm = Number(m1[2]); }
+  else if (m2) { hh = Number(m2[1]); }
+
+  // AM/PM heurística
+  if (/\bpm\b/.test(lower) && hh < 12) hh += 12;
+  if (/\bam\b/.test(lower) && hh === 12) hh = 0;
+
+  const start = new Date(d.getFullYear(), d.getMonth(), d.getDate(), hh, mm);
+  const end = new Date(start.getTime() + 60 * 60 * 1000); // 1h
+  return { start: start.toISOString(), end: end.toISOString() };
+}
+function clampToWindow(when, tz) {
+  const start = new Date(when.start);
+  const end = new Date(when.end);
+  const sh = start.getHours();
+  if (sh < 10) { start.setHours(10, 0); end.setTime(start.getTime() + 60 * 60 * 1000); }
+  if (sh > 15) { start.setHours(15, 0); end.setTime(start.getTime() + 60 * 60 * 1000); }
+  return { start: start.toISOString(), end: end.toISOString() };
+}
+function fmtDate(iso, tz) {
+  try {
+    return new Intl.DateTimeFormat('es-MX', { timeZone: tz, dateStyle: 'full' }).format(new Date(iso));
+  } catch { return new Date(iso).toDateString(); }
+}
+function fmtTime(iso, tz) {
+  try {
+    return new Intl.DateTimeFormat('es-MX', { timeZone: tz, timeStyle: 'short' }).format(new Date(iso));
+  } catch { return new Date(iso).toLocaleTimeString(); }
+}
+
+/* ============================ WhatsApp extractor ============================ */
+function extractWhatsAppContext(body) {
+  try {
+    const entry = body?.entry?.[0];
     const changes = entry?.changes?.[0];
-    const msg = changes?.value?.messages?.[0];
+    const value = changes?.value;
+    const msg = value?.messages?.[0];
     if (!msg) return null;
 
-    const from = msg?.from || changes?.value?.contacts?.[0]?.wa_id;
-    const profileName = changes?.value?.contacts?.[0]?.profile?.name || '';
-    const mid = msg?.id;
-    const ts = msg?.timestamp ? Number(msg.timestamp) * 1000 : Date.now();
+    const from = msg.from; // string sin + (E164 limpio)
+    const fromE164 = `+${from}`;
+    const mid = msg.id;
+    const profileName = value?.contacts?.[0]?.profile?.name || '';
+    const ts = msg.timestamp;
+    const type = msg.type;
 
-    let msgType = msg?.type || 'text';
-    let textRaw = '';
-    let media = null;
-
-    if (msgType === 'text') textRaw = msg?.text?.body || '';
-    else if (msgType === 'audio') media = { id: msg?.audio?.id, mime_type: msg?.audio?.mime_type, voice: msg?.audio?.voice };
-
-    const fromE164 = `+${(from||'').replace(/\D/g,'')}`;
-    return { mid, from, fromE164, profileName, msgType, textRaw, ts, media };
+    if (type === 'text') {
+      return {
+        mid, from, fromE164, profileName, ts,
+        msgType: 'text',
+        textRaw: msg.text?.body || ''
+      };
+    }
+    if (type === 'audio') {
+      return {
+        mid, from, fromE164, profileName, ts,
+        msgType: 'audio',
+        media: { id: msg.audio?.id }
+      };
+    }
+    // cualquier otro
+    return { mid, from, fromE164, profileName, ts, msgType: type, textRaw: '' };
   } catch {
     return null;
   }
 }
+
+   
