@@ -1,7 +1,27 @@
 /**
  * CopiBot – Worker Lite (SIN IA)
  * Conversacional + Ventas + Soporte Técnico + GCal + Supabase
- * Build: “Lite-R14”
+ * Build: “Lite-R15”
+ *
+ * Cloudflare env:
+ *  - WA_TOKEN, PHONE_ID, VERIFY_TOKEN
+ *  - SUPABASE_URL, SUPABASE_ANON_KEY
+ *  - GCAL_CLIENT_ID, GCAL_CLIENT_SECRET, GCAL_REFRESH_TOKEN
+ *  - SUPPORT_WHATSAPP (o SUPPORT_PHONE_E164)
+ *  - TZ (p.ej. America/Mexico_City)
+ *  - CRON_SECRET
+ *
+ * Tablas (schema public):
+ *  - wa_session(from text pk, stage text, data jsonb, updated_at timestamptz, expires_at timestamptz?)
+ *  - producto_stock_v(id, nombre, marca, sku, precio, stock, tipo, compatible)
+ *  - cliente(id uuid pk, nombre, rfc, email, telefono, calle, numero, colonia, ciudad, estado, cp)
+ *  - pedido(id, cliente_id, total, moneda, estado, created_at)
+ *  - pedido_item(pedido_id, producto_id, sku, nombre, qty, precio_unitario)
+ *  - orden_servicio(id uuid, cliente_id uuid, marca text, modelo text, falla_descripcion text, prioridad text,
+ *                   estado text, ventana_inicio timestamptz, ventana_fin timestamptz,
+ *                   gcal_event_id text, calendar_id text,
+ *                   calle text, numero text, colonia text, ciudad text, estado text, cp text, created_at timestamptz)
+ *  - calendar_pool(id uuid, name text, calendar_id text, active bool)
  */
 
 export default {
@@ -32,16 +52,16 @@ export default {
       });
     }
 
-    // --- Cron (opcional)
+    // --- Cron (optional)
     if (req.method === 'POST' && url.pathname === '/cron') {
       const sec = req.headers.get('x-cron-secret') || url.searchParams.get('secret');
       if (!sec || sec !== env.CRON_SECRET) return new Response('Forbidden', { status: 403 });
       return json(await cronReminders(env));
     }
 
-    // --- Webhook principal
+    // --- Main webhook
     if (req.method === 'POST' && url.pathname === '/') {
-      let ctxRef = null; // <- preservamos contexto para el catch
+      let ctxRef = null;
       try {
         const payload = await safeJson(req);
         const ctx = extractWhatsAppContext(payload);
@@ -62,12 +82,12 @@ export default {
           session.data.customer.nombre = toTitleCase(firstWord(profileName));
         }
 
-        // ===== idempotencia (más tolerante: 60s) =====
+        // ===== idempotencia (60s) =====
         const msgTs = Number(ts || Date.now());
         let lastTs = Number(session?.data?.last_ts || 0);
         const nowMs = Date.now();
-        if (lastTs > nowMs + 60 * 60 * 1000) lastTs = 0;       // reseteo defensivo
-        if (lastTs && (msgTs + 60 * 1000) <= lastTs) return ok('EVENT_RECEIVED'); // >60s más viejo
+        if (lastTs > nowMs + 60 * 60 * 1000) lastTs = 0;
+        if (lastTs && (msgTs + 60 * 1000) <= lastTs) return ok('EVENT_RECEIVED');
         session.data.last_ts = Math.max(msgTs, lastTs);
         const lastMid = session?.data?.last_mid || null;
         if (lastMid === mid) return ok('EVENT_RECEIVED');
@@ -97,6 +117,7 @@ export default {
         if (RX_GREET.test(lowered)) {
           session.stage = 'idle';
           session.data.last_candidate = null;
+          session.data.last_candidate_lock = null;
           session.data.cart = session.data.cart || [];
           await saveSession(env, session, now);
           const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
@@ -104,11 +125,11 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // --- atajo: “quiero|dame|agrega 1/2/3 …” con candidato cargado
+        // atajo: “quiero|dame|agrega … 1/2/3”
         if (session.data?.last_candidate) {
           const fastQty = parseFastQty(lowered);
           if (fastQty !== null) {
-            session.stage = 'ask_qty'; // forzamos etapa y pasamos por el handler
+            session.stage = 'ask_qty';
             await saveSession(env, session, now);
             return await handleAskQty(env, session, fromE164, String(fastQty), String(fastQty), ntext, now);
           }
@@ -156,6 +177,7 @@ export default {
         if (salesIntent) {
           session.stage = 'idle';
           session.data.last_candidate = null;
+          session.data.last_candidate_lock = null;
           await saveSession(env, session, now);
           return await startSalesFromQuery(env, session, fromE164, text, ntext, now);
         }
@@ -175,12 +197,7 @@ export default {
 
       } catch (e) {
         console.error('Worker error', e);
-        // Responder sin re-leer el body
-        try {
-          if (ctxRef?.fromE164) {
-            await sendWhatsAppText(env, ctxRef.fromE164, 'Recibí tu mensaje. Tuve un problema momentáneo pero ya quedó, ¿me repites por favor? 🙂');
-          }
-        } catch {}
+        try { if (ctxRef?.fromE164) await sendWhatsAppText(env, ctxRef.fromE164, 'Recibí tu mensaje. Tuve un problema momentáneo pero ya quedó, ¿me repites por favor? 🙂'); } catch {}
         return ok('EVENT_RECEIVED');
       }
     }
@@ -193,7 +210,7 @@ export default {
   }
 };
 
-/* ============ utils ============ */
+/* ========= utils ========= */
 function ok(s='ok'){ return new Response(s, { status:200 }); }
 function json(obj){ return new Response(JSON.stringify(obj), { status:200, headers:{'Content-Type':'application/json'} }); }
 async function safeJson(req){ try{ return await req.json(); }catch{ return {}; } }
@@ -208,7 +225,7 @@ const truthy = v => v!==null && v!==undefined && String(v).trim()!=='';
 const moneyMXN = n => { try{ return new Intl.NumberFormat('es-MX',{style:'currency',currency:'MXN'}).format(Number(n||0)); }catch{ return `$${Number(n||0).toFixed(2)}`; } };
 const priceWithIVA = n => `${moneyMXN(n)} + IVA`;
 
-/* ============ inbound parsing (WA) ============ */
+/* ========= WA parse ========= */
 function extractWhatsAppContext(body){
   try{
     const entry = body?.entry?.[0];
@@ -232,23 +249,20 @@ function extractWhatsAppContext(body){
     const media = m.audio || m.image || m.document || null;
     const ts = (m.timestamp ? Number(m.timestamp)*1000 : Date.now());
     return { mid: m.id, from, fromE164, profileName, textRaw, msgType, ts, media };
-  }catch(e){
-    console.warn('extractWhatsAppContext error', e);
-    return null;
-  }
+  }catch(e){ console.warn('extractWhatsAppContext error', e); return null; }
 }
 
-/* ============ intents (sin IA) ============ */
+/* ========= intents ========= */
 const RX_GREET = /^(hola+|buen[oa]s|qué onda|que tal|saludos|hey|buen dia|buenas|holi+)\b/i;
 const RX_INV_KWS   = /(toner|t[óo]ner|cartucho|developer|unidad de revelado|refacci[oó]n|precio|costo|sku|pieza|compatible)\b/i;
 const RX_MODEL_KWS = /(versant|docucolor|primelink|versalink|altalink|apeos|work ?center|workcentre|c\d{2,4}|b\d{2,4}|550|560|570|2100|180|280|4100|c70|c60|c75)\b/i;
 const RX_NEG_NO = /\b(no|nel|ahorita no|no gracias)\b/i;
 const RX_DONE   = /\b(es(ta)?\s*todo|ser[ií]a\s*todo|nada\s*m[aá]s|con\s*eso|as[ií]\s*est[aá]\s*bien|ya\s*qued[oó]|listo|finaliza(r|mos)?|termina(r)?)\b/i;
 
-/* atajo de cantidad “quiero|dame|agrega … <n>” */
+/* atajo cantidad */
 function parseFastQty(t=''){
-  const m = t.match(/\b(quiero|dame|agrega|añade|pon|sum(a|a)|agregar|añadir)\b.*?\b(\d{1,3})\b/);
-  if (m) return Number(m[3]);
+  const m = t.match(/\b(quiero|dame|agrega|añade|pon|suma|agregar|añadir)\b.*?\b(\d{1,3})\b/);
+  if (m) return Number(m[2]);
   return null;
 }
 
@@ -270,7 +284,7 @@ function isSupportIntent(n){
   return (hasProblem && hasDevice) || /\b(soporte|servicio|visita)\b/.test(t);
 }
 
-/* ============ WhatsApp send ============ */
+/* ========= WhatsApp send ========= */
 async function sendWhatsAppText(env, toE164, body) {
   if (!env.WA_TOKEN || !env.PHONE_ID) return;
   const url = `https://graph.facebook.com/v20.0/${env.PHONE_ID}/messages`;
@@ -289,7 +303,7 @@ async function forwardAudioToSupport(env, media, fromE164) {
   await sendWhatsAppText(env, to, `🗣️ *Audio reenviado*\nDe: ${fromE164}\nMedia ID: ${media?.id||'N/A'} (revísalo en Meta/WA Business).`);
 }
 
-/* ============ sesión (Supabase) ============ */
+/* ========= sesión (Supabase) ========= */
 async function loadSession(env, phone) {
   try {
     const r = await sbGet(env, 'wa_session', { query: `select=from,stage,data,updated_at,expires_at&from=eq.${encodeURIComponent(phone)}&limit=1` });
@@ -305,7 +319,7 @@ async function saveSession(env, session, now=new Date()) {
   } catch(e){ console.warn('saveSession', e); }
 }
 
-/* ============ cantidades / carrito ============ */
+/* ========= cantidades / carrito ========= */
 const NUM_WORDS = { cero:0, una:1, uno:1, un:1, dos:2, tres:3, cuatro:4, cinco:5, seis:6, siete:7, ocho:8, nueve:9, diez:10, once:11, doce:12, docena:12, 'media docena':6 };
 function looksLikeQuantityStrict(t=''){ const hasDigit=/\b\d+\b/.test(t); const hasWord=Object.keys(NUM_WORDS).some(w=>new RegExp(`\\b${w}\\b`,'i').test(t)); return hasDigit||hasWord; }
 function parseQty(text, fallback=1){
@@ -334,16 +348,25 @@ function renderProducto(p){
   const stockLine = s>0 ? `${s} pzas en stock` : `0 pzas — *sobre pedido*`;
   const marca = p.marca ? `\nMarca: ${p.marca}` : '';
   const sku = p.sku ? `\nSKU: ${p.sku}` : '';
-  return `1. ${p.nombre}${marca}${sku}\n${priceWithIVA(p.precio)}\n${stockLine}`;
+  return `1. ${p.nombre}${marca}${sku}\n${priceWithIVA(p.precio)}\n${stockLine}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; lo que exceda el stock va *sobre pedido*.`;
 }
 
-/* ============ flujo ventas ============ */
+/* ========= ventas ========= */
 async function handleAskQty(env, session, toE164, text, lowered, _ntext, now){
   try{
-    const cand = session.data?.last_candidate;
+    // -------- Candado de SKU: si hay lock, recargar ese SKU desde la vista
+    let cand = session.data?.last_candidate || null;
+    const lockSku = session.data?.last_candidate_lock?.sku || null;
+    if (lockSku) {
+      try{
+        const r = await sbGet(env, 'producto_stock_v', { query:`select=id,nombre,marca,sku,precio,stock,tipo,compatible&sku=eq.${encodeURIComponent(lockSku)}&limit=1` });
+        if (r && r[0]) cand = r[0];
+      }catch(e){ console.warn('lockSku fetch', e); }
+    }
 
     if (RX_NEG_NO.test(lowered)) {
       session.data.last_candidate = null;
+      session.data.last_candidate_lock = null;
       session.stage = 'cart_open';
       await saveSession(env, session, now);
       await sendWhatsAppText(env, toE164, 'Sin problema. ¿Busco otra opción? Dime modelo/color o lo que necesitas.');
@@ -393,9 +416,7 @@ async function handleAskQty(env, session, toE164, text, lowered, _ntext, now){
     return ok('EVENT_RECEIVED');
   }catch(err){
     console.warn('handleAskQty error', err);
-    try{
-      await sendWhatsAppText(env, toE164, 'Recibí tu cantidad 👍. Si no viste mi mensaje anterior, dime de nuevo cuántas *piezas* necesitas (número).');
-    }catch{}
+    try{ await sendWhatsAppText(env, toE164, 'Recibí tu cantidad 👍. Si no viste mi mensaje anterior, dime de nuevo cuántas *piezas* necesitas (número).'); }catch{}
     return ok('EVENT_RECEIVED');
   }
 }
@@ -430,14 +451,16 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now){
 
 async function startSalesFromQuery(env, session, toE164, text, ntext, now){
   session.data.last_candidate = null;
+  session.data.last_candidate_lock = null;
   await saveSession(env, session, now);
 
   const prod = await findBestProduct(env, ntext);
   if (prod) {
     session.stage = 'ask_qty';
     session.data.last_candidate = prod;
+    session.data.last_candidate_lock = { sku: prod.sku || null, ts: Date.now(), query: ntext };
     await saveSession(env, session, now);
-    await sendWhatsAppText(env, toE164, `${renderProducto(prod)}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; lo que exceda el stock va *sobre pedido*.`);
+    await sendWhatsAppText(env, toE164, renderProducto(prod));
     return ok('EVENT_RECEIVED');
   }
 
@@ -447,7 +470,7 @@ async function startSalesFromQuery(env, session, toE164, text, ntext, now){
   return ok('EVENT_RECEIVED');
 }
 
-/* ============ matching ============ */
+/* ========= matching (inventario) ========= */
 function extractColorWord(text=''){
   const t = normalizeWithAliases(text);
   if (/\b(amarillo|yellow)\b/i.test(t)) return 'yellow';
@@ -496,13 +519,8 @@ async function findBestProduct(env, queryText) {
   const scoreAndPick = (arr=[]) => {
     if (!arr?.length) return null;
 
-    // familia
     let pool = arr.filter(p => productMatchesFamily(p, queryText));
-
-    // color
     if (colorCode) pool = pool.filter(p => productHasColor(p, colorCode));
-
-    // si pidió "tóner" excluir unidades de revelado/developer/cintas
     if (wantsToner) {
       pool = pool.filter(p => {
         const name = normalizeBase(p?.nombre||'');
@@ -515,7 +533,6 @@ async function findBestProduct(env, queryText) {
 
     if (!pool.length) return null;
 
-    // ordenar: stock primero, luego precio asc
     pool.sort((a,b) => {
       const sa = numberOrZero(a.stock) > 0 ? 1 : 0;
       const sb = numberOrZero(b.stock) > 0 ? 1 : 0;
@@ -532,7 +549,7 @@ async function findBestProduct(env, queryText) {
     if (pick1) return pick1;
   } catch (_) {}
 
-  // 2) LIKE contra producto_stock_v (tabla correcta)
+  // 2) LIKE contra producto_stock_v
   try {
     const like = encodeURIComponent('%' + queryText.replace(/\s+/g,' ') + '%');
     const parts = [
@@ -543,18 +560,17 @@ async function findBestProduct(env, queryText) {
     parts.push(`nombre=not.ilike.*unidad%20de%20revelado*`);
     parts.push(`nombre=not.ilike.*developer*`);
     const q = parts.join('&') + `&order=stock.desc.nullslast,precio.asc&limit=600`;
+
     const r2 = await sbGet(env, 'producto_stock_v', { query: q }) || [];
     const pick2 = scoreAndPick(r2);
     if (pick2) return pick2;
   } catch (_) {}
 
-  // 3) red de seguridad: buscar “toner” genérico
+  // 3) Rescate: buscar “toner”
   try {
     const likeToner = encodeURIComponent('%toner%');
     const r3 = await sbGet(env, 'producto_stock_v', {
-      query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&` +
-             `or=(nombre.ilike.${likeToner},sku.ilike.${likeToner})&` +
-             `order=stock.desc.nullslast,precio.asc&limit=400`
+      query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&or=(nombre.ilike.${likeToner},sku.ilike.${likeToner})&order=stock.desc.nullslast,precio.asc&limit=400`
     }) || [];
     const pick3 = scoreAndPick(r3);
     if (pick3) return pick3;
@@ -563,7 +579,7 @@ async function findBestProduct(env, queryText) {
   return null;
 }
 
-/* ============ cierre (pedido) ============ */
+/* ========= cierre venta ========= */
 async function handleAwaitInvoice(env, session, toE164, lowered, now){
   if (/\b(no|gracias|todo bien)\b/i.test(lowered)) {
     session.stage = 'idle';
@@ -595,6 +611,8 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now){
     }
     session.stage = 'idle';
     session.data.cart = [];
+    session.data.last_candidate = null;
+    session.data.last_candidate_lock = null;
     await saveSession(env, session, now);
     await sendWhatsAppText(env, toE164, `¿Te ayudo con algo más en este momento? (Sí / No)`);
     return ok('EVENT_RECEIVED');
@@ -641,77 +659,14 @@ async function handleCollectSequential(env, session, toE164, text, now){
   else        await sendWhatsAppText(env, toE164, `Creé tu solicitud y la pasé a un asesor para confirmar detalles. 🙌`);
   session.stage = 'idle';
   session.data.cart = [];
+  session.data.last_candidate = null;
+  session.data.last_candidate_lock = null;
   await saveSession(env, session, now);
   await sendWhatsAppText(env, toE164, `¿Puedo ayudarte con algo más? (Sí / No)`);
   return ok('EVENT_RECEIVED');
 }
 
-/* ============ cliente/pedido ============ */
-async function preloadCustomerIfAny(env, session){
-  try{
-    const r = await sbGet(env, 'cliente', { query: `select=nombre,rfc,email,calle,numero,colonia,ciudad,estado,cp&telefono=eq.${session.from}&limit=1` });
-    if (r && r[0]) session.data.customer = { ...(session.data.customer||{}), ...r[0] };
-  }catch(e){ console.warn('preloadCustomerIfAny', e); }
-}
-async function ensureClienteFields(env, cliente_id, c){
-  try{
-    const patch = {};
-    ['nombre','rfc','email','calle','numero','colonia','ciudad','estado','cp'].forEach(k=>{ if (truthy(c[k])) patch[k]=c[k]; });
-    if (Object.keys(patch).length>0) await sbPatch(env, 'cliente', patch, `id=eq.${cliente_id}`);
-  }catch(e){ console.warn('ensureClienteFields', e); }
-}
-async function createOrderFromSession(env, session){
-  try{
-    const cart = session.data?.cart || [];
-    if (!cart.length) return { ok:false, error:'empty' };
-    const c = session.data.customer || {};
-    let cliente_id = null;
-    try{
-      const exist = await sbGet(env, 'cliente', { query:`select=id,telefono,email&or=(telefono.eq.${session.from},email.eq.${encodeURIComponent(c.email||'')})&limit=1` });
-      if (exist && exist[0]) cliente_id = exist[0].id;
-    }catch(_){}
-    if (!cliente_id) {
-      const ins = await sbUpsert(env, 'cliente', [{
-        nombre:c.nombre||null, rfc:c.rfc||null, email:c.email||null, telefono:session.from||null,
-        calle:c.calle||null, numero:c.numero||null, colonia:c.colonia||null, ciudad:c.ciudad||null, estado:c.estado||null, cp:c.cp||null
-      }], { onConflict:'telefono', returning:'representation' });
-      cliente_id = ins?.data?.[0]?.id || null;
-    } else {
-      await ensureClienteFields(env, cliente_id, c);
-    }
-
-    let total = 0;
-    for (const it of cart) total += Number(it.product?.precio||0) * Number(it.qty||1);
-
-    const p = await sbUpsert(env, 'pedido', [{ cliente_id, total, moneda:'MXN', estado:'nuevo', created_at:new Date().toISOString() }], { returning:'representation' });
-    const pedido_id = p?.data?.[0]?.id;
-
-    const items = cart.map(it => ({
-      pedido_id, producto_id: it.product?.id||null, sku: it.product?.sku||null,
-      nombre: it.product?.nombre||null, qty: it.qty, precio_unitario: Number(it.product?.precio||0)
-    }));
-    await sbUpsert(env, 'pedido_item', items, { returning:'minimal' });
-
-    // disminuir stock real por RPC (si existe)
-    for (const it of cart) {
-      const sku = it.product?.sku;
-      if (!sku) continue;
-      try {
-        const row = await sbGet(env, 'producto_stock_v', { query:`select=sku,stock&sku=eq.${encodeURIComponent(sku)}&limit=1` });
-        const current = numberOrZero(row?.[0]?.stock);
-        const dec = Math.min(current, Number(it.qty||0));
-        if (dec > 0) await sbRpc(env, 'decrement_stock', { in_sku: sku, in_by: dec });
-      } catch (_){}
-    }
-
-    return { ok:true, pedido_id, total };
-  }catch(e){
-    console.warn('createOrderFromSession', e);
-    return { ok:false, error:String(e) };
-  }
-}
-
-/* ============ Supabase helpers ============ */
+/* ========= Supabase helpers ========= */
 async function sbGet(env, table, { query }){
   const url = `${env.SUPABASE_URL}/rest/v1/${table}?${query}`;
   const r = await fetch(url, { headers:{ apikey: env.SUPABASE_ANON_KEY, Authorization:`Bearer ${env.SUPABASE_ANON_KEY}` } });
@@ -751,13 +706,13 @@ async function sbRpc(env, fn, params){
   return await r.json();
 }
 
-/* ============ SEPOMEX helper ============ */
+/* ========= SEPOMEX ========= */
 async function cityFromCP(env, cp){
   try { const r = await sbGet(env, 'sepomex_cp', { query:`cp=eq.${encodeURIComponent(cp)}&select=cp,estado,municipio,ciudad&limit=1` }); return r?.[0] || null; }
   catch { return null; }
 }
 
-/* ============ SOPORTE + GCal ============ */
+/* ========= SOPORTE + GCal ========= */
 
 // --- Parsers básicos de marca/modelo, dirección y datos del cliente ---
 function parseBrandModel(text=''){
@@ -920,7 +875,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now){
     if (cal && env.GCAL_REFRESH_TOKEN && env.GCAL_CLIENT_ID && env.GCAL_CLIENT_SECRET) {
       try {
         const nearest = await findNearestFreeSlot(env, cal.calendar_id, slot, tz);
-        const osTmpNumber = Math.floor(Date.now()/1000);
+        const osTmpNumber = Math.floor(Date.now()/1000); // temporal para el título
         const summary = `${sv.nombre || 'Cliente'} — ${sv.modelo || 'Equipo'} — OS#${osTmpNumber}`;
         event = await gcalCreateEvent(env, cal.calendar_id, {
           summary,
@@ -941,7 +896,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now){
         gcal_event_id: event?.id || null, calendar_id: cal?.calendar_id || null,
         calle: sv.calle || null, numero: sv.numero || null, colonia: sv.colonia || null, ciudad: sv.ciudad || null, estado: sv.estado || null, cp: sv.cp || null,
         created_at: new Date().toISOString()
-      }];
+      }]];
       const os = await sbUpsert(env, 'orden_servicio', osBody, { returning: 'representation' });
       osId = os?.data?.[0]?.id || null;
 
@@ -1035,6 +990,7 @@ async function upsertClienteByPhone(env, phone){
 }
 async function getLastOpenOS(env, phone){
   try{
+    // buscar cliente por teléfono
     const cli = await sbGet(env, 'cliente', { query:`select=id&telefono=eq.${encodeURIComponent(phone)}&limit=1` });
     const cliente_id = cli?.[0]?.id;
     if (!cliente_id) return null;
@@ -1103,12 +1059,13 @@ async function findNearestFreeSlot(env, calendarId, desired, tz){
   const start = new Date(base.start);
   let end   = new Date(start.getTime() + durationMs);
 
+  // consultamos free/busy en una ventana de 3 días
   const token = await gcalToken(env);
   const fbUrl = 'https://www.googleapis.com/calendar/v3/freeBusy';
   for (let dayOffset=0; dayOffset<3; dayOffset++){
     const dayStart = new Date(start.getTime() + dayOffset*24*60*60*1000);
-    const windowStart = windowOfDay(dayStart, tz, 10);
-    const windowEnd   = windowOfDay(dayStart, tz, 15);
+    const windowStart = windowOfDay(dayStart, tz, 10); // 10:00
+    const windowEnd   = windowOfDay(dayStart, tz, 15); // 15:00
     const r = await fetch(fbUrl, {
       method:'POST',
       headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
@@ -1120,6 +1077,7 @@ async function findNearestFreeSlot(env, calendarId, desired, tz){
     });
     const j = await r.json();
     const busy = (j?.calendars?.[calendarId]?.busy) || [];
+    // probamos slots cada 30 min
     let probe = new Date(Math.max(windowStart.getTime(), start.getTime()));
     for (let i=0; i<12; i++){
       end = new Date(probe.getTime() + durationMs);
@@ -1128,11 +1086,13 @@ async function findNearestFreeSlot(env, calendarId, desired, tz){
       probe = new Date(probe.getTime() + 30*60*1000);
     }
   }
+  // si no encontramos, devolver el clamped original
   return { start: base.start, end: new Date(new Date(base.start).getTime()+durationMs).toISOString() };
 }
 function windowOfDay(date, tz, hour){
+  // construye Date en la zona local aproximada (CF no soporta TZ real)
   const d = new Date(date);
-  d.setUTCHours(hour,0,0,0);
+  d.setUTCHours(hour,0,0,0); // aproximación suficiente
   return d;
 }
 
@@ -1168,6 +1128,7 @@ function parseNaturalDateTime(text, env){
 function clampToWindow(when, tz){
   const start = new Date(when?.start || Date.now() + 2*60*60*1000);
   const end   = new Date(when?.end   || start.getTime() + 60*60*1000);
+  // ventana 10:00–15:00
   const dayStart = new Date(start); dayStart.setHours(10,0,0,0);
   const dayEnd   = new Date(start); dayEnd.setHours(15,0,0,0);
   const s = new Date(Math.max(start.getTime(), dayStart.getTime()));
@@ -1185,4 +1146,3 @@ function fmtTime(iso, tz){
     return new Intl.DateTimeFormat('es-MX',{ timeZone: tz, hour:'2-digit', minute:'2-digit' }).format(new Date(iso));
   }catch{ const d=new Date(iso); return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`; }
 }
-
