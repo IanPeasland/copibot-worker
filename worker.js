@@ -1,13 +1,13 @@
 /**
  * CopiBot – Worker Lite (SIN IA)
  * Conversacional + Ventas + Soporte Técnico + GCal + Supabase
- * Build: “Lite-R12”
+ * Build: “Lite-R13”
  *
  * Cloudflare env:
  *  - WA_TOKEN, PHONE_ID, VERIFY_TOKEN
  *  - SUPABASE_URL, SUPABASE_ANON_KEY
  *  - GCAL_CLIENT_ID, GCAL_CLIENT_SECRET, GCAL_REFRESH_TOKEN
- *  - SUPPORT_WHATSAPP (o SUPPORT_PHONE_E164)   // +524612304861
+ *  - SUPPORT_WHATSAPP (o SUPPORT_PHONE_E164)
  *  - TZ (p.ej. America/Mexico_City)
  *  - CRON_SECRET
  *
@@ -60,7 +60,7 @@ export default {
     if (req.method === 'POST' && url.pathname === '/') {
       try {
         const payload = await safeJson(req);
-        const ctx = extractWhatsAppContext(payload);
+        const ctx = extractWhatsAppContext(payload);  // <- AHORA SÍ existe
         if (!ctx) return ok('EVENT_RECEIVED');
 
         const { mid, from, fromE164, profileName, textRaw, msgType, ts, media } = ctx;
@@ -180,6 +180,14 @@ export default {
 
       } catch (e) {
         console.error('Worker error', e);
+        // Respuesta suave para no dejar al usuario sin feedback
+        try {
+          const body = await safeJson(req).catch(() => ({}));
+          const ctx2 = extractWhatsAppContext(body);
+          if (ctx2?.fromE164) {
+            await sendWhatsAppText(env, ctx2.fromE164, 'Tu mensaje llegó, tuve un problema momentáneo pero ya estoy encima 🙂');
+          }
+        } catch {}
         return ok('EVENT_RECEIVED');
       }
     }
@@ -206,6 +214,40 @@ const numberOrZero = n => Number.isFinite(Number(n)) ? Number(n) : 0;
 const truthy = v => v!==null && v!==undefined && String(v).trim()!=='';
 const moneyMXN = n => { try{ return new Intl.NumberFormat('es-MX',{style:'currency',currency:'MXN'}).format(Number(n||0)); }catch{ return `$${Number(n||0).toFixed(2)}`; } };
 const priceWithIVA = n => `${moneyMXN(n)} + IVA`;
+
+/* ============ WhatsApp inbound parsing ============ */
+/** Extrae el contexto usable del payload de WhatsApp */
+function extractWhatsAppContext(body){
+  try{
+    const entry = body?.entry?.[0];
+    const change = entry?.changes?.[0];
+    const value = change?.value || {};
+    const messages = value.messages || [];
+    if (!messages.length) return null;           // status, acks, etc → ignorar
+    const m = messages[0];
+    const contacts = value.contacts || [];
+    const profileName = contacts?.[0]?.profile?.name || '';
+    const from = m.from || value.metadata?.phone_number_id || '';
+    const fromE164 = m.from ? ('+' + String(m.from).replace(/\D/g,'')) : null;
+
+    // tipo + texto
+    const msgType = m.type || (m.text ? 'text' : (m.audio ? 'audio' : 'unknown'));
+    const textRaw =
+      m.text?.body ??
+      m.button?.text ??
+      m.interactive?.button_reply?.title ??
+      m.interactive?.list_reply?.title ??
+      m.interactive?.list_reply?.description ??
+      '';
+
+    const media = m.audio || m.image || m.document || null;
+    const ts = (m.timestamp ? Number(m.timestamp)*1000 : Date.now());
+    return { mid: m.id, from, fromE164, profileName, textRaw, msgType, ts, media };
+  }catch(e){
+    console.warn('extractWhatsAppContext error', e);
+    return null;
+  }
+}
 
 /* ============ intents (sin IA) ============ */
 const RX_GREET = /^(hola+|buen[oa]s|qué onda|que tal|saludos|hey|buen dia|buenas|holi+)\b/i;
@@ -488,24 +530,21 @@ async function findBestProduct(env, queryText) {
 
   // 2) LIKE contra producto_stock_v (tabla correcta)
   try {
-    // si pidió 'toner' fuerza tipo=toner; si no, no filtra tipo
     const like = encodeURIComponent('%' + queryText.replace(/\s+/g,' ') + '%');
     const parts = [
       `select=id,nombre,marca,sku,precio,stock,tipo,compatible`,
       `or=(nombre.ilike.${like},sku.ilike.${like})`
     ];
     if (wantsToner) parts.push(`tipo=eq.toner`);
-    // excluir "unidad de revelado"/developer por nombre desde el query
     parts.push(`nombre=not.ilike.*unidad%20de%20revelado*`);
     parts.push(`nombre=not.ilike.*developer*`);
     const q = parts.join('&') + `&order=stock.desc.nullslast,precio.asc&limit=600`;
-
     const r2 = await sbGet(env, 'producto_stock_v', { query: q }) || [];
     const pick2 = scoreAndPick(r2);
     if (pick2) return pick2;
   } catch (_) {}
 
-  // 3) red de seguridad: buscar “toner” genérico en nombre
+  // 3) red de seguridad: buscar “toner” genérico
   try {
     const likeToner = encodeURIComponent('%toner%');
     const r3 = await sbGet(env, 'producto_stock_v', {
@@ -713,6 +752,7 @@ async function cityFromCP(env, cp){
   try { const r = await sbGet(env, 'sepomex_cp', { query:`cp=eq.${encodeURIComponent(cp)}&select=cp,estado,municipio,ciudad&limit=1` }); return r?.[0] || null; }
   catch { return null; }
 }
+
 /* ============ SOPORTE + GCal ============ */
 
 // --- Parsers básicos de marca/modelo, dirección y datos del cliente ---
@@ -876,7 +916,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now){
     if (cal && env.GCAL_REFRESH_TOKEN && env.GCAL_CLIENT_ID && env.GCAL_CLIENT_SECRET) {
       try {
         const nearest = await findNearestFreeSlot(env, cal.calendar_id, slot, tz);
-        const osTmpNumber = Math.floor(Date.now()/1000); // temporal para el título
+        const osTmpNumber = Math.floor(Date.now()/1000);
         const summary = `${sv.nombre || 'Cliente'} — ${sv.modelo || 'Equipo'} — OS#${osTmpNumber}`;
         event = await gcalCreateEvent(env, cal.calendar_id, {
           summary,
@@ -991,7 +1031,6 @@ async function upsertClienteByPhone(env, phone){
 }
 async function getLastOpenOS(env, phone){
   try{
-    // buscar cliente por teléfono
     const cli = await sbGet(env, 'cliente', { query:`select=id&telefono=eq.${encodeURIComponent(phone)}&limit=1` });
     const cliente_id = cli?.[0]?.id;
     if (!cliente_id) return null;
@@ -1060,13 +1099,12 @@ async function findNearestFreeSlot(env, calendarId, desired, tz){
   const start = new Date(base.start);
   let end   = new Date(start.getTime() + durationMs);
 
-  // consultamos free/busy en una ventana de 3 días
   const token = await gcalToken(env);
   const fbUrl = 'https://www.googleapis.com/calendar/v3/freeBusy';
   for (let dayOffset=0; dayOffset<3; dayOffset++){
     const dayStart = new Date(start.getTime() + dayOffset*24*60*60*1000);
-    const windowStart = windowOfDay(dayStart, tz, 10); // 10:00
-    const windowEnd   = windowOfDay(dayStart, tz, 15); // 15:00
+    const windowStart = windowOfDay(dayStart, tz, 10);
+    const windowEnd   = windowOfDay(dayStart, tz, 15);
     const r = await fetch(fbUrl, {
       method:'POST',
       headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
@@ -1078,7 +1116,6 @@ async function findNearestFreeSlot(env, calendarId, desired, tz){
     });
     const j = await r.json();
     const busy = (j?.calendars?.[calendarId]?.busy) || [];
-    // probamos slots cada 30 min
     let probe = new Date(Math.max(windowStart.getTime(), start.getTime()));
     for (let i=0; i<12; i++){
       end = new Date(probe.getTime() + durationMs);
@@ -1087,13 +1124,11 @@ async function findNearestFreeSlot(env, calendarId, desired, tz){
       probe = new Date(probe.getTime() + 30*60*1000);
     }
   }
-  // si no encontramos, devolver el clamped original
   return { start: base.start, end: new Date(new Date(base.start).getTime()+durationMs).toISOString() };
 }
 function windowOfDay(date, tz, hour){
-  // construye Date en la zona local aproximada (usamos la fecha base; CF no soporta TZ real)
   const d = new Date(date);
-  d.setUTCHours(hour,0,0,0); // aproximación suficiente
+  d.setUTCHours(hour,0,0,0);
   return d;
 }
 
@@ -1129,7 +1164,6 @@ function parseNaturalDateTime(text, env){
 function clampToWindow(when, tz){
   const start = new Date(when?.start || Date.now() + 2*60*60*1000);
   const end   = new Date(when?.end   || start.getTime() + 60*60*1000);
-  // ventana 10:00–15:00
   const dayStart = new Date(start); dayStart.setHours(10,0,0,0);
   const dayEnd   = new Date(start); dayEnd.setHours(15,0,0,0);
   const s = new Date(Math.max(start.getTime(), dayStart.getTime()));
@@ -1147,4 +1181,3 @@ function fmtTime(iso, tz){
     return new Intl.DateTimeFormat('es-MX',{ timeZone: tz, hour:'2-digit', minute:'2-digit' }).format(new Date(iso));
   }catch{ const d=new Date(iso); return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`; }
 }
-
