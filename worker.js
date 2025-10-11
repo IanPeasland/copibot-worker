@@ -896,7 +896,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now){
         gcal_event_id: event?.id || null, calendar_id: cal?.calendar_id || null,
         calle: sv.calle || null, numero: sv.numero || null, colonia: sv.colonia || null, ciudad: sv.ciudad || null, estado: sv.estado || null, cp: sv.cp || null,
         created_at: new Date().toISOString()
-      }]];
+      }];
       const os = await sbUpsert(env, 'orden_servicio', osBody, { returning: 'representation' });
       osId = os?.data?.[0]?.id || null;
 
@@ -1146,3 +1146,4 @@ function fmtTime(iso, tz){
     return new Intl.DateTimeFormat('es-MX',{ timeZone: tz, hour:'2-digit', minute:'2-digit' }).format(new Date(iso));
   }catch{ const d=new Date(iso); return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`; }
 }
+
