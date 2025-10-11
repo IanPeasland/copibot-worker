@@ -1,31 +1,14 @@
 /**
  * CopiBot – Worker Lite (SIN IA)
  * Conversacional + Ventas + Soporte Técnico + GCal + Supabase
- * Build: “Lite-R13”
- *
- * Cloudflare env:
- *  - WA_TOKEN, PHONE_ID, VERIFY_TOKEN
- *  - SUPABASE_URL, SUPABASE_ANON_KEY
- *  - GCAL_CLIENT_ID, GCAL_CLIENT_SECRET, GCAL_REFRESH_TOKEN
- *  - SUPPORT_WHATSAPP (o SUPPORT_PHONE_E164)
- *  - TZ (p.ej. America/Mexico_City)
- *  - CRON_SECRET
- *
- * Tablas (schema public):
- *  - wa_session(from text pk, stage text, data jsonb, updated_at timestamptz, expires_at timestamptz?)
- *  - producto_stock_v(id, nombre, marca, sku, precio, stock, tipo, compatible)
- *  - cliente(id uuid pk, nombre, rfc, email, telefono, calle, numero, colonia, ciudad, estado, cp)
- *  - pedido(id, cliente_id, total, moneda, estado, created_at)
- *  - pedido_item(pedido_id, producto_id, sku, nombre, qty, precio_unitario)
- *  - orden_servicio(..., gcal_event_id, calendar_id, ...)
- *  - calendar_pool(id, name, calendar_id, active)
+ * Build: “Lite-R14”
  */
 
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
 
-    // Webhook verification (WhatsApp)
+    // --- Verify webhook
     if (req.method === 'GET' && url.pathname === '/') {
       const mode = url.searchParams.get('hub.mode');
       const token = url.searchParams.get('hub.verify_token');
@@ -36,7 +19,7 @@ export default {
       return new Response('Forbidden', { status: 403 });
     }
 
-    // Health
+    // --- Health
     if (req.method === 'GET' && url.pathname === '/health') {
       return json({
         ok: true,
@@ -49,18 +32,20 @@ export default {
       });
     }
 
-    // Cron (opcional)
+    // --- Cron (opcional)
     if (req.method === 'POST' && url.pathname === '/cron') {
       const sec = req.headers.get('x-cron-secret') || url.searchParams.get('secret');
       if (!sec || sec !== env.CRON_SECRET) return new Response('Forbidden', { status: 403 });
       return json(await cronReminders(env));
     }
 
-    // Main webhook
+    // --- Webhook principal
     if (req.method === 'POST' && url.pathname === '/') {
+      let ctxRef = null; // <- preservamos contexto para el catch
       try {
         const payload = await safeJson(req);
-        const ctx = extractWhatsAppContext(payload);  // <- AHORA SÍ existe
+        const ctx = extractWhatsAppContext(payload);
+        ctxRef = ctx;
         if (!ctx) return ok('EVENT_RECEIVED');
 
         const { mid, from, fromE164, profileName, textRaw, msgType, ts, media } = ctx;
@@ -77,12 +62,12 @@ export default {
           session.data.customer.nombre = toTitleCase(firstWord(profileName));
         }
 
-        // idempotencia/anticolisiones
+        // ===== idempotencia (más tolerante: 60s) =====
         const msgTs = Number(ts || Date.now());
         let lastTs = Number(session?.data?.last_ts || 0);
         const nowMs = Date.now();
-        if (lastTs > nowMs + 10 * 60 * 1000) lastTs = 0;
-        if (lastTs && (msgTs + 5000) <= lastTs) return ok('EVENT_RECEIVED');
+        if (lastTs > nowMs + 60 * 60 * 1000) lastTs = 0;       // reseteo defensivo
+        if (lastTs && (msgTs + 60 * 1000) <= lastTs) return ok('EVENT_RECEIVED'); // >60s más viejo
         session.data.last_ts = Math.max(msgTs, lastTs);
         const lastMid = session?.data?.last_mid || null;
         if (lastMid === mid) return ok('EVENT_RECEIVED');
@@ -108,7 +93,7 @@ export default {
         const lowered = text.toLowerCase();
         const ntext = normalizeWithAliases(text);
 
-        // saludo — NO deja candidatos, NO añade nada
+        // saludo
         if (RX_GREET.test(lowered)) {
           session.stage = 'idle';
           session.data.last_candidate = null;
@@ -117,6 +102,16 @@ export default {
           const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
           await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
           return ok('EVENT_RECEIVED');
+        }
+
+        // --- atajo: “quiero|dame|agrega 1/2/3 …” con candidato cargado
+        if (session.data?.last_candidate) {
+          const fastQty = parseFastQty(lowered);
+          if (fastQty !== null) {
+            session.stage = 'ask_qty'; // forzamos etapa y pasamos por el handler
+            await saveSession(env, session, now);
+            return await handleAskQty(env, session, fromE164, String(fastQty), String(fastQty), ntext, now);
+          }
         }
 
         // flujo activo
@@ -180,12 +175,10 @@ export default {
 
       } catch (e) {
         console.error('Worker error', e);
-        // Respuesta suave para no dejar al usuario sin feedback
+        // Responder sin re-leer el body
         try {
-          const body = await safeJson(req).catch(() => ({}));
-          const ctx2 = extractWhatsAppContext(body);
-          if (ctx2?.fromE164) {
-            await sendWhatsAppText(env, ctx2.fromE164, 'Tu mensaje llegó, tuve un problema momentáneo pero ya estoy encima 🙂');
+          if (ctxRef?.fromE164) {
+            await sendWhatsAppText(env, ctxRef.fromE164, 'Recibí tu mensaje. Tuve un problema momentáneo pero ya quedó, ¿me repites por favor? 🙂');
           }
         } catch {}
         return ok('EVENT_RECEIVED');
@@ -215,22 +208,19 @@ const truthy = v => v!==null && v!==undefined && String(v).trim()!=='';
 const moneyMXN = n => { try{ return new Intl.NumberFormat('es-MX',{style:'currency',currency:'MXN'}).format(Number(n||0)); }catch{ return `$${Number(n||0).toFixed(2)}`; } };
 const priceWithIVA = n => `${moneyMXN(n)} + IVA`;
 
-/* ============ WhatsApp inbound parsing ============ */
-/** Extrae el contexto usable del payload de WhatsApp */
+/* ============ inbound parsing (WA) ============ */
 function extractWhatsAppContext(body){
   try{
     const entry = body?.entry?.[0];
     const change = entry?.changes?.[0];
     const value = change?.value || {};
     const messages = value.messages || [];
-    if (!messages.length) return null;           // status, acks, etc → ignorar
+    if (!messages.length) return null;
     const m = messages[0];
     const contacts = value.contacts || [];
     const profileName = contacts?.[0]?.profile?.name || '';
-    const from = m.from || value.metadata?.phone_number_id || '';
+    const from = m.from || '';
     const fromE164 = m.from ? ('+' + String(m.from).replace(/\D/g,'')) : null;
-
-    // tipo + texto
     const msgType = m.type || (m.text ? 'text' : (m.audio ? 'audio' : 'unknown'));
     const textRaw =
       m.text?.body ??
@@ -239,7 +229,6 @@ function extractWhatsAppContext(body){
       m.interactive?.list_reply?.title ??
       m.interactive?.list_reply?.description ??
       '';
-
     const media = m.audio || m.image || m.document || null;
     const ts = (m.timestamp ? Number(m.timestamp)*1000 : Date.now());
     return { mid: m.id, from, fromE164, profileName, textRaw, msgType, ts, media };
@@ -255,6 +244,13 @@ const RX_INV_KWS   = /(toner|t[óo]ner|cartucho|developer|unidad de revelado|ref
 const RX_MODEL_KWS = /(versant|docucolor|primelink|versalink|altalink|apeos|work ?center|workcentre|c\d{2,4}|b\d{2,4}|550|560|570|2100|180|280|4100|c70|c60|c75)\b/i;
 const RX_NEG_NO = /\b(no|nel|ahorita no|no gracias)\b/i;
 const RX_DONE   = /\b(es(ta)?\s*todo|ser[ií]a\s*todo|nada\s*m[aá]s|con\s*eso|as[ií]\s*est[aá]\s*bien|ya\s*qued[oó]|listo|finaliza(r|mos)?|termina(r)?)\b/i;
+
+/* atajo de cantidad “quiero|dame|agrega … <n>” */
+function parseFastQty(t=''){
+  const m = t.match(/\b(quiero|dame|agrega|añade|pon|sum(a|a)|agregar|añadir)\b.*?\b(\d{1,3})\b/);
+  if (m) return Number(m[3]);
+  return null;
+}
 
 function normalizeWithAliases(s=''){
   const t = normalizeBase(s);
@@ -343,57 +339,65 @@ function renderProducto(p){
 
 /* ============ flujo ventas ============ */
 async function handleAskQty(env, session, toE164, text, lowered, _ntext, now){
-  const cand = session.data?.last_candidate;
+  try{
+    const cand = session.data?.last_candidate;
 
-  if (RX_NEG_NO.test(lowered)) {
-    session.data.last_candidate = null;
-    session.stage = 'cart_open';
-    await saveSession(env, session, now);
-    await sendWhatsAppText(env, toE164, 'Sin problema. ¿Busco otra opción? Dime modelo/color o lo que necesitas.');
-    return ok('EVENT_RECEIVED');
-  }
-
-  if (RX_DONE.test(lowered)) {
-    const cart = session.data?.cart || [];
-    if (cart.length > 0) {
-      session.stage = 'await_invoice';
+    if (RX_NEG_NO.test(lowered)) {
+      session.data.last_candidate = null;
+      session.stage = 'cart_open';
       await saveSession(env, session, now);
-      await sendWhatsAppText(env, toE164, '¿La cotizamos *con factura* o *sin factura*?');
+      await sendWhatsAppText(env, toE164, 'Sin problema. ¿Busco otra opción? Dime modelo/color o lo que necesitas.');
       return ok('EVENT_RECEIVED');
     }
-  }
 
-  if (!cand) {
+    if (RX_DONE.test(lowered)) {
+      const cart = session.data?.cart || [];
+      if (cart.length > 0) {
+        session.stage = 'await_invoice';
+        await saveSession(env, session, now);
+        await sendWhatsAppText(env, toE164, '¿La cotizamos *con factura* o *sin factura*?');
+        return ok('EVENT_RECEIVED');
+      }
+    }
+
+    if (!cand) {
+      session.stage = 'cart_open';
+      await saveSession(env, session, now);
+      await sendWhatsAppText(env, toE164, '¿Qué artículo necesitas? (ej. "*tóner amarillo Versant 180*")');
+      return ok('EVENT_RECEIVED');
+    }
+
+    if (!looksLikeQuantityStrict(lowered)) {
+      const s = numberOrZero(cand.stock);
+      await sendWhatsAppText(env, toE164, `¿Cuántas *piezas* necesitas? (hay ${s} en stock; el resto sería *sobre pedido*)`);
+      await saveSession(env, session, now);
+      return ok('EVENT_RECEIVED');
+    }
+
+    const qty = parseQty(lowered, 1);
+    if (!Number.isFinite(qty) || qty<=0) {
+      const s = numberOrZero(cand.stock);
+      await sendWhatsAppText(env, toE164, `Necesito un número de piezas (hay ${s} en stock).`);
+      await saveSession(env, session, now);
+      return ok('EVENT_RECEIVED');
+    }
+
+    addWithStockSplit(session, cand, qty);
     session.stage = 'cart_open';
     await saveSession(env, session, now);
-    await sendWhatsAppText(env, toE164, '¿Qué artículo necesitas? (ej. "*tóner amarillo Versant 180*")');
-    return ok('EVENT_RECEIVED');
-  }
 
-  if (!looksLikeQuantityStrict(lowered)) {
     const s = numberOrZero(cand.stock);
-    await sendWhatsAppText(env, toE164, `¿Cuántas *piezas* necesitas? (hay ${s} en stock; el resto sería *sobre pedido*)`);
-    await saveSession(env, session, now);
+    const bo = Math.max(0, qty - Math.min(s, qty));
+    const nota = bo>0 ? `\n(De ${qty}, ${Math.min(s,qty)} en stock y ${bo} sobre pedido)` : '';
+    await sendWhatsAppText(env, toE164, `Añadí 🛒\n• ${cand.nombre} x ${qty} ${priceWithIVA(cand.precio)}${nota}\n\n¿Deseas *agregar algo más* o *finalizamos*?`);
+    return ok('EVENT_RECEIVED');
+  }catch(err){
+    console.warn('handleAskQty error', err);
+    try{
+      await sendWhatsAppText(env, toE164, 'Recibí tu cantidad 👍. Si no viste mi mensaje anterior, dime de nuevo cuántas *piezas* necesitas (número).');
+    }catch{}
     return ok('EVENT_RECEIVED');
   }
-
-  const qty = parseQty(lowered, 1);
-  if (!Number.isFinite(qty) || qty<=0) {
-    const s = numberOrZero(cand.stock);
-    await sendWhatsAppText(env, toE164, `Necesito un número de piezas (hay ${s} en stock).`);
-    await saveSession(env, session, now);
-    return ok('EVENT_RECEIVED');
-  }
-
-  addWithStockSplit(session, cand, qty);
-  session.stage = 'cart_open';
-  await saveSession(env, session, now);
-
-  const s = numberOrZero(cand.stock);
-  const bo = Math.max(0, qty - Math.min(s, qty));
-  const nota = bo>0 ? `\n(De ${qty}, ${Math.min(s,qty)} en stock y ${bo} sobre pedido)` : '';
-  await sendWhatsAppText(env, toE164, `Añadí 🛒\n• ${cand.nombre} x ${qty} ${priceWithIVA(cand.precio)}${nota}\n\n¿Deseas *agregar algo más* o *finalizamos*?`);
-  return ok('EVENT_RECEIVED');
 }
 
 async function handleCartOpen(env, session, toE164, text, lowered, ntext, now){
@@ -1181,3 +1185,4 @@ function fmtTime(iso, tz){
     return new Intl.DateTimeFormat('es-MX',{ timeZone: tz, hour:'2-digit', minute:'2-digit' }).format(new Date(iso));
   }catch{ const d=new Date(iso); return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`; }
 }
+
