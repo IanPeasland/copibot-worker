@@ -1,15 +1,7 @@
 /**
- * CopiBot – Worker Lite (SIN IA)
- * Conversacional + Ventas + Soporte Técnico + GCal + Supabase
- * Build: “Lite-R15”
- *
- * Cloudflare env:
- *  - WA_TOKEN, PHONE_ID, VERIFY_TOKEN
- *  - SUPABASE_URL, SUPABASE_ANON_KEY
- *  - GCAL_CLIENT_ID, GCAL_CLIENT_SECRET, GCAL_REFRESH_TOKEN
- *  - SUPPORT_WHATSAPP (o SUPPORT_PHONE_E164)
- *  - TZ (p.ej. America/Mexico_City)
- *  - CRON_SECRET
+ * CopiBot – Worker Lite (SIN botones, TEXTO puro)
+ * Conversacional + Ventas + Soporte Técnico + GCal + Supabase + IA opcional
+ * Build: “Lite-R14”
  *
  * Tablas (schema public):
  *  - wa_session(from text pk, stage text, data jsonb, updated_at timestamptz, expires_at timestamptz?)
@@ -17,18 +9,15 @@
  *  - cliente(id uuid pk, nombre, rfc, email, telefono, calle, numero, colonia, ciudad, estado, cp)
  *  - pedido(id, cliente_id, total, moneda, estado, created_at)
  *  - pedido_item(pedido_id, producto_id, sku, nombre, qty, precio_unitario)
- *  - orden_servicio(id uuid, cliente_id uuid, marca text, modelo text, falla_descripcion text, prioridad text,
- *                   estado text, ventana_inicio timestamptz, ventana_fin timestamptz,
- *                   gcal_event_id text, calendar_id text,
- *                   calle text, numero text, colonia text, ciudad text, estado text, cp text, created_at timestamptz)
- *  - calendar_pool(id uuid, name text, calendar_id text, active bool)
+ *  - orden_servicio(..., gcal_event_id, calendar_id, ...)
+ *  - calendar_pool(id, name, calendar_id, active)
  */
 
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
 
-    // --- Verify webhook
+    // Verificación webhook (WhatsApp)
     if (req.method === 'GET' && url.pathname === '/') {
       const mode = url.searchParams.get('hub.mode');
       const token = url.searchParams.get('hub.verify_token');
@@ -39,103 +28,132 @@ export default {
       return new Response('Forbidden', { status: 403 });
     }
 
-    // --- Health
+    // Health
     if (req.method === 'GET' && url.pathname === '/health') {
       return json({
         ok: true,
         have: {
           WA_TOKEN: !!env.WA_TOKEN, PHONE_ID: !!env.PHONE_ID,
           SUPABASE_URL: !!env.SUPABASE_URL, SUPABASE_ANON_KEY: !!env.SUPABASE_ANON_KEY,
-          GCAL_REFRESH_TOKEN: !!env.GCAL_REFRESH_TOKEN, TZ: env.TZ || 'America/Mexico_City'
+          GCAL_REFRESH_TOKEN: !!env.GCAL_REFRESH_TOKEN,
+          OPENAI_API_KEY: !!env.OPENAI_API_KEY,
+          TZ: env.TZ || 'America/Mexico_City'
         },
         now: new Date().toISOString()
       });
     }
 
-    // --- Cron (optional)
+    // Cron (opcional)
     if (req.method === 'POST' && url.pathname === '/cron') {
       const sec = req.headers.get('x-cron-secret') || url.searchParams.get('secret');
       if (!sec || sec !== env.CRON_SECRET) return new Response('Forbidden', { status: 403 });
       return json(await cronReminders(env));
     }
 
-    // --- Main webhook
+    // Webhook principal
     if (req.method === 'POST' && url.pathname === '/') {
-      let ctxRef = null;
       try {
         const payload = await safeJson(req);
         const ctx = extractWhatsAppContext(payload);
-        ctxRef = ctx;
         if (!ctx) return ok('EVENT_RECEIVED');
 
         const { mid, from, fromE164, profileName, textRaw, msgType, ts, media } = ctx;
 
-        // ===== session =====
+        // Sesión
         const now = new Date();
         let session = await loadSession(env, from);
         session.from = from;
         session.data = session.data || {};
         session.stage = session.stage || 'idle';
 
+        // Nombre de perfil
         if (profileName && !session?.data?.customer?.nombre) {
           session.data.customer = session.data.customer || {};
           session.data.customer.nombre = toTitleCase(firstWord(profileName));
         }
 
-        // ===== idempotencia (60s) =====
+        // Idempotencia / anti-colisiones
         const msgTs = Number(ts || Date.now());
         let lastTs = Number(session?.data?.last_ts || 0);
         const nowMs = Date.now();
-        if (lastTs > nowMs + 60 * 60 * 1000) lastTs = 0;
-        if (lastTs && (msgTs + 60 * 1000) <= lastTs) return ok('EVENT_RECEIVED');
+        if (lastTs > nowMs + 10 * 60 * 1000) lastTs = 0;
+        if (lastTs && (msgTs + 5000) <= lastTs) return ok('EVENT_RECEIVED');
         session.data.last_ts = Math.max(msgTs, lastTs);
         const lastMid = session?.data?.last_mid || null;
         if (lastMid === mid) return ok('EVENT_RECEIVED');
         session.data.last_mid = mid;
 
-        // ===== non-text =====
+        // Mensaje no texto
         if (msgType === 'audio') {
           await forwardAudioToSupport(env, media, fromE164);
           await sendWhatsAppText(env, fromE164,
-            'Lo siento, todavía no puedo escuchar audios. Ya avisé a soporte y en breve te contactan. Si quieres, escríbeme el detalle y te ayudo por aquí 🙂'
+            'Lo siento, aún no puedo escuchar audios. Ya avisé a soporte y te escriben pronto. Si puedes, cuéntame por texto 🙂'
           );
           await saveSession(env, session, now);
           return ok('EVENT_RECEIVED');
         }
         if (msgType !== 'text') {
-          await sendWhatsAppText(env, fromE164, '¿Podrías escribirme con palabras lo que necesitas? Así te ayudo más rápido 🙂');
+          await sendWhatsAppText(env, fromE164, '¿Podrías describirlo por texto? Así te ayudo más rápido 🙂');
           await saveSession(env, session, now);
           return ok('EVENT_RECEIVED');
         }
 
-        // ===== text / intents =====
+        // Texto
         const text = (textRaw || '').trim();
         const lowered = text.toLowerCase();
         const ntext = normalizeWithAliases(text);
 
-        // saludo
+        // Saludo
         if (RX_GREET.test(lowered)) {
-          session.stage = 'idle';
-          session.data.last_candidate = null;
-          session.data.last_candidate_lock = null;
-          session.data.cart = session.data.cart || [];
+          cleanupSalesState(session);
           await saveSession(env, session, now);
           const nombre = toTitleCase(firstWord(session?.data?.customer?.nombre || ''));
           await sendWhatsAppText(env, fromE164, `¡Hola${nombre ? ' ' + nombre : ''}! ¿En qué te puedo ayudar hoy? 👋`);
           return ok('EVENT_RECEIVED');
         }
 
-        // atajo: “quiero|dame|agrega … 1/2/3”
-        if (session.data?.last_candidate) {
-          const fastQty = parseFastQty(lowered);
-          if (fastQty !== null) {
+        // ======== FILTROS DE FLUJO (SIN BOTONES, TEXTO PURO) ========
+
+        // 0) Opción N (desambiguación)
+        const pickIdx = parseOpcionIndex(lowered);
+        if (Number.isInteger(pickIdx) && session?.data?.search_options?.length > 0) {
+          const idx = pickIdx - 1;
+          const p = session.data.search_options[idx];
+          if (p) {
+            session.data.last_candidate = { ...p, printed_hash: null, lock: true, lock_expires: Date.now() + LOCK_MS };
+            session.data.search_options = [];
             session.stage = 'ask_qty';
             await saveSession(env, session, now);
-            return await handleAskQty(env, session, fromE164, String(fastQty), String(fastQty), ntext, now);
+            await sendWhatsAppText(env, fromE164,
+              `${renderProducto(p)}\n\nPerfecto. ¿Cuántas *piezas*? (hay ${numberOrZero(p.stock)} en stock; el resto sería *sobre pedido*)`
+            );
+            return ok('EVENT_RECEIVED');
           }
         }
 
-        // flujo activo
+        // 1) Si estamos pidiendo cantidad y el usuario dice “agregar N / quiero N / pon N…”
+        if (session.stage === 'ask_qty' && isAddQtyCommand(lowered)) {
+          const qty = parseQtyFromAddCommand(lowered, 1);
+          const cand = getLockedCandidate(session);
+          if (cand && qty > 0) {
+            // Revalidar contra el SKU exacto por seguridad
+            const fresh = await getBySKU(env, cand.sku);
+            const prod = fresh || cand;
+            addWithStockSplit(session, prod, qty);
+            session.stage = 'cart_open';
+            clearLock(session); // ya no necesitamos candado
+            await saveSession(env, session, now);
+            const s = numberOrZero(prod.stock);
+            const bo = Math.max(0, qty - Math.min(s, qty));
+            const nota = bo>0 ? `\n(De ${qty}, ${Math.min(s,qty)} en stock y ${bo} sobre pedido)` : '';
+            await sendWhatsAppText(env, fromE164,
+              `Añadí 🛒\n• ${prod.nombre} x ${qty} ${priceWithIVA(prod.precio)}${nota}\n\n¿Deseas *agregar algo más* o *finalizamos*?`
+            );
+            return ok('EVENT_RECEIVED');
+          }
+        }
+
+        // 2) Etapas (si ya hay flujo)
         if (session.stage === 'ask_qty')       return await handleAskQty(env, session, fromE164, text, lowered, ntext, now);
         if (session.stage === 'cart_open')     return await handleCartOpen(env, session, fromE164, text, lowered, ntext, now);
         if (session.stage === 'await_invoice') return await handleAwaitInvoice(env, session, fromE164, lowered, now, text);
@@ -143,10 +161,10 @@ export default {
           return await handleCollectSequential(env, session, fromE164, text, now);
         }
         if (session.stage?.startsWith('sv_')) {
-          return await handleSupport(env, session, fromE164, text, lowered, ntext, now, {});
+          return await handleSupport(env, session, fromE164, text, lowered, ntext, now);
         }
 
-        // comandos soporte
+        // 3) Comandos rápidos soporte
         if (/\b(cancel(a|ar).*(cita|visita|servicio))\b/i.test(lowered)) {
           await svCancel(env, session, fromE164);
           await saveSession(env, session, now);
@@ -166,23 +184,21 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // decisión de intención
+        // 4) Intención
         const supportIntent = isSupportIntent(ntext);
         const salesIntent   = isSalesIntent(ntext);
 
         if (supportIntent) {
-          return await handleSupport(env, session, fromE164, text, lowered, ntext, now, { intent: 'support' });
+          return await handleSupport(env, session, fromE164, text, lowered, ntext, now);
         }
 
         if (salesIntent) {
-          session.stage = 'idle';
-          session.data.last_candidate = null;
-          session.data.last_candidate_lock = null;
+          cleanupSalesState(session);
           await saveSession(env, session, now);
           return await startSalesFromQuery(env, session, fromE164, text, ntext, now);
         }
 
-        // FAQs
+        // 5) FAQs
         const faq = await maybeFAQ(env, ntext);
         if (faq) {
           await sendWhatsAppText(env, fromE164, faq);
@@ -190,14 +206,13 @@ export default {
           return ok('EVENT_RECEIVED');
         }
 
-        // fallback
+        // Fallback
         await sendWhatsAppText(env, fromE164, 'Te leo. Puedo cotizar consumibles/refacciones o agendar *soporte técnico*. ¿Qué necesitas?');
         await saveSession(env, session, now);
         return ok('EVENT_RECEIVED');
 
       } catch (e) {
         console.error('Worker error', e);
-        try { if (ctxRef?.fromE164) await sendWhatsAppText(env, ctxRef.fromE164, 'Recibí tu mensaje. Tuve un problema momentáneo pero ya quedó, ¿me repites por favor? 🙂'); } catch {}
         return ok('EVENT_RECEIVED');
       }
     }
@@ -210,7 +225,7 @@ export default {
   }
 };
 
-/* ========= utils ========= */
+/* =================== Utils =================== */
 function ok(s='ok'){ return new Response(s, { status:200 }); }
 function json(obj){ return new Response(JSON.stringify(obj), { status:200, headers:{'Content-Type':'application/json'} }); }
 async function safeJson(req){ try{ return await req.json(); }catch{ return {}; } }
@@ -221,51 +236,62 @@ const toTitleCase = (s='') => s ? s.charAt(0).toUpperCase()+s.slice(1).toLowerCa
 const clean = (s='') => s.replace(/\s+/g,' ').trim();
 const normalizeBase = (s='') => s.normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/\s+/g,' ').trim().toLowerCase();
 const numberOrZero = n => Number.isFinite(Number(n)) ? Number(n) : 0;
-const truthy = v => v!==null && v!==undefined && String(v).trim()!=='';
+const truthy = v => v!==null && v!==undefined && String(v).trim()!==''; 
 const moneyMXN = n => { try{ return new Intl.NumberFormat('es-MX',{style:'currency',currency:'MXN'}).format(Number(n||0)); }catch{ return `$${Number(n||0).toFixed(2)}`; } };
 const priceWithIVA = n => `${moneyMXN(n)} + IVA`;
 
-/* ========= WA parse ========= */
-function extractWhatsAppContext(body){
-  try{
-    const entry = body?.entry?.[0];
-    const change = entry?.changes?.[0];
-    const value = change?.value || {};
-    const messages = value.messages || [];
-    if (!messages.length) return null;
-    const m = messages[0];
-    const contacts = value.contacts || [];
-    const profileName = contacts?.[0]?.profile?.name || '';
-    const from = m.from || '';
-    const fromE164 = m.from ? ('+' + String(m.from).replace(/\D/g,'')) : null;
-    const msgType = m.type || (m.text ? 'text' : (m.audio ? 'audio' : 'unknown'));
-    const textRaw =
-      m.text?.body ??
-      m.button?.text ??
-      m.interactive?.button_reply?.title ??
-      m.interactive?.list_reply?.title ??
-      m.interactive?.list_reply?.description ??
-      '';
-    const media = m.audio || m.image || m.document || null;
-    const ts = (m.timestamp ? Number(m.timestamp)*1000 : Date.now());
-    return { mid: m.id, from, fromE164, profileName, textRaw, msgType, ts, media };
-  }catch(e){ console.warn('extractWhatsAppContext error', e); return null; }
-}
-
-/* ========= intents ========= */
 const RX_GREET = /^(hola+|buen[oa]s|qué onda|que tal|saludos|hey|buen dia|buenas|holi+)\b/i;
 const RX_INV_KWS   = /(toner|t[óo]ner|cartucho|developer|unidad de revelado|refacci[oó]n|precio|costo|sku|pieza|compatible)\b/i;
 const RX_MODEL_KWS = /(versant|docucolor|primelink|versalink|altalink|apeos|work ?center|workcentre|c\d{2,4}|b\d{2,4}|550|560|570|2100|180|280|4100|c70|c60|c75)\b/i;
 const RX_NEG_NO = /\b(no|nel|ahorita no|no gracias)\b/i;
 const RX_DONE   = /\b(es(ta)?\s*todo|ser[ií]a\s*todo|nada\s*m[aá]s|con\s*eso|as[ií]\s*est[aá]\s*bien|ya\s*qued[oó]|listo|finaliza(r|mos)?|termina(r)?)\b/i;
 
-/* atajo cantidad */
-function parseFastQty(t=''){
-  const m = t.match(/\b(quiero|dame|agrega|añade|pon|suma|agregar|añadir)\b.*?\b(\d{1,3})\b/);
-  if (m) return Number(m[2]);
-  return null;
+/* ======== Texto puro: candado/parsers ======== */
+const LOCK_MS = 5 * 60 * 1000; // 5 minutos
+function cleanupSalesState(session){
+  session.stage = 'idle';
+  session.data.last_candidate = null;
+  session.data.last_candidate_lock = false;
+  session.data.lock_expires = 0;
+  session.data.search_options = [];
+  session.data.cart = session.data.cart || [];
+}
+function setLock(session){
+  session.data.last_candidate_lock = true;
+  session.data.lock_expires = Date.now() + LOCK_MS;
+}
+function clearLock(session){
+  session.data.last_candidate_lock = false;
+  session.data.lock_expires = 0;
+}
+function lockIsValid(session){
+  return !!session.data.last_candidate_lock && Number(session.data.lock_expires||0) > Date.now();
+}
+function getLockedCandidate(session){
+  if (!lockIsValid(session)) return null;
+  return session.data.last_candidate || null;
+}
+const NUM_WORDS = { cero:0, una:1, uno:1, un:1, dos:2, tres:3, cuatro:4, cinco:5, seis:6, siete:7, ocho:8, nueve:9, diez:10, once:11, doce:12, docena:12, 'media docena':6 };
+const ADD_QTY_RX = /\b(?:agrega(?:r)?|añad(?:e|ir)|pon|pón|quiero|dame|coloca|mete)\s+(?:x\s*)?(\d+|una|un|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|docena)\b/i;
+function parseQtyWord(w){
+  const W = (w||'').toLowerCase();
+  if (NUM_WORDS.hasOwnProperty(W)) return Number(NUM_WORDS[W]);
+  const n = Number(w); return Number.isFinite(n) ? n : null;
+}
+function isAddQtyCommand(t){ return ADD_QTY_RX.test(t); }
+function parseQtyFromAddCommand(t, fallback=1){
+  const m = t.match(ADD_QTY_RX);
+  if (!m) return fallback;
+  const qty = parseQtyWord(m[1]) ?? fallback;
+  return Math.max(1, qty);
+}
+function parseOpcionIndex(t){
+  const m = t.match(/\bopci[oó]n\s+(\d+)\b/i);
+  if (!m) return null;
+  const n = Number(m[1]); return Number.isFinite(n) && n > 0 ? n : null;
 }
 
+/* =================== Intents =================== */
 function normalizeWithAliases(s=''){
   const t = normalizeBase(s);
   const aliases = [
@@ -284,7 +310,7 @@ function isSupportIntent(n){
   return (hasProblem && hasDevice) || /\b(soporte|servicio|visita)\b/.test(t);
 }
 
-/* ========= WhatsApp send ========= */
+/* =================== WhatsApp =================== */
 async function sendWhatsAppText(env, toE164, body) {
   if (!env.WA_TOKEN || !env.PHONE_ID) return;
   const url = `https://graph.facebook.com/v20.0/${env.PHONE_ID}/messages`;
@@ -303,7 +329,7 @@ async function forwardAudioToSupport(env, media, fromE164) {
   await sendWhatsAppText(env, to, `🗣️ *Audio reenviado*\nDe: ${fromE164}\nMedia ID: ${media?.id||'N/A'} (revísalo en Meta/WA Business).`);
 }
 
-/* ========= sesión (Supabase) ========= */
+/* =================== Sesión =================== */
 async function loadSession(env, phone) {
   try {
     const r = await sbGet(env, 'wa_session', { query: `select=from,stage,data,updated_at,expires_at&from=eq.${encodeURIComponent(phone)}&limit=1` });
@@ -319,16 +345,7 @@ async function saveSession(env, session, now=new Date()) {
   } catch(e){ console.warn('saveSession', e); }
 }
 
-/* ========= cantidades / carrito ========= */
-const NUM_WORDS = { cero:0, una:1, uno:1, un:1, dos:2, tres:3, cuatro:4, cinco:5, seis:6, siete:7, ocho:8, nueve:9, diez:10, once:11, doce:12, docena:12, 'media docena':6 };
-function looksLikeQuantityStrict(t=''){ const hasDigit=/\b\d+\b/.test(t); const hasWord=Object.keys(NUM_WORDS).some(w=>new RegExp(`\\b${w}\\b`,'i').test(t)); return hasDigit||hasWord; }
-function parseQty(text, fallback=1){
-  const t = normalizeBase(text);
-  if (/\bmedia\s+docena\b/i.test(t)) return 6;
-  if (/\bdocena\b/i.test(t)) return 12;
-  for (const [w,n] of Object.entries(NUM_WORDS)) if (new RegExp(`\\b${w}\\b`,'i').test(t)) return Number(n);
-  const m = t.match(/\b(\d+)\b/); return m ? Number(m[1]) : fallback;
-}
+/* =================== Carrito =================== */
 function pushCart(session, product, qty, backorder=false){
   session.data.cart = session.data.cart || [];
   const key = `${product?.sku || product?.id || product?.nombre}${backorder?'_bo':''}`;
@@ -348,77 +365,96 @@ function renderProducto(p){
   const stockLine = s>0 ? `${s} pzas en stock` : `0 pzas — *sobre pedido*`;
   const marca = p.marca ? `\nMarca: ${p.marca}` : '';
   const sku = p.sku ? `\nSKU: ${p.sku}` : '';
-  return `1. ${p.nombre}${marca}${sku}\n${priceWithIVA(p.precio)}\n${stockLine}\n\n¿Te funciona?\nSi sí, dime *cuántas piezas*; lo que exceda el stock va *sobre pedido*.`;
+  return `1. ${p.nombre}${marca}${sku}\n${priceWithIVA(p.precio)}\n${stockLine}`;
 }
 
-/* ========= ventas ========= */
+/* =================== Ventas =================== */
+function looksLikeQuantityStrict(t=''){
+  const hasDigit=/\b\d+\b/.test(t);
+  const hasWord=Object.keys(NUM_WORDS).some(w=>new RegExp(`\\b${w}\\b`,'i').test(t));
+  return hasDigit||hasWord;
+}
+function parseQty(text, fallback=1){
+  const t = normalizeBase(text);
+  if (/\bmedia\s+docena\b/i.test(t)) return 6;
+  if (/\bdocena\b/i.test(t)) return 12;
+  for (const [w,n] of Object.entries(NUM_WORDS)) if (new RegExp(`\\b${w}\\b`,'i').test(t)) return Number(n);
+  const m = t.match(/\b(\d+)\b/); return m ? Number(m[1]) : fallback;
+}
+
 async function handleAskQty(env, session, toE164, text, lowered, _ntext, now){
-  try{
-    // -------- Candado de SKU: si hay lock, recargar ese SKU desde la vista
-    let cand = session.data?.last_candidate || null;
-    const lockSku = session.data?.last_candidate_lock?.sku || null;
-    if (lockSku) {
-      try{
-        const r = await sbGet(env, 'producto_stock_v', { query:`select=id,nombre,marca,sku,precio,stock,tipo,compatible&sku=eq.${encodeURIComponent(lockSku)}&limit=1` });
-        if (r && r[0]) cand = r[0];
-      }catch(e){ console.warn('lockSku fetch', e); }
-    }
+  const cand = getLockedCandidate(session) || session.data?.last_candidate;
 
-    if (RX_NEG_NO.test(lowered)) {
-      session.data.last_candidate = null;
-      session.data.last_candidate_lock = null;
-      session.stage = 'cart_open';
-      await saveSession(env, session, now);
-      await sendWhatsAppText(env, toE164, 'Sin problema. ¿Busco otra opción? Dime modelo/color o lo que necesitas.');
-      return ok('EVENT_RECEIVED');
-    }
-
-    if (RX_DONE.test(lowered)) {
-      const cart = session.data?.cart || [];
-      if (cart.length > 0) {
-        session.stage = 'await_invoice';
-        await saveSession(env, session, now);
-        await sendWhatsAppText(env, toE164, '¿La cotizamos *con factura* o *sin factura*?');
-        return ok('EVENT_RECEIVED');
-      }
-    }
-
-    if (!cand) {
-      session.stage = 'cart_open';
-      await saveSession(env, session, now);
-      await sendWhatsAppText(env, toE164, '¿Qué artículo necesitas? (ej. "*tóner amarillo Versant 180*")');
-      return ok('EVENT_RECEIVED');
-    }
-
-    if (!looksLikeQuantityStrict(lowered)) {
-      const s = numberOrZero(cand.stock);
-      await sendWhatsAppText(env, toE164, `¿Cuántas *piezas* necesitas? (hay ${s} en stock; el resto sería *sobre pedido*)`);
-      await saveSession(env, session, now);
-      return ok('EVENT_RECEIVED');
-    }
-
-    const qty = parseQty(lowered, 1);
-    if (!Number.isFinite(qty) || qty<=0) {
-      const s = numberOrZero(cand.stock);
-      await sendWhatsAppText(env, toE164, `Necesito un número de piezas (hay ${s} en stock).`);
-      await saveSession(env, session, now);
-      return ok('EVENT_RECEIVED');
-    }
-
-    addWithStockSplit(session, cand, qty);
+  if (RX_NEG_NO.test(lowered)) {
+    session.data.last_candidate = null;
+    clearLock(session);
     session.stage = 'cart_open';
     await saveSession(env, session, now);
-
-    const s = numberOrZero(cand.stock);
-    const bo = Math.max(0, qty - Math.min(s, qty));
-    const nota = bo>0 ? `\n(De ${qty}, ${Math.min(s,qty)} en stock y ${bo} sobre pedido)` : '';
-    await sendWhatsAppText(env, toE164, `Añadí 🛒\n• ${cand.nombre} x ${qty} ${priceWithIVA(cand.precio)}${nota}\n\n¿Deseas *agregar algo más* o *finalizamos*?`);
-    return ok('EVENT_RECEIVED');
-  }catch(err){
-    console.warn('handleAskQty error', err);
-    try{ await sendWhatsAppText(env, toE164, 'Recibí tu cantidad 👍. Si no viste mi mensaje anterior, dime de nuevo cuántas *piezas* necesitas (número).'); }catch{}
+    await sendWhatsAppText(env, toE164, 'Sin problema. ¿Busco otra opción? Dime modelo/color o lo que necesitas.');
     return ok('EVENT_RECEIVED');
   }
+
+  if (RX_DONE.test(lowered)) {
+    const cart = session.data?.cart || [];
+    if (cart.length > 0) {
+      session.stage = 'await_invoice';
+      await saveSession(env, session, now);
+      await sendWhatsAppText(env, toE164, '¿La cotizamos *con factura* o *sin factura*?');
+      return ok('EVENT_RECEIVED');
+    }
+  }
+
+  if (!cand) {
+    session.stage = 'cart_open';
+    await saveSession(env, session, now);
+    await sendWhatsAppText(env, toE164, '¿Qué artículo necesitas? (ej. "*tóner amarillo Versant 180*")');
+    return ok('EVENT_RECEIVED');
+  }
+
+  // Comando "agregar N"
+  if (isAddQtyCommand(lowered)) {
+    const qty = parseQtyFromAddCommand(lowered, 1);
+    if (qty > 0) {
+      const fresh = await getBySKU(env, cand.sku);
+      const prod = fresh || cand;
+      addWithStockSplit(session, prod, qty);
+      session.stage = 'cart_open';
+      clearLock(session);
+      await saveSession(env, session, now);
+      const s = numberOrZero(prod.stock);
+      const bo = Math.max(0, qty - Math.min(s, qty));
+      const nota = bo>0 ? `\n(De ${qty}, ${Math.min(s,qty)} en stock y ${bo} sobre pedido)` : '';
+      await sendWhatsAppText(env, toE164, `Añadí 🛒\n• ${prod.nombre} x ${qty} ${priceWithIVA(prod.precio)}${nota}\n\n¿Deseas *agregar algo más* o *finalizamos*?`);
+      return ok('EVENT_RECEIVED');
+    }
+  }
+
+  // Cantidad suelta
+  if (!looksLikeQuantityStrict(lowered)) {
+    const s = numberOrZero(cand.stock);
+    await sendWhatsAppText(env, toE164, `¿Cuántas *piezas* necesitas? (hay ${s} en stock; el resto sería *sobre pedido*)\nEjemplos: "agregar 1", "quiero 2", "pon 3"`);
+    await saveSession(env, session, now);
+    return ok('EVENT_RECEIVED');
+  }
+
+  const qty = parseQty(lowered, 1);
+  if (!Number.isFinite(qty) || qty<=0) {
+    const s = numberOrZero(cand.stock);
+    await sendWhatsAppText(env, toE164, `Necesito un número de piezas (hay ${s} en stock).`);
+    await saveSession(env, session, now);
+    return ok('EVENT_RECEIVED');
+  }
+
+  addWithStockSplit(session, cand, qty);
+  session.stage = 'cart_open';
+  clearLock(session);
+  await saveSession(env, session, now);
+
+  const s = numberOrZero(cand.stock);
+  const bo = Math.max(0, qty - Math.min(s, qty));
+  const nota = bo>0 ? `\n(De ${qty}, ${Math.min(s,qty)} en stock y ${bo} sobre pedido)` : '';
+  await sendWhatsAppText(env, toE164, `Añadí 🛒\n• ${cand.nombre} x ${qty} ${priceWithIVA(cand.precio)}${nota}\n\n¿Deseas *agregar algo más* o *finalizamos*?`);
+  return ok('EVENT_RECEIVED');
 }
 
 async function handleCartOpen(env, session, toE164, text, lowered, ntext, now){
@@ -432,14 +468,17 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now){
     return ok('EVENT_RECEIVED');
   }
 
-  if (looksLikeQuantityStrict(lowered) && session.data?.last_candidate) {
+  // Si pone "agregar 2" pero estamos en cart_open y hay candado previo, dirigir a ask_qty
+  if (isAddQtyCommand(lowered) && session.data?.last_candidate) {
     session.stage = 'ask_qty';
+    setLock(session);
     await saveSession(env, session, now);
     const s = numberOrZero(session.data.last_candidate.stock);
-    await sendWhatsAppText(env, toE164, `Perfecto. ¿Cuántas *piezas* en total? (hay ${s} en stock; el resto sería *sobre pedido*)`);
+    await sendWhatsAppText(env, toE164, `Perfecto. ¿Cuántas *piezas*? (hay ${s} en stock; el resto sería *sobre pedido*)`);
     return ok('EVENT_RECEIVED');
   }
 
+  // Intento de buscar / agregar algo
   if (RX_INV_KWS.test(ntext) || RX_MODEL_KWS.test(ntext)) {
     return await startSalesFromQuery(env, session, toE164, text, ntext, now);
   }
@@ -450,27 +489,53 @@ async function handleCartOpen(env, session, toE164, text, lowered, ntext, now){
 }
 
 async function startSalesFromQuery(env, session, toE164, text, ntext, now){
+  // Si venía de una propuesta: limpiar lock y opciones
   session.data.last_candidate = null;
-  session.data.last_candidate_lock = null;
-  await saveSession(env, session, now);
+  clearLock(session);
+  session.data.search_options = [];
 
-  const prod = await findBestProduct(env, ntext);
-  if (prod) {
+  // IA opcional: extraer entidades (no decide SKU)
+  let ent = null;
+  if (env.OPENAI_API_KEY) {
+    try { ent = await extractEntitiesWithAI(env, text); } catch(e){ console.warn('[AI] extract', e); }
+  }
+
+  const result = await findProductsDeterministic(env, ntext, ent);
+  if (result.pick) {
+    const prod = result.pick;
     session.stage = 'ask_qty';
     session.data.last_candidate = prod;
-    session.data.last_candidate_lock = { sku: prod.sku || null, ts: Date.now(), query: ntext };
+    setLock(session);
     await saveSession(env, session, now);
-    await sendWhatsAppText(env, toE164, renderProducto(prod));
+    await sendWhatsAppText(env, toE164,
+      `${renderProducto(prod)}\n\n¿Te funciona?\nSi sí, escribe: *"agregar 1"*, *"quiero 2"* o *"pon 3"*. Lo que exceda el stock va *sobre pedido*.`
+    );
     return ok('EVENT_RECEIVED');
   }
 
+  if (result.options && result.options.length) {
+    session.data.search_options = result.options.slice(0, 6); // hasta 6 opciones
+    session.stage = 'idle';
+    await saveSession(env, session, now);
+
+    const lines = result.options.map((p,i) => {
+      const s = numberOrZero(p.stock) > 0 ? `${p.stock} en stock` : `0 (sobre pedido)`;
+      return `${i+1}) ${p.nombre} — SKU ${p.sku || 'N/D'} — ${priceWithIVA(p.precio)} — ${s}`;
+    }).join('\n');
+    await sendWhatsAppText(env, toE164,
+      `Encontré ${result.options.length} opciones:\n${lines}\n\nResponde con: "opción 1", "opción 2", ...`
+    );
+    return ok('EVENT_RECEIVED');
+  }
+
+  // Sin match claro
   await sendWhatsAppText(env, toE164, 'No encontré una coincidencia directa 😕. ¿Me das el *modelo* y el *color* del consumible? (ej. *tóner amarillo Versant 180*)');
   await notifySupport(env, `Inventario sin match. ${toE164}: ${text}`);
   await saveSession(env, session, now);
   return ok('EVENT_RECEIVED');
 }
 
-/* ========= matching (inventario) ========= */
+/* =================== Matching determinista + IA opcional =================== */
 function extractColorWord(text=''){
   const t = normalizeWithAliases(text);
   if (/\b(amarillo|yellow)\b/i.test(t)) return 'yellow';
@@ -511,15 +576,33 @@ function productMatchesFamily(p, text=''){
   }
   return true;
 }
+function sortPool(pool){
+  pool.sort((a,b) => {
+    const sa = numberOrZero(a.stock) > 0 ? 1 : 0;
+    const sb = numberOrZero(b.stock) > 0 ? 1 : 0;
+    if (sa !== sb) return sb - sa;
+    return numberOrZero(a.precio||0) - numberOrZero(b.precio||0);
+  });
+}
+async function getBySKU(env, sku){
+  if (!sku) return null;
+  try {
+    const r = await sbGet(env, 'producto_stock_v', {
+      query:`select=id,nombre,marca,sku,precio,stock,tipo,compatible&sku=eq.${encodeURIComponent(sku)}&limit=1`
+    });
+    return r?.[0] || null;
+  } catch { return null; }
+}
 
-async function findBestProduct(env, queryText) {
-  const colorCode = extractColorWord(queryText);
-  const wantsToner = /\b(t[oó]ner|toner|cartucho)\b/i.test(queryText);
+async function findProductsDeterministic(env, queryText, ent){
+  const colorCode = ent?.color || extractColorWord(queryText);
+  const wantsToner = ent?.tipo==='toner' || /\b(t[oó]ner|toner|cartucho)\b/i.test(queryText);
 
+  // filtro & puntuación
   const scoreAndPick = (arr=[]) => {
-    if (!arr?.length) return null;
+    if (!arr?.length) return { pick:null, options:[] };
 
-    let pool = arr.filter(p => productMatchesFamily(p, queryText));
+    let pool = arr.filter(p => productMatchesFamily(p, ent?.familia || queryText));
     if (colorCode) pool = pool.filter(p => productHasColor(p, colorCode));
     if (wantsToner) {
       pool = pool.filter(p => {
@@ -530,56 +613,91 @@ async function findBestProduct(env, queryText) {
         return true;
       });
     }
-
-    if (!pool.length) return null;
-
-    pool.sort((a,b) => {
-      const sa = numberOrZero(a.stock) > 0 ? 1 : 0;
-      const sb = numberOrZero(b.stock) > 0 ? 1 : 0;
-      if (sa !== sb) return sb - sa;
-      return numberOrZero(a.precio||0) - numberOrZero(b.precio||0);
-    });
-    return pool[0] || null;
+    if (!pool.length) return { pick:null, options:[] };
+    sortPool(pool);
+    // Si quedaron varias del mismo “grupo” → devolver opciones
+    const top = pool.slice(0, 6);
+    const sameFamily = top.every(p => productMatchesFamily(p, ent?.familia || queryText));
+    if (top.length > 1 && sameFamily) return { pick:null, options: top };
+    return { pick: top[0], options: top.slice(1) };
   };
 
-  // 1) fuzzy RPC (si existe)
+  // 1) RPC fuzzy (si existe)
   try {
-    const res = await sbRpc(env, 'match_products_trgm', { q: queryText, match_count: 60 }) || [];
+    const res = await sbRpc(env, 'match_products_trgm', { q: ent?.modelo_libre || queryText, match_count: 60 }) || [];
     const pick1 = scoreAndPick(res);
-    if (pick1) return pick1;
+    if (pick1.pick || pick1.options.length) return pick1;
   } catch (_) {}
 
-  // 2) LIKE contra producto_stock_v
+  // 2) LIKE principal (tipo=toner cuando aplique + exclusiones)
   try {
-    const like = encodeURIComponent('%' + queryText.replace(/\s+/g,' ') + '%');
+    const like = encodeURIComponent('%' + (ent?.modelo_libre || queryText).replace(/\s+/g,' ') + '%');
     const parts = [
       `select=id,nombre,marca,sku,precio,stock,tipo,compatible`,
-      `or=(nombre.ilike.${like},sku.ilike.${like})`
+      `or=(nombre.ilike.${like},sku.ilike.${like})`,
+      `nombre=not.ilike.*unidad%20de%20revelado*`,
+      `nombre=not.ilike.*developer*`,
+      `nombre=not.ilike.*drum*`,
+      `nombre=not.ilike.*transfer*`,
+      `nombre=not.ilike.*banda*`
     ];
     if (wantsToner) parts.push(`tipo=eq.toner`);
-    parts.push(`nombre=not.ilike.*unidad%20de%20revelado*`);
-    parts.push(`nombre=not.ilike.*developer*`);
     const q = parts.join('&') + `&order=stock.desc.nullslast,precio.asc&limit=600`;
-
     const r2 = await sbGet(env, 'producto_stock_v', { query: q }) || [];
     const pick2 = scoreAndPick(r2);
-    if (pick2) return pick2;
+    if (pick2.pick || pick2.options.length) return pick2;
   } catch (_) {}
 
-  // 3) Rescate: buscar “toner”
+  // 3) Red de seguridad: buscar “toner” literal
   try {
     const likeToner = encodeURIComponent('%toner%');
     const r3 = await sbGet(env, 'producto_stock_v', {
-      query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&or=(nombre.ilike.${likeToner},sku.ilike.${likeToner})&order=stock.desc.nullslast,precio.asc&limit=400`
+      query: `select=id,nombre,marca,sku,precio,stock,tipo,compatible&` +
+             `or=(nombre.ilike.${likeToner},sku.ilike.${likeToner})&` +
+             `order=stock.desc.nullslast,precio.asc&limit=400`
     }) || [];
     const pick3 = scoreAndPick(r3);
-    if (pick3) return pick3;
+    if (pick3.pick || pick3.options.length) return pick3;
   } catch(_) {}
 
-  return null;
+  return { pick:null, options:[] };
 }
 
-/* ========= cierre venta ========= */
+/* ===== IA opcional: extracción de entidades (NO decide SKU) ===== */
+async function extractEntitiesWithAI(env, text){
+  const sys = `Eres un extractor de entidades. Devuelve un JSON compacto con:
+{"tipo":"toner|drum|developer|refaccion|desconocido","color":"yellow|magenta|cyan|black|null","familia":"versant|docucolor|primelink|versalink|altalink|c70|null","modelo_libre":"string breve o null"}
+No inventes. Usa null si no estás seguro.`;
+
+  const usr = `Texto del usuario: """${text}"""`;
+  try{
+    const r = await fetch('https://api.openai.com/v1/chat/completions', {
+      method:'POST',
+      headers:{ 'Authorization': `Bearer ${env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        temperature: 0.0,
+        messages: [{ role:'system', content: sys }, { role:'user', content: usr }],
+        response_format: { type: 'json_object' }
+      })
+    });
+    if (!r.ok) throw new Error('OpenAI ' + r.status);
+    const j = await r.json();
+    const content = j?.choices?.[0]?.message?.content || '{}';
+    const data = JSON.parse(content);
+    // Normalizar
+    const tipo = (data.tipo||'').toLowerCase();
+    const color = (data.color||'') || null;
+    const familia = (data.familia||'') || null;
+    const modelo_libre = (data.modelo_libre||'') || null;
+    return { tipo, color, familia, modelo_libre };
+  } catch(e){
+    console.warn('[AI] error', e);
+    return null;
+  }
+}
+
+/* =================== Cierre de venta (pedido) =================== */
 async function handleAwaitInvoice(env, session, toE164, lowered, now){
   if (/\b(no|gracias|todo bien)\b/i.test(lowered)) {
     session.stage = 'idle';
@@ -603,7 +721,7 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now){
       await sendWhatsAppText(env, toE164, `¿${LABEL[need]}?`);
       return ok('EVENT_RECEIVED');
     }
-    const res = await createOrderFromSession(env, session, toE164);
+    const res = await createOrderFromSession(env, session);
     if (res?.ok) {
       await sendWhatsAppText(env, toE164, `¡Listo! Generé tu solicitud 🙌\n*Total estimado:* ${moneyMXN(res.total)} + IVA\nUn asesor te confirmará entrega y forma de pago.`);
     } else {
@@ -611,8 +729,6 @@ async function handleAwaitInvoice(env, session, toE164, lowered, now){
     }
     session.stage = 'idle';
     session.data.cart = [];
-    session.data.last_candidate = null;
-    session.data.last_candidate_lock = null;
     await saveSession(env, session, now);
     await sendWhatsAppText(env, toE164, `¿Te ayudo con algo más en este momento? (Sí / No)`);
     return ok('EVENT_RECEIVED');
@@ -654,19 +770,82 @@ async function handleCollectSequential(env, session, toE164, text, now){
     await sendWhatsAppText(env, toE164, `¿${LABEL[next]}?`);
     return ok('EVENT_RECEIVED');
   }
-  const res = await createOrderFromSession(env, session, toE164);
+  const res = await createOrderFromSession(env, session);
   if (res?.ok) await sendWhatsAppText(env, toE164, `¡Listo! Generé tu solicitud 🙌\n*Total estimado:* ${moneyMXN(res.total)} + IVA`);
   else        await sendWhatsAppText(env, toE164, `Creé tu solicitud y la pasé a un asesor para confirmar detalles. 🙌`);
   session.stage = 'idle';
   session.data.cart = [];
-  session.data.last_candidate = null;
-  session.data.last_candidate_lock = null;
   await saveSession(env, session, now);
   await sendWhatsAppText(env, toE164, `¿Puedo ayudarte con algo más? (Sí / No)`);
   return ok('EVENT_RECEIVED');
 }
 
-/* ========= Supabase helpers ========= */
+/* =================== Cliente/Pedido =================== */
+async function preloadCustomerIfAny(env, session){
+  try{
+    const r = await sbGet(env, 'cliente', { query: `select=nombre,rfc,email,calle,numero,colonia,ciudad,estado,cp&telefono=eq.${session.from}&limit=1` });
+    if (r && r[0]) session.data.customer = { ...(session.data.customer||{}), ...r[0] };
+  }catch(e){ console.warn('preloadCustomerIfAny', e); }
+}
+async function ensureClienteFields(env, cliente_id, c){
+  try{
+    const patch = {};
+    ['nombre','rfc','email','calle','numero','colonia','ciudad','estado','cp'].forEach(k=>{ if (truthy(c[k])) patch[k]=c[k]; });
+    if (Object.keys(patch).length>0) await sbPatch(env, 'cliente', patch, `id=eq.${cliente_id}`);
+  }catch(e){ console.warn('ensureClienteFields', e); }
+}
+async function createOrderFromSession(env, session){
+  try{
+    const cart = session.data?.cart || [];
+    if (!cart.length) return { ok:false, error:'empty' };
+    const c = session.data.customer || {};
+    let cliente_id = null;
+    try{
+      const exist = await sbGet(env, 'cliente', { query:`select=id,telefono,email&or=(telefono.eq.${session.from},email.eq.${encodeURIComponent(c.email||'')})&limit=1` });
+      if (exist && exist[0]) cliente_id = exist[0].id;
+    }catch(_){}
+    if (!cliente_id) {
+      const ins = await sbUpsert(env, 'cliente', [{
+        nombre:c.nombre||null, rfc:c.rfc||null, email:c.email||null, telefono:session.from||null,
+        calle:c.calle||null, numero:c.numero||null, colonia:c.colonia||null, ciudad:c.ciudad||null, estado:c.estado||null, cp:c.cp||null
+      }], { onConflict:'telefono', returning:'representation' });
+      cliente_id = ins?.data?.[0]?.id || null;
+    } else {
+      await ensureClienteFields(env, cliente_id, c);
+    }
+
+    let total = 0;
+    for (const it of cart) total += Number(it.product?.precio||0) * Number(it.qty||1);
+
+    const p = await sbUpsert(env, 'pedido', [{ cliente_id, total, moneda:'MXN', estado:'nuevo', created_at:new Date().toISOString() }], { returning:'representation' });
+    const pedido_id = p?.data?.[0]?.id;
+
+    const items = cart.map(it => ({
+      pedido_id, producto_id: it.product?.id||null, sku: it.product?.sku||null,
+      nombre: it.product?.nombre||null, qty: it.qty, precio_unitario: Number(it.product?.precio||0)
+    }));
+    await sbUpsert(env, 'pedido_item', items, { returning:'minimal' });
+
+    // disminuir stock real (RPC si existe)
+    for (const it of cart) {
+      const sku = it.product?.sku;
+      if (!sku) continue;
+      try {
+        const row = await sbGet(env, 'producto_stock_v', { query:`select=sku,stock&sku=eq.${encodeURIComponent(sku)}&limit=1` });
+        const current = numberOrZero(row?.[0]?.stock);
+        const dec = Math.min(current, Number(it.qty||0));
+        if (dec > 0) await sbRpc(env, 'decrement_stock', { in_sku: sku, in_by: dec });
+      } catch (_){}
+    }
+
+    return { ok:true, pedido_id, total };
+  }catch(e){
+    console.warn('createOrderFromSession', e);
+    return { ok:false, error:String(e) };
+  }
+}
+
+/* =================== Supabase helpers =================== */
 async function sbGet(env, table, { query }){
   const url = `${env.SUPABASE_URL}/rest/v1/${table}?${query}`;
   const r = await fetch(url, { headers:{ apikey: env.SUPABASE_ANON_KEY, Authorization:`Bearer ${env.SUPABASE_ANON_KEY}` } });
@@ -706,15 +885,15 @@ async function sbRpc(env, fn, params){
   return await r.json();
 }
 
-/* ========= SEPOMEX ========= */
+/* =================== SEPOMEX =================== */
 async function cityFromCP(env, cp){
   try { const r = await sbGet(env, 'sepomex_cp', { query:`cp=eq.${encodeURIComponent(cp)}&select=cp,estado,municipio,ciudad&limit=1` }); return r?.[0] || null; }
   catch { return null; }
 }
 
-/* ========= SOPORTE + GCal ========= */
+/* =================== SOPORTE + GCal =================== */
 
-// --- Parsers básicos de marca/modelo, dirección y datos del cliente ---
+// Parsers de marca/modelo, dirección y datos del cliente
 function parseBrandModel(text=''){
   const t = normalizeWithAliases(text);
   let marca = null;
@@ -796,7 +975,6 @@ function svFillFromAnswer(sv, field, text, env){
   if (field === 'horario') { const dt = parseNaturalDateTime(text, env); if (dt?.start) sv.when = dt; return; }
 }
 
-// --- Flujo principal de soporte ---
 async function handleSupport(env, session, toE164, text, lowered, ntext, now){
   try {
     session.data = session.data || {};
@@ -810,7 +988,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now){
       await saveSession(env, session, now);
     }
 
-    // Minería ligera del mensaje actual
+    // Minería del mensaje actual
     const mined = extractSvInfo(text);
     ['marca','modelo','falla','calle','numero','colonia','cp','ciudad','estado','error_code','prioridad','nombre','email']
       .forEach(k=>{ if (!truthy(sv[k]) && truthy(mined[k])) sv[k]=mined[k]; });
@@ -861,7 +1039,6 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now){
     let pool = [];
     try { pool = await getCalendarPool(env) || []; } catch(e){ console.warn('[GCal] pool', e); }
 
-    // usar el primero activo
     const cal = (pool.find(p => p.active !== false)) || pool[0] || null;
     const tz = env.TZ || 'America/Mexico_City';
     const whenParsed = sv.when || parseNaturalDateTime(lowered, env) || {};
@@ -870,12 +1047,12 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now){
     const cliente_id = await upsertClienteByPhone(env, session.from);
     try { await ensureClienteFields(env, cliente_id, { nombre: sv.nombre, email: sv.email, calle: sv.calle, numero: sv.numero, colonia: sv.colonia, ciudad: sv.ciudad, estado: sv.estado, cp: sv.cp }); } catch (_) {}
 
-    // Crear en GCal (si hay config)
+    // Crear en GCal
     let event = null; let calName = cal?.name || '';
     if (cal && env.GCAL_REFRESH_TOKEN && env.GCAL_CLIENT_ID && env.GCAL_CLIENT_SECRET) {
       try {
         const nearest = await findNearestFreeSlot(env, cal.calendar_id, slot, tz);
-        const osTmpNumber = Math.floor(Date.now()/1000); // temporal para el título
+        const osTmpNumber = Math.floor(Date.now()/1000);
         const summary = `${sv.nombre || 'Cliente'} — ${sv.modelo || 'Equipo'} — OS#${osTmpNumber}`;
         event = await gcalCreateEvent(env, cal.calendar_id, {
           summary,
@@ -886,7 +1063,7 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now){
       } catch (e) { console.warn('[GCal] create error', e); }
     }
 
-    // Crear OS en supabase
+    // Crear OS
     let osId = null; let estado = event ? 'agendado' : 'pendiente';
     try {
       const osBody = [{
@@ -899,8 +1076,6 @@ async function handleSupport(env, session, toE164, text, lowered, ntext, now){
       }];
       const os = await sbUpsert(env, 'orden_servicio', osBody, { returning: 'representation' });
       osId = os?.data?.[0]?.id || null;
-
-      // Renombrar evento con OS real
       if (event && osId) {
         const pretty = `${sv.nombre || 'Cliente'} — ${sv.modelo || 'Equipo'} — OS#${osId}`;
         await gcalPatchEvent(env, cal.calendar_id, event.id, { summary: pretty });
@@ -945,7 +1120,7 @@ function renderOsDescription(phone, sv={}){
   ].filter(Boolean).join('\n');
 }
 
-// --- Comandos rápidos sobre OS existentes ---
+// OS / cliente
 async function svCancel(env, session, toE164) {
   const os = await getLastOpenOS(env, session.from);
   if (!os) { await sendWhatsAppText(env, toE164, `No encuentro una visita activa para cancelar.`); return; }
@@ -976,8 +1151,6 @@ async function svWhenIsMyVisit(env, session, toE164) {
   const tz = env.TZ || 'America/Mexico_City';
   await sendWhatsAppText(env, toE164, `Tu visita está para *${fmtDate(os.ventana_inicio, tz)}* de *${fmtTime(os.ventana_inicio, tz)}* a *${fmtTime(os.ventana_fin, tz)}*.`);
 }
-
-// --- Utilidades de OS / cliente ---
 async function upsertClienteByPhone(env, phone){
   let id = null;
   try {
@@ -990,7 +1163,6 @@ async function upsertClienteByPhone(env, phone){
 }
 async function getLastOpenOS(env, phone){
   try{
-    // buscar cliente por teléfono
     const cli = await sbGet(env, 'cliente', { query:`select=id&telefono=eq.${encodeURIComponent(phone)}&limit=1` });
     const cliente_id = cli?.[0]?.id;
     if (!cliente_id) return null;
@@ -999,7 +1171,7 @@ async function getLastOpenOS(env, phone){
   }catch(_){ return null; }
 }
 
-// --- Google Calendar helpers (OAuth con refresh token) ---
+/* =================== Google Calendar =================== */
 async function gcalToken(env){
   const res = await fetch('https://oauth2.googleapis.com/token', {
     method:'POST',
@@ -1051,33 +1223,25 @@ async function gcalDeleteEvent(env, calendarId, eventId){
   const r = await fetch(url, { method:'DELETE', headers:{ Authorization:`Bearer ${token}` } });
   if (!r.ok) console.warn('gcal delete', r.status, await r.text());
 }
-
-// Buscar el slot libre más cercano (1h) dentro de 10:00–15:00 local
 async function findNearestFreeSlot(env, calendarId, desired, tz){
   const durationMs = 60*60*1000;
   const base = clampToWindow(desired, tz);
   const start = new Date(base.start);
   let end   = new Date(start.getTime() + durationMs);
 
-  // consultamos free/busy en una ventana de 3 días
   const token = await gcalToken(env);
   const fbUrl = 'https://www.googleapis.com/calendar/v3/freeBusy';
   for (let dayOffset=0; dayOffset<3; dayOffset++){
     const dayStart = new Date(start.getTime() + dayOffset*24*60*60*1000);
-    const windowStart = windowOfDay(dayStart, tz, 10); // 10:00
-    const windowEnd   = windowOfDay(dayStart, tz, 15); // 15:00
+    const windowStart = windowOfDay(dayStart, tz, 10);
+    const windowEnd   = windowOfDay(dayStart, tz, 15);
     const r = await fetch(fbUrl, {
       method:'POST',
       headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
-      body: JSON.stringify({
-        timeMin: windowStart.toISOString(),
-        timeMax: windowEnd.toISOString(),
-        items:[{ id: calendarId }]
-      })
+      body: JSON.stringify({ timeMin: windowStart.toISOString(), timeMax: windowEnd.toISOString(), items:[{ id: calendarId }] })
     });
     const j = await r.json();
     const busy = (j?.calendars?.[calendarId]?.busy) || [];
-    // probamos slots cada 30 min
     let probe = new Date(Math.max(windowStart.getTime(), start.getTime()));
     for (let i=0; i<12; i++){
       end = new Date(probe.getTime() + durationMs);
@@ -1086,49 +1250,12 @@ async function findNearestFreeSlot(env, calendarId, desired, tz){
       probe = new Date(probe.getTime() + 30*60*1000);
     }
   }
-  // si no encontramos, devolver el clamped original
   return { start: base.start, end: new Date(new Date(base.start).getTime()+durationMs).toISOString() };
 }
-function windowOfDay(date, tz, hour){
-  // construye Date en la zona local aproximada (CF no soporta TZ real)
-  const d = new Date(date);
-  d.setUTCHours(hour,0,0,0); // aproximación suficiente
-  return d;
-}
-
-// --- Pool de calendarios ---
-async function getCalendarPool(env){
-  try {
-    return await sbGet(env, 'calendar_pool', { query:`select=id,name,calendar_id,active&order=name.asc` }) || [];
-  } catch { return []; }
-}
-
-// --- Date parsing minimalista (hoy/mañana, hh:mm) ---
-function parseNaturalDateTime(text, env){
-  const tz = env.TZ || 'America/Mexico_City';
-  const now = new Date();
-  let base = new Date(now);
-  if (/\bpasado\s+ma[ñn]ana\b/i.test(text)) base = new Date(now.getTime()+2*24*60*60*1000);
-  else if (/\bma[ñn]ana\b/i.test(text)) base = new Date(now.getTime()+1*24*60*60*1000);
-  else if (/\bhoy\b/i.test(text)) base = new Date(now);
-
-  let h = 12, m = 0;
-  const mHM = text.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i);
-  if (mHM) {
-    h = Number(mHM[1]); m = Number(mHM[2]||0);
-    const ampm = (mHM[3]||'').toLowerCase();
-    if (ampm === 'pm' && h<12) h += 12;
-    if (ampm === 'am' && h===12) h = 0;
-  }
-  const start = new Date(base);
-  start.setHours(h, m, 0, 0);
-  const end = new Date(start.getTime() + 60*60*1000);
-  return { start: start.toISOString(), end: end.toISOString(), timezone: tz };
-}
+function windowOfDay(date, tz, hour){ const d = new Date(date); d.setUTCHours(hour,0,0,0); return d; }
 function clampToWindow(when, tz){
   const start = new Date(when?.start || Date.now() + 2*60*60*1000);
   const end   = new Date(when?.end   || start.getTime() + 60*60*1000);
-  // ventana 10:00–15:00
   const dayStart = new Date(start); dayStart.setHours(10,0,0,0);
   const dayEnd   = new Date(start); dayEnd.setHours(15,0,0,0);
   const s = new Date(Math.max(start.getTime(), dayStart.getTime()));
@@ -1138,12 +1265,25 @@ function clampToWindow(when, tz){
 }
 function fmtDate(iso, tz){
   try{
-    return new Intl.DateTimeFormat('es-MX',{ timeZone: tz, weekday:'short', day:'2-digit', month:'short' }).format(new Date(iso));
-  }catch{ return new Date(iso).toDateString(); }
+    return new Intl.DateTimeFormat('es-MX', {
+      timeZone: tz,
+      weekday: 'short',
+      day: '2-digit',
+      month: 'short'
+    }).format(new Date(iso));
+  } catch {
+    return new Date(iso).toDateString();
+  }
 }
 function fmtTime(iso, tz){
   try{
-    return new Intl.DateTimeFormat('es-MX',{ timeZone: tz, hour:'2-digit', minute:'2-digit' }).format(new Date(iso));
-  }catch{ const d=new Date(iso); return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`; }
+    return new Intl.DateTimeFormat('es-MX', {
+      timeZone: tz,
+      hour: '2-digit',
+      minute: '2-digit'
+    }).format(new Date(iso));
+  } catch {
+    const d = new Date(iso);
+    return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+  }
 }
-
